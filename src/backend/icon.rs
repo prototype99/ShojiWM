@@ -114,18 +114,15 @@ impl IconRasterizer {
         let spec_hash = hash_icon_spec(spec);
         if let Some(cached) = self.async_buffers.get_mut(&spec_hash) {
             cached.last_used_at = Instant::now();
-            return Some(CachedDecorationIcon {
-                owner_node_id: None,
-                stable_key: String::new(),
-                order: 0,
-                rect: spec.rect,
-                rect_precise: spec.rect_precise,
-                clip_rect: None,
-                clip_radius: 0,
-                clip_rect_precise: None,
-                clip_radius_precise: None,
-                buffer: cached.buffer.clone(),
-            });
+            return Some(cached_icon_from_buffer(spec, cached.buffer.clone()));
+        }
+
+        // `Image` nodes are explicit local decoration assets and can be
+        // short-lived (for example hover-only close icons). Render them on the
+        // first use instead of waiting for the async worker, otherwise the
+        // first hover can end before the asset becomes available.
+        if spec.asset_path.is_some() {
+            return self.render_icon_sync_cached(spec);
         }
 
         if let Some(async_job_sender) = &self.async_job_sender {
@@ -141,54 +138,11 @@ impl IconRasterizer {
             return None;
         }
 
-        let rendered = self.render_icon_pixels(spec)?;
-        let buffer = MemoryRenderBuffer::from_slice(
-            &rendered.pixels,
-            Fourcc::Argb8888,
-            (rendered.width, rendered.height),
-            spec.raster_scale.max(1),
-            smithay::utils::Transform::Normal,
-            None,
-        );
-        Some(CachedDecorationIcon {
-            owner_node_id: None,
-            stable_key: String::new(),
-            order: 0,
-            rect: spec.rect,
-            rect_precise: spec.rect_precise,
-            clip_rect: None,
-            clip_radius: 0,
-            clip_rect_precise: None,
-            clip_radius_precise: None,
-            buffer,
-        })
+        self.render_icon_sync_cached(spec)
     }
 
     pub fn render_icon_pixels(&mut self, spec: &IconSpec) -> Option<RenderedIconPixels> {
-        if spec.rect.width <= 0 || spec.rect.height <= 0 {
-            return None;
-        }
-
-        let raster_scale = spec.raster_scale.max(1);
-        let logical_width = spec
-            .rect_precise
-            .map(|rect| rect.width)
-            .unwrap_or(spec.rect.width as f32)
-            .max(0.0);
-        let logical_height = spec
-            .rect_precise
-            .map(|rect| rect.height)
-            .unwrap_or(spec.rect.height as f32)
-            .max(0.0);
-        let target_width = (logical_width * raster_scale as f32).round().max(1.0) as i32;
-        let target_height = (logical_height * raster_scale as f32).round().max(1.0) as i32;
-
-        let source = icon_source_key(spec)?;
-        let key = IconCacheKey {
-            source,
-            width: target_width,
-            height: target_height,
-        };
+        let (key, target_width, target_height, raster_scale) = icon_cache_key_for_spec(spec)?;
 
         let rgba = if let Some(asset_path) = spec.asset_path.as_deref() {
             let extension = std::path::Path::new(asset_path)
@@ -252,6 +206,21 @@ impl IconRasterizer {
             height: target_height,
             pixels,
         })
+    }
+
+    fn render_icon_sync_cached(&mut self, spec: &IconSpec) -> Option<CachedDecorationIcon> {
+        let (key, _, _, _) = icon_cache_key_for_spec(spec)?;
+        if let Some(cached) = self.cache.get(&key) {
+            return cached
+                .as_ref()
+                .map(|buffer| cached_icon_from_buffer(spec, buffer.clone()));
+        }
+
+        self.render_icon_pixels(spec)?;
+        self.cache
+            .get(&key)
+            .and_then(|cached| cached.as_ref())
+            .map(|buffer| cached_icon_from_buffer(spec, buffer.clone()))
     }
 
     pub fn handle_async_ready(
@@ -361,6 +330,53 @@ pub fn hash_icon_spec(spec: &IconSpec) -> u64 {
         }
     }
     hasher.finish()
+}
+
+fn icon_cache_key_for_spec(spec: &IconSpec) -> Option<(IconCacheKey, i32, i32, i32)> {
+    if spec.rect.width <= 0 || spec.rect.height <= 0 {
+        return None;
+    }
+
+    let raster_scale = spec.raster_scale.max(1);
+    let logical_width = spec
+        .rect_precise
+        .map(|rect| rect.width)
+        .unwrap_or(spec.rect.width as f32)
+        .max(0.0);
+    let logical_height = spec
+        .rect_precise
+        .map(|rect| rect.height)
+        .unwrap_or(spec.rect.height as f32)
+        .max(0.0);
+    let target_width = (logical_width * raster_scale as f32).round().max(1.0) as i32;
+    let target_height = (logical_height * raster_scale as f32).round().max(1.0) as i32;
+    let source = icon_source_key(spec)?;
+
+    Some((
+        IconCacheKey {
+            source,
+            width: target_width,
+            height: target_height,
+        },
+        target_width,
+        target_height,
+        raster_scale,
+    ))
+}
+
+fn cached_icon_from_buffer(spec: &IconSpec, buffer: MemoryRenderBuffer) -> CachedDecorationIcon {
+    CachedDecorationIcon {
+        owner_node_id: None,
+        stable_key: String::new(),
+        order: 0,
+        rect: spec.rect,
+        rect_precise: spec.rect_precise,
+        clip_rect: None,
+        clip_radius: 0,
+        clip_rect_precise: None,
+        clip_radius_precise: None,
+        buffer,
+    }
 }
 
 pub fn icon_elements_for_window(
@@ -1091,6 +1107,37 @@ mod tests {
         assert_eq!((width, height), (20, 10));
         assert_eq!(offset_x, -5.0);
         assert_eq!(offset_y, 0.0);
+    }
+
+    #[test]
+    fn image_asset_renders_synchronously_with_async_sender() {
+        let path = std::env::temp_dir().join(format!(
+            "shoji-wm-image-asset-test-{}.svg",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="#fff"/></svg>"##,
+        )
+        .expect("test svg should be writable");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut rasterizer = IconRasterizer::new(Some(sender));
+        let spec = IconSpec {
+            rect: LogicalRect::new(0, 0, 16, 16),
+            rect_precise: None,
+            icon: None,
+            app_id: None,
+            asset_path: Some(path.to_string_lossy().into_owned()),
+            image_fit: Some(ImageFit::Contain),
+            raster_scale: 2,
+        };
+
+        let rendered = rasterizer.render_icon(&spec);
+
+        let _ = std::fs::remove_file(path);
+        assert!(rendered.is_some());
+        assert!(receiver.try_recv().is_err());
     }
 }
 

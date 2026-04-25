@@ -2250,7 +2250,7 @@ fn merge_cached_buffers(
         .filter(|item| {
             item.owner_node_id
                 .as_deref()
-                .is_none_or(|node_id| !dirty_node_ids.contains(node_id))
+                .is_none_or(|node_id| !node_id_matches_dirty_scope(node_id, &dirty_node_ids))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -2273,7 +2273,7 @@ fn merge_shader_buffers(
         .filter(|item| {
             item.owner_node_id
                 .as_deref()
-                .is_none_or(|node_id| !dirty_node_ids.contains(node_id))
+                .is_none_or(|node_id| !node_id_matches_dirty_scope(node_id, &dirty_node_ids))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -2296,7 +2296,7 @@ fn merge_text_buffers(
         .filter(|item| {
             item.owner_node_id
                 .as_deref()
-                .is_none_or(|node_id| !dirty_node_ids.contains(node_id))
+                .is_none_or(|node_id| !node_id_matches_dirty_scope(node_id, &dirty_node_ids))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -2319,13 +2319,28 @@ fn merge_icon_buffers(
         .filter(|item| {
             item.owner_node_id
                 .as_deref()
-                .is_none_or(|node_id| !dirty_node_ids.contains(node_id))
+                .is_none_or(|node_id| !node_id_matches_dirty_scope(node_id, &dirty_node_ids))
         })
         .cloned()
         .collect::<Vec<_>>();
     merged.extend(rebuilt);
     merged.sort_by_key(|item| item.order);
     merged
+}
+
+fn is_descendant_node_id(node_id: &str, ancestor_id: &str) -> bool {
+    node_id.len() > ancestor_id.len()
+        && node_id.starts_with(ancestor_id)
+        && node_id.as_bytes().get(ancestor_id.len()) == Some(&b'.')
+}
+
+fn node_id_matches_dirty_scope(
+    node_id: &str,
+    dirty_node_ids: &std::collections::HashSet<&str>,
+) -> bool {
+    dirty_node_ids
+        .iter()
+        .any(|dirty_id| node_id == *dirty_id || is_descendant_node_id(node_id, dirty_id))
 }
 
 fn paint_ordered_children(
@@ -2436,7 +2451,7 @@ fn collect_cached_buffers(
     let include_node = dirty_node_ids.is_none_or(|dirty_node_ids| {
         node.stable_id
             .as_deref()
-            .is_some_and(|stable_id| dirty_node_ids.contains(stable_id))
+            .is_some_and(|stable_id| node_id_matches_dirty_scope(stable_id, dirty_node_ids))
     });
     let shared_geometry = node
         .stable_id
@@ -2809,7 +2824,7 @@ fn collect_text_buffers(
         !node
             .stable_id
             .as_deref()
-            .is_some_and(|stable_id| dirty_node_ids.contains(stable_id))
+            .is_some_and(|stable_id| node_id_matches_dirty_scope(stable_id, dirty_node_ids))
     }) {
         return;
     }
@@ -2904,7 +2919,7 @@ fn collect_icon_buffers(
         !node
             .stable_id
             .as_deref()
-            .is_some_and(|stable_id| dirty_node_ids.contains(stable_id))
+            .is_some_and(|stable_id| node_id_matches_dirty_scope(stable_id, dirty_node_ids))
     }) {
         return;
     }
@@ -3850,12 +3865,8 @@ fn runtime_dirty_node_damage_rects(
         .collect::<std::collections::HashSet<_>>();
     let mut previous_rects = Vec::new();
     let mut next_rects = Vec::new();
-    previous_layout
-        .root
-        .rects_for_stable_ids(&node_id_set, &mut previous_rects);
-    next_layout
-        .root
-        .rects_for_stable_ids(&node_id_set, &mut next_rects);
+    collect_dirty_scope_rects(&previous_layout.root, &node_id_set, &mut previous_rects);
+    collect_dirty_scope_rects(&next_layout.root, &node_id_set, &mut next_rects);
 
     let mut damage = Vec::new();
     for rect in previous_rects {
@@ -3865,6 +3876,24 @@ fn runtime_dirty_node_damage_rects(
         damage.push(transformed_root_rect(rect, next_transform));
     }
     damage
+}
+
+fn collect_dirty_scope_rects(
+    node: &super::ComputedDecorationNode,
+    dirty_node_ids: &std::collections::HashSet<&str>,
+    rects: &mut Vec<LogicalRect>,
+) {
+    if node
+        .stable_id
+        .as_deref()
+        .is_some_and(|stable_id| node_id_matches_dirty_scope(stable_id, dirty_node_ids))
+    {
+        rects.push(node.rect);
+    }
+
+    for child in &node.children {
+        collect_dirty_scope_rects(child, dirty_node_ids, rects);
+    }
 }
 
 fn freeze_manual_shader_buffers(
@@ -3960,6 +3989,24 @@ mod tests {
             Some("DP-4"),
             Some("DP-4"),
             false,
+        ));
+    }
+
+    #[test]
+    fn dirty_scope_matches_descendant_node_ids() {
+        let dirty = ["root.Box[0]"]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(node_id_matches_dirty_scope("root.Box[0]", &dirty));
+        assert!(node_id_matches_dirty_scope(
+            "root.Box[0].Button[1].Image[0]",
+            &dirty
+        ));
+        assert!(!node_id_matches_dirty_scope("root.Box[1].Image[0]", &dirty));
+        assert!(!node_id_matches_dirty_scope(
+            "root.Box[0-extra].Image[0]",
+            &dirty
         ));
     }
 
