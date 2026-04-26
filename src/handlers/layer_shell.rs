@@ -42,6 +42,18 @@ impl WlrLayerShellHandler for ShojiWM {
         let output = wl_output
             .as_ref()
             .and_then(Output::from_resource)
+            .or_else(|| {
+                let pos = self.seat.get_pointer()?.current_location();
+                let pos_i = pos.to_i32_round();
+                self.space
+                    .outputs()
+                    .find(|output| {
+                        self.space
+                            .output_geometry(output)
+                            .is_some_and(|geometry| geometry.contains(pos_i))
+                    })
+                    .cloned()
+            })
             .unwrap_or_else(|| self.space.outputs().next().unwrap().clone());
         let layer = LayerSurface::new(surface, namespace);
         let mut map = layer_map_for_output(&output);
