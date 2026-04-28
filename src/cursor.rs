@@ -34,6 +34,10 @@ impl Cursor {
         Self { theme, cache, size }
     }
 
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
     pub fn get_image(&mut self, icon: CursorIcon, scale: u32, time: Duration) -> Image {
         let size = self.size * scale;
         let icons = self.cache.entry(icon).or_insert_with(|| {

@@ -109,6 +109,15 @@ pub struct OwnedDamageRect {
     pub rect: LogicalRect,
 }
 
+/// Per-surface marker tracking whether we have already reinterpreted the cursor
+/// hotspot for an oversized cursor buffer (Xwayland HiDPI workaround). Reset in
+/// `SeatHandler::cursor_image` whenever a new cursor surface is set, applied at
+/// most once per set_cursor cycle in the commit handler.
+#[derive(Debug, Default)]
+pub struct CursorOverrideApplied {
+    pub applied: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PopupLatencyDebugState {
     pub surface_id: u32,

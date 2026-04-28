@@ -75,6 +75,19 @@ impl SeatHandler for ShojiWM {
         _seat: &Seat<Self>,
         image: smithay::input::pointer::CursorImageStatus,
     ) {
+        // A new cursor surface (or hotspot update on the same surface) was set; clear
+        // any previous override marker so the commit handler re-applies the hotspot
+        // reinterpretation exactly once for the next commit (Xwayland HiDPI workaround).
+        if let smithay::input::pointer::CursorImageStatus::Surface(surface) = &image {
+            smithay::wayland::compositor::with_states(surface, |states| {
+                if let Some(applied) = states
+                    .data_map
+                    .get::<std::sync::Mutex<crate::state::CursorOverrideApplied>>()
+                {
+                    applied.lock().unwrap().applied = false;
+                }
+            });
+        }
         self.cursor_status = image;
         self.schedule_redraw();
     }

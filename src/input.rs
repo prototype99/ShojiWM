@@ -30,6 +30,7 @@ enum KeyboardAction {
     Forward,
     Quit,
     RuntimeKeyBinding(String),
+    LogMarker(u8),
 }
 
 fn layer_focus_debug_enabled() -> bool {
@@ -84,6 +85,29 @@ impl ShojiWM {
 
                             if modifiers.logo && keysym.raw() == keysyms::KEY_q {
                                 FilterResult::Intercept(KeyboardAction::Quit)
+                            } else if matches!(
+                                key_phase,
+                                crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
+                            ) && modifiers.logo
+                                && modifiers.shift
+                                && !modifiers.ctrl
+                                && !modifiers.alt
+                                && let Some(raw) = handle.raw_latin_sym_or_raw_current_sym()
+                                && let Some(digit) = match raw.raw() {
+                                    keysyms::KEY_0 => Some(0u8),
+                                    keysyms::KEY_1 => Some(1),
+                                    keysyms::KEY_2 => Some(2),
+                                    keysyms::KEY_3 => Some(3),
+                                    keysyms::KEY_4 => Some(4),
+                                    keysyms::KEY_5 => Some(5),
+                                    keysyms::KEY_6 => Some(6),
+                                    keysyms::KEY_7 => Some(7),
+                                    keysyms::KEY_8 => Some(8),
+                                    keysyms::KEY_9 => Some(9),
+                                    _ => None,
+                                }
+                            {
+                                FilterResult::Intercept(KeyboardAction::LogMarker(digit))
                             } else {
                                 FilterResult::Forward
                             }
@@ -136,6 +160,9 @@ impl ShojiWM {
                                 );
                             }
                         }
+                    }
+                    KeyboardAction::LogMarker(digit) => {
+                        tracing::info!(marker = digit, "log marker");
                     }
                     KeyboardAction::Forward => {}
                 }

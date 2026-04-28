@@ -1,7 +1,7 @@
 use crate::{
     grabs::resize_grab,
     handlers::{layer_shell, xdg_shell},
-    state::{ClientState, ShojiWM},
+    state::{ClientState, CursorOverrideApplied, ShojiWM},
 };
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
@@ -136,22 +136,84 @@ impl CompositorHandler for ShojiWM {
                 // / xdg-shell / mapped-window tracking, so we must schedule the redraw here
                 // (niri does the equivalent via its own cursor-surface branch).
                 cursor_surface_committed = true;
-                // Apply the role-specific buffer offset to the hotspot so the cursor stays
-                // anchored when the client attaches a buffer at a non-zero (x, y).
+                let cursor_size = self.cursor_theme.size() as i32;
                 if surface == &root {
                     with_states(surface, |states| {
-                        if let Some(attrs) = states
-                            .data_map
-                            .get::<Mutex<smithay::input::pointer::CursorImageAttributes>>()
-                        {
-                            let buffer_delta = states
-                                .cached_state
-                                .get::<SurfaceAttributes>()
-                                .current()
-                                .buffer_delta
-                                .take();
-                            if let Some(buffer_delta) = buffer_delta {
+                        // Apply the role-specific buffer offset to the hotspot so the cursor
+                        // stays anchored when the client attaches a buffer at a non-zero (x, y).
+                        let buffer_delta = states
+                            .cached_state
+                            .get::<SurfaceAttributes>()
+                            .current()
+                            .buffer_delta
+                            .take();
+                        if let Some(buffer_delta) = buffer_delta {
+                            if let Some(attrs) = states
+                                .data_map
+                                .get::<Mutex<smithay::input::pointer::CursorImageAttributes>>()
+                            {
                                 attrs.lock().unwrap().hotspot -= buffer_delta;
+                            }
+                        }
+
+                        // Workaround for Xwayland (via xwayland-satellite) sending oversized
+                        // cursor buffers without setting buffer_scale: it attaches a 48×48
+                        // Adwaita buffer and never calls set_buffer_scale(2), resulting in a
+                        // logical 48-px cursor that renders as 72 physical px on a 1.5×
+                        // output. xwayland-satellite does not viewport-correct cursor
+                        // surfaces (only toplevels), so we patch buffer_scale here on
+                        // commit. WaylandSurfaceRenderElement::geometry() then uses the
+                        // corrected view.dst at render time.
+                        let buffer_dims = match &states
+                            .cached_state
+                            .get::<SurfaceAttributes>()
+                            .current()
+                            .buffer
+                        {
+                            Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(
+                                buffer,
+                            )) => smithay::backend::renderer::buffer_dimensions(buffer),
+                            _ => None,
+                        };
+                        if let Some(dims) = buffer_dims {
+                            let max_dim = dims.w.max(dims.h);
+                            if cursor_size > 0 && max_dim > cursor_size {
+                                let mut attrs_cache =
+                                    states.cached_state.get::<SurfaceAttributes>();
+                                let attrs = attrs_cache.current();
+                                if attrs.buffer_scale == 1 {
+                                    let factor = ((max_dim as f64 / cursor_size as f64).round()
+                                        as i32)
+                                        .max(2);
+                                    attrs.buffer_scale = factor;
+
+                                    // Hotspot reinterpretation: divide by factor exactly once
+                                    // per set_cursor cycle. CursorOverrideApplied tracks this
+                                    // and is reset in `cursor_image()` whenever a new cursor
+                                    // surface is set.
+                                    states
+                                        .data_map
+                                        .insert_if_missing_threadsafe(|| {
+                                            Mutex::new(CursorOverrideApplied::default())
+                                        });
+                                    let mut applied = states
+                                        .data_map
+                                        .get::<Mutex<CursorOverrideApplied>>()
+                                        .unwrap()
+                                        .lock()
+                                        .unwrap();
+                                    if !applied.applied {
+                                        applied.applied = true;
+                                        if let Some(cursor_attrs) = states.data_map.get::<Mutex<
+                                            smithay::input::pointer::CursorImageAttributes,
+                                        >>(
+                                        ) {
+                                            let mut hot = cursor_attrs.lock().unwrap();
+                                            hot.hotspot.x /= factor;
+                                            hot.hotspot.y /= factor;
+                                        }
+                                    }
+                                }
                             }
                         }
                     });
