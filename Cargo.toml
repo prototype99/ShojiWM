@@ -7,13 +7,13 @@ edition = "2024"
 bitflags = "2.11.0"
 thiserror = "2.0.12"
 smithay = {
-    git = "https://github.com/Smithay/smithay.git",
-    rev = "f6d10709db2bb68c46b9c128a4163d035356572c",
+    git = "https://github.com/bea4dev/smithay.git",
+    branch = "fix-xwayland-multi-monitor",
     features = ["use_system_lib", "xwayland"]
 }
 smithay-drm-extras = {
-    git = "https://github.com/Smithay/smithay.git",
-    rev = "f6d10709db2bb68c46b9c128a4163d035356572c",
+    git = "https://github.com/bea4dev/smithay.git",
+    branch = "fix-xwayland-multi-monitor",
     package = "smithay-drm-extras",
     default-features = false
 }
@@ -29,7 +29,3 @@ fontdue = "0.9.3"
 cosmic-text = "0.17.2"
 png = "0.17.16"
 resvg = "0.45.1"
-
-[patch."https://github.com/Smithay/smithay.git"]
-smithay = { path = "misc/smithay" }
-smithay-drm-extras = { path = "misc/smithay/smithay-drm-extras" }

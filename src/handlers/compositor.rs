@@ -5,27 +5,15 @@ use crate::{
 };
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
-    delegate_shm,
     reexports::wayland_server::{
-        Client, DataInit, Dispatch, DisplayHandle, Resource,
-        backend::ClientId,
-        delegate_dispatch, delegate_global_dispatch,
-        protocol::{
-            wl_buffer,
-            wl_callback::WlCallback,
-            wl_compositor::WlCompositor,
-            wl_region::{self, WlRegion},
-            wl_subcompositor::WlSubcompositor,
-            wl_subsurface::WlSubsurface,
-            wl_surface::WlSurface,
-        },
+        Client, Resource,
+        protocol::{wl_buffer, wl_surface::WlSurface},
     },
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            CompositorClientState, CompositorHandler, CompositorState, RegionUserData,
-            SubsurfaceUserData, SurfaceAttributes, SurfaceUserData, get_parent, is_sync_subsurface,
-            with_states,
+            CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
+            get_parent, is_sync_subsurface, with_states,
         },
         shell::xdg::SurfaceCachedState,
         shm::{ShmHandler, ShmState},
@@ -191,11 +179,9 @@ impl CompositorHandler for ShojiWM {
                                     // per set_cursor cycle. CursorOverrideApplied tracks this
                                     // and is reset in `cursor_image()` whenever a new cursor
                                     // surface is set.
-                                    states
-                                        .data_map
-                                        .insert_if_missing_threadsafe(|| {
-                                            Mutex::new(CursorOverrideApplied::default())
-                                        });
+                                    states.data_map.insert_if_missing_threadsafe(|| {
+                                        Mutex::new(CursorOverrideApplied::default())
+                                    });
                                     let mut applied = states
                                         .data_map
                                         .get::<Mutex<CursorOverrideApplied>>()
@@ -204,10 +190,13 @@ impl CompositorHandler for ShojiWM {
                                         .unwrap();
                                     if !applied.applied {
                                         applied.applied = true;
-                                        if let Some(cursor_attrs) = states.data_map.get::<Mutex<
-                                            smithay::input::pointer::CursorImageAttributes,
-                                        >>(
-                                        ) {
+                                        if let Some(cursor_attrs) =
+                                            states
+                                                .data_map
+                                                .get::<Mutex<
+                                                    smithay::input::pointer::CursorImageAttributes,
+                                                >>()
+                                        {
                                             let mut hot = cursor_attrs.lock().unwrap();
                                             hot.hotspot.x /= factor;
                                             hot.hotspot.y /= factor;
@@ -396,62 +385,3 @@ impl ShmHandler for ShojiWM {
         &self.shm_state
     }
 }
-
-// delegate_compositor!(ShojiWM) is intentionally expanded by hand here instead of using the
-// macro directly. The reason is that we need to intercept wl_region requests before they reach
-// Smithay's handler: Smithay's Size::new contains a debug_assert that panics when width or height
-// is negative, but Firefox (and potentially other clients) sends wl_region rectangles with
-// negative dimensions (e.g. height = -1) in certain situations such as moving a window to a
-// different monitor. By handling WlRegion ourselves and filtering out invalid rectangles before
-// forwarding to CompositorState, we avoid the panic without touching the Smithay source.
-//
-// If delegate_compositor! gains new delegations in a future Smithay update, the individual
-// delegate_dispatch!/delegate_global_dispatch! lines below must be updated to match.
-delegate_global_dispatch!(ShojiWM: [WlCompositor: ()] => CompositorState);
-delegate_global_dispatch!(ShojiWM: [WlSubcompositor: ()] => CompositorState);
-delegate_dispatch!(ShojiWM: [WlCompositor: ()] => CompositorState);
-delegate_dispatch!(ShojiWM: [WlSurface: SurfaceUserData] => CompositorState);
-delegate_dispatch!(ShojiWM: [WlCallback: ()] => CompositorState);
-delegate_dispatch!(ShojiWM: [WlSubcompositor: ()] => CompositorState);
-delegate_dispatch!(ShojiWM: [WlSubsurface: SubsurfaceUserData] => CompositorState);
-impl Dispatch<WlRegion, RegionUserData> for ShojiWM {
-    fn request(
-        state: &mut Self,
-        client: &Client,
-        resource: &WlRegion,
-        request: wl_region::Request,
-        data: &RegionUserData,
-        dhandle: &DisplayHandle,
-        data_init: &mut DataInit<'_, Self>,
-    ) {
-        let skip = match &request {
-            wl_region::Request::Add { width, height, .. }
-            | wl_region::Request::Subtract { width, height, .. } => {
-                if *width < 0 || *height < 0 {
-                    tracing::debug!(
-                        width,
-                        height,
-                        "ignoring wl_region rect with negative dimensions"
-                    );
-                    true
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        };
-        if !skip {
-            <CompositorState as Dispatch<WlRegion, RegionUserData, Self>>::request(
-                state, client, resource, request, data, dhandle, data_init,
-            );
-        }
-    }
-
-    fn destroyed(state: &mut Self, client: ClientId, resource: &WlRegion, data: &RegionUserData) {
-        <CompositorState as Dispatch<WlRegion, RegionUserData, Self>>::destroyed(
-            state, client, resource, data,
-        );
-    }
-}
-
-delegate_shm!(ShojiWM);

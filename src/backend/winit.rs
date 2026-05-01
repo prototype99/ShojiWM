@@ -171,7 +171,6 @@ pub fn init_winit(
             serial_number: "Unknown".into(),
         },
     );
-    let _global = output.create_global::<ShojiWM>(&state.display_handle);
     output.change_current_state(
         Some(mode),
         Some(Transform::Flipped180),
@@ -179,6 +178,8 @@ pub fn init_winit(
         Some((0, 0).into()),
     );
     output.set_preferred(mode);
+    state.seed_xwayland_refresh_override_from_output(&output, "winit-output-connected");
+    let _global = state.create_output_global(&output);
 
     state.space.map_output(&output, (0, 0));
 

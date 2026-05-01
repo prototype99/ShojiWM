@@ -982,11 +982,7 @@ fn render_surface(
                     CursorImageStatus::Named(icon) => *icon,
                     _ => smithay::input::pointer::CursorIcon::Default,
                 };
-                let cursor_scale = output
-                    .current_scale()
-                    .fractional_scale()
-                    .ceil()
-                    .max(1.0) as u32;
+                let cursor_scale = output.current_scale().fractional_scale().ceil().max(1.0) as u32;
                 let frame = cursor_theme.get_image(icon, cursor_scale, start_time.elapsed());
                 let buffer = pointer_images
                     .iter()
@@ -3898,18 +3894,6 @@ fn backdrop_shader_elements_for_window(
         .cloned()
         .collect::<Vec<_>>();
     let (_, lower_layers) = window_render::layer_surfaces_for_output(output);
-    let relevant_source_damage = {
-        let mut entries = collect_window_source_damage(
-            window_decorations,
-            lower_windows.iter().cloned(),
-            window_source_damage,
-        );
-        entries.extend(collect_layer_source_damage(
-            lower_layers.iter().cloned(),
-            lower_layer_source_damage,
-        ));
-        entries
-    };
 
     decoration
         .shader_buffers
@@ -6548,7 +6532,8 @@ fn connector_connected(
     let frame_duration = Duration::from_secs_f64(1_000f64 / wl_mode.refresh as f64);
     output.set_preferred(wl_mode);
     output.change_current_state(Some(wl_mode), None, None, Some((0, 0).into()));
-    output.create_global::<ShojiWM>(&state.display_handle);
+    state.seed_xwayland_refresh_override_from_output(&output, "tty-output-connected");
+    state.create_output_global(&output);
     state.space.map_output(&output, (0, 0));
     info!(
         ?node,

@@ -1,7 +1,6 @@
 use std::os::unix::io::OwnedFd;
 
 use smithay::{
-    delegate_xwayland_shell,
     desktop::Window,
     utils::{Logical, Rectangle},
     wayland::{
@@ -38,8 +37,6 @@ impl XWaylandShellHandler for ShojiWM {
     }
 }
 
-delegate_xwayland_shell!(ShojiWM);
-
 impl ShojiWM {
     fn find_x11_window(&self, surface: &X11Surface) -> Option<Window> {
         self.space
@@ -49,12 +46,16 @@ impl ShojiWM {
     }
 
     fn x11_place_location(&self) -> (i32, i32) {
-        let outputs: Vec<_> = self.space.outputs().cloned().collect();
-        let output = match outputs.first() {
+        let pointer_output = self
+            .seat
+            .get_pointer()
+            .and_then(|pointer| self.output_at_point(pointer.current_location()));
+        let first_output = || self.space.outputs().next().cloned();
+        let output = match pointer_output.or_else(first_output) {
             Some(output) => output,
             None => return (0, 0),
         };
-        let geo = match self.space.output_geometry(output) {
+        let geo = match self.space.output_geometry(&output) {
             Some(geo) => geo,
             None => return (0, 0),
         };
@@ -86,7 +87,9 @@ impl XwmHandler for ShojiWM {
         }
         let location = self.x11_place_location();
         let smithay_window = Window::new_x11_window(window.clone());
-        self.space.map_element(smithay_window, location, true);
+        self.space
+            .map_element(smithay_window.clone(), location, true);
+        self.update_xwayland_refresh_override_for_window(&smithay_window, "x11-window-map");
         let bbox = window.geometry();
         let placed = Rectangle::<i32, Logical>::new((location.0, location.1).into(), bbox.size);
         if let Err(err) = window.configure(Some(placed)) {
@@ -164,7 +167,8 @@ impl XwmHandler for ShojiWM {
             );
         }
         if let Some(elem) = self.find_x11_window(&window) {
-            self.space.map_element(elem, geometry.loc, false);
+            self.space.map_element(elem.clone(), geometry.loc, false);
+            self.update_xwayland_refresh_override_for_window(&elem, "x11-configure-notify");
             self.schedule_redraw();
         }
     }

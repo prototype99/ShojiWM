@@ -1,7 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::OsString,
-    sync::Arc,
+    fs,
+    os::fd::AsFd,
+    sync::{
+        Arc,
+        atomic::{AtomicI32, Ordering},
+    },
     time::Duration,
 };
 
@@ -24,6 +29,7 @@ use smithay::{
             generic::Generic,
             timer::{TimeoutAction, Timer},
         },
+        rustix::net::sockopt::socket_peercred,
         wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
         wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as KdeDecorationMode,
         wayland_server::{
@@ -277,6 +283,7 @@ pub struct ShojiWM {
     pub xwm: Option<X11Wm>,
     pub xdisplay: Option<u32>,
     pub xwayland_satellite: Option<SatelliteInstance>,
+    pub xwayland_refresh_override_mhz: Arc<AtomicI32>,
 }
 
 impl ShojiWM {
@@ -711,10 +718,164 @@ impl ShojiWM {
             xwm: None,
             xdisplay: None,
             xwayland_satellite: None,
+            xwayland_refresh_override_mhz: Arc::new(AtomicI32::new(0)),
         }
     }
 
+    pub fn create_output_global(
+        &self,
+        output: &Output,
+    ) -> smithay::reexports::wayland_server::backend::GlobalId {
+        let refresh_override_mhz = self.xwayland_refresh_override_mhz.clone();
+        output.create_global_with_mode_refresh_override::<ShojiWM, _>(
+            &self.display_handle,
+            move |client| {
+                let is_builtin_xwayland = client
+                    .get_data::<smithay::xwayland::XWaylandClientData>()
+                    .is_some();
+                let is_xwayland_bridge = client
+                    .get_data::<ClientState>()
+                    .is_some_and(|data| data.xwayland_refresh_override);
+                if !(is_builtin_xwayland || is_xwayland_bridge) {
+                    return None;
+                }
+
+                let refresh = refresh_override_mhz.load(Ordering::Acquire);
+                (refresh > 0).then_some(refresh)
+            },
+        )
+    }
+
+    pub fn seed_xwayland_refresh_override_from_output(
+        &self,
+        output: &Output,
+        reason: &'static str,
+    ) {
+        let Some(mode) = output.current_mode() else {
+            return;
+        };
+        if self
+            .xwayland_refresh_override_mhz
+            .compare_exchange(0, mode.refresh, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            info!(
+                output = %output.name(),
+                refresh_mhz = mode.refresh,
+                reason,
+                "seeded xwayland refresh override"
+            );
+        }
+    }
+
+    pub fn update_xwayland_refresh_override_for_window(
+        &mut self,
+        window: &Window,
+        reason: &'static str,
+    ) {
+        if !self.window_uses_xwayland_refresh_override(window) {
+            return;
+        }
+        let Some(output) = self.output_for_window(window) else {
+            return;
+        };
+        self.update_xwayland_refresh_override_for_output(&output, reason);
+    }
+
+    pub fn update_xwayland_refresh_override_from_pointer_or_first(&mut self, reason: &'static str) {
+        let output = self
+            .seat
+            .get_pointer()
+            .and_then(|pointer| self.output_at_point(pointer.current_location()))
+            .or_else(|| self.space.outputs().next().cloned());
+        if let Some(output) = output {
+            self.update_xwayland_refresh_override_for_output(&output, reason);
+        }
+    }
+
+    fn update_xwayland_refresh_override_for_output(
+        &mut self,
+        output: &Output,
+        reason: &'static str,
+    ) {
+        let Some(mode) = output.current_mode() else {
+            return;
+        };
+        let previous = self
+            .xwayland_refresh_override_mhz
+            .swap(mode.refresh, Ordering::AcqRel);
+        if previous == mode.refresh {
+            return;
+        }
+
+        info!(
+            output = %output.name(),
+            previous_refresh_mhz = previous,
+            refresh_mhz = mode.refresh,
+            reason,
+            "updated xwayland refresh override"
+        );
+
+        for output in self.space.outputs() {
+            if let Some(mode) = output.current_mode() {
+                output.change_current_state(Some(mode), None, None, None);
+            }
+        }
+        let _ = self.display_handle.flush_clients();
+    }
+
+    fn window_uses_xwayland_refresh_override(&self, window: &Window) -> bool {
+        if window.x11_surface().is_some() {
+            return true;
+        }
+        window
+            .toplevel()
+            .and_then(|toplevel| toplevel.wl_surface().client())
+            .is_some_and(|client| {
+                client
+                    .get_data::<ClientState>()
+                    .is_some_and(|data| data.xwayland_refresh_override)
+            })
+    }
+
+    pub(crate) fn output_at_point(&self, pos: Point<f64, Logical>) -> Option<Output> {
+        self.space
+            .outputs()
+            .find(|output| {
+                self.space
+                    .output_geometry(output)
+                    .is_some_and(|geometry| geometry.contains(pos.to_i32_round()))
+            })
+            .cloned()
+    }
+
+    fn output_for_window(&self, window: &Window) -> Option<Output> {
+        let rect = self.space.element_bbox(window)?;
+        self.space
+            .outputs()
+            .filter_map(|output| {
+                let geometry = self.space.output_geometry(output)?;
+                let area = geometry
+                    .intersection(rect)
+                    .map(|overlap| i64::from(overlap.size.w) * i64::from(overlap.size.h))
+                    .unwrap_or(0);
+                Some((area, output.clone()))
+            })
+            .max_by_key(|(area, _)| *area)
+            .and_then(|(area, output)| (area > 0).then_some(output))
+            .or_else(|| {
+                let center = Point::from((
+                    f64::from(rect.loc.x) + f64::from(rect.size.w) / 2.0,
+                    f64::from(rect.loc.y) + f64::from(rect.size.h) / 2.0,
+                ));
+                self.output_at_point(center)
+            })
+            .or_else(|| self.space.outputs().next().cloned())
+    }
+
     pub fn start_xwayland(&mut self, event_loop: &EventLoop<'static, ShojiWM>) {
+        self.update_xwayland_refresh_override_from_pointer_or_first("xwayland-start");
+
         if satellite_requested() {
             match spawn_satellite() {
                 Ok(instance) => {
@@ -819,13 +980,28 @@ impl ShojiWM {
         loop_handle
             .insert_source(listening_socket, move |client_stream, _, state| {
                 state.record_event_source_wake("wayland-listener");
-                info!("accepted new wayland client connection");
+                let client_is_xwayland_bridge = is_xwayland_bridge_client(&client_stream);
+                if client_is_xwayland_bridge {
+                    state.update_xwayland_refresh_override_from_pointer_or_first(
+                        "xwayland-bridge-connect",
+                    );
+                }
+                info!(
+                    client_is_xwayland_bridge,
+                    "accepted new wayland client connection"
+                );
                 // Inside the callback, you should insert the client into the display.
                 //
                 // You may also associate some data with the client when inserting the client.
                 state
                     .display_handle
-                    .insert_client(client_stream, Arc::new(ClientState::default()))
+                    .insert_client(
+                        client_stream,
+                        Arc::new(ClientState {
+                            compositor_state: CompositorClientState::default(),
+                            xwayland_refresh_override: client_is_xwayland_bridge,
+                        }),
+                    )
                     .unwrap();
                 state.request_tty_maintenance("wayland-listener");
             })
@@ -2171,9 +2347,45 @@ impl ShojiWM {
 #[derive(Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
+    pub xwayland_refresh_override: bool,
 }
 
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+fn is_xwayland_bridge_client<Fd: AsFd>(fd: Fd) -> bool {
+    let Ok(credentials) = socket_peercred(fd) else {
+        return false;
+    };
+    let pid = credentials.pid.as_raw_pid();
+    let Some(command) = process_command_for_pid(pid) else {
+        return false;
+    };
+
+    let is_bridge = command.contains("xwayland-satellite")
+        || command.contains("Xwayland")
+        || command.contains("Xorg");
+    if is_bridge {
+        info!(pid, command, "detected xwayland refresh-override client");
+    }
+    is_bridge
+}
+
+fn process_command_for_pid(pid: i32) -> Option<String> {
+    if let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) {
+        let command = String::from_utf8_lossy(&cmdline)
+            .split('\0')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !command.is_empty() {
+            return Some(command);
+        }
+    }
+
+    fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|value| value.trim().to_owned())
 }

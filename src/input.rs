@@ -962,6 +962,7 @@ impl ShojiWM {
             .map(|toplevel| toplevel.wl_surface().id().protocol_id())
             .unwrap_or_default();
         self.space.raise_element(window, true);
+        self.update_xwayland_refresh_override_for_window(window, "window-focus");
         self.set_window_keyboard_focus_target(Some(window));
         self.focus_layer_surface_if_on_demand(None);
         self.update_keyboard_focus(serial);

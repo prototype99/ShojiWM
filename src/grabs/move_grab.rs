@@ -98,6 +98,7 @@ impl PointerGrab<ShojiWM> for MoveSurfaceGrab {
 
             data.space
                 .map_element(self.window.clone(), new_location, true);
+            data.update_xwayland_refresh_override_for_window(&self.window, "window-move");
             data.window_source_damage
                 .push(crate::state::OwnedDamageRect {
                     owner: window_id.clone(),

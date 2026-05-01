@@ -1,5 +1,4 @@
 use smithay::{
-    delegate_xdg_shell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window,
         WindowSurfaceType, find_popup_root_surface, get_popup_toplevel_coords,
@@ -85,6 +84,11 @@ impl XdgShellHandler for ShojiWM {
         // });
         // surface.send_pending_configure();
 
+        let uses_xwayland_refresh_override = surface.wl_surface().client().is_some_and(|client| {
+            client
+                .get_data::<crate::state::ClientState>()
+                .is_some_and(|data| data.xwayland_refresh_override)
+        });
         let window = Window::new_wayland_window(surface);
         let snapshot = self.snapshot_window(&window);
         let initial_location = match self.suggested_window_location(&snapshot) {
@@ -101,7 +105,11 @@ impl XdgShellHandler for ShojiWM {
             }
         };
 
-        self.space.map_element(window, initial_location, false);
+        self.space
+            .map_element(window.clone(), initial_location, false);
+        if uses_xwayland_refresh_override {
+            self.update_xwayland_refresh_override_for_window(&window, "xdg-toplevel-map");
+        }
         debug!(
             window_count = self.space.elements().count(),
             "mapped new toplevel into space"
@@ -299,9 +307,6 @@ impl XdgShellHandler for ShojiWM {
         }
     }
 }
-
-// Xdg Shell
-delegate_xdg_shell!(ShojiWM);
 
 impl XdgDecorationHandler for ShojiWM {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
