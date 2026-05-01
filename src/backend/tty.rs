@@ -72,7 +72,15 @@ use crate::{
 use smithay::wayland::presentation::Refresh;
 
 const CLEAR_COLOR: [f32; 4] = [0.08, 0.10, 0.13, 1.0];
-const TTY_FRAME_FLAGS: FrameFlags = FrameFlags::DEFAULT;
+// Match niri's default policy: direct scanout is still allowed on the primary plane and
+// hardware cursor updates may use the cursor plane, but overlay planes stay disabled.
+//
+// Smithay's `FrameFlags::DEFAULT` includes overlay-plane scanout. That is attractive in theory,
+// but in practice overlay assignment can interact poorly with buffer lifetime/presentation timing
+// on some drivers. Keeping this explicit makes the tradeoff visible and avoids accidentally
+// re-enabling overlays if Smithay's default changes.
+const TTY_FRAME_FLAGS: FrameFlags =
+    FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY.union(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
 
 fn frame_liveness_debug_enabled() -> bool {
     std::env::var_os("SHOJI_FRAME_LIVENESS_DEBUG")
