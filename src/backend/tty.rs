@@ -1783,17 +1783,6 @@ fn render_surface(
             let client_elements = if use_full_window_snapshot {
                 let full_snapshot_scene_started_at = Instant::now();
                 let mut snapshot_scene = Vec::new();
-                snapshot_scene.extend(
-                    window_render::popup_elements(
-                        window,
-                        &mut backend.renderer,
-                        physical_location,
-                        scale,
-                        1.0,
-                    )
-                    .into_iter()
-                    .map(TtyRenderElements::Window),
-                );
                 if let Some(content_clip) = content_clip {
                     let clipped = window_render::clipped_surface_elements(
                         window,
@@ -1807,17 +1796,29 @@ fn render_surface(
                         Some(content_clip),
                     )
                     .unwrap_or_default();
-                    snapshot_scene.extend(clipped.into_iter().map(|element| match element {
-                        window_render::WindowClipElement::Clipped(element) => {
-                            TtyRenderElements::Clipped(element)
+                    let mut root_raw_element = None;
+                    for element in clipped {
+                        match element {
+                            window_render::WindowClipElement::Clipped(element) => {
+                                snapshot_scene.push(TtyRenderElements::Clipped(element));
+                                break;
+                            }
+                            window_render::WindowClipElement::Raw(element)
+                                if root_raw_element.is_none() =>
+                            {
+                                root_raw_element = Some(element);
+                            }
+                            window_render::WindowClipElement::Raw(_) => {}
                         }
-                        window_render::WindowClipElement::Raw(element) => {
-                            TtyRenderElements::Window(element)
-                        }
-                    }));
+                    }
+                    if snapshot_scene.is_empty()
+                        && let Some(element) = root_raw_element
+                    {
+                        snapshot_scene.push(TtyRenderElements::Window(element));
+                    }
                 } else {
                     snapshot_scene.extend(
-                        window_render::surface_elements(
+                        window_render::root_surface_elements(
                             window,
                             &mut backend.renderer,
                             physical_location,
@@ -2754,24 +2755,35 @@ fn render_surface(
             window_timing.client_phase_ms =
                 client_phase_started_at.elapsed().as_secs_f64() * 1000.0;
             let mut current_window_elements: Vec<TtyRenderElements> = Vec::new();
-            if !use_full_window_snapshot {
-                let popup_phase_started_at = Instant::now();
-                let popup_elements = transform_window_elements(
-                    window_render::popup_elements(
-                        window,
-                        &mut backend.renderer,
-                        physical_location,
-                        scale,
-                        visual_state.opacity,
-                    ),
+            let popup_phase_started_at = Instant::now();
+            let popup_elements = transform_window_elements(
+                window_render::popup_elements(
+                    window,
+                    &mut backend.renderer,
+                    physical_location,
+                    scale,
+                    visual_state.opacity,
+                ),
+                visual_state,
+                TtyRenderElements::Window,
+                TtyRenderElements::TransformedWindow,
+            );
+            current_window_elements.extend(popup_elements);
+            if use_full_window_snapshot {
+                current_window_elements.extend(non_root_surface_elements_for_window(
+                    window,
+                    &mut backend.renderer,
+                    physical_location,
+                    client_physical_geometry,
+                    output_geo.loc,
+                    scale,
+                    scale,
                     visual_state,
-                    TtyRenderElements::Window,
-                    TtyRenderElements::TransformedWindow,
-                );
-                current_window_elements.extend(popup_elements);
-                window_timing.popup_phase_ms =
-                    popup_phase_started_at.elapsed().as_secs_f64() * 1000.0;
+                    visual_state.opacity,
+                    content_clip,
+                ));
             }
+            window_timing.popup_phase_ms = popup_phase_started_at.elapsed().as_secs_f64() * 1000.0;
             if output_render_debug_enabled() {
                 let title = window_decorations
                     .get(window)
@@ -3034,34 +3046,22 @@ fn render_surface(
                         warn!(window_id = %window_id, ?error, "failed to build replacement window effect");
                     })
                     .ok()
-                });
+            });
             if let Some(replace_effects) = replace_effects {
-                if use_full_window_snapshot {
-                    current_window_elements.extend(transform_window_elements(
-                        window_render::popup_elements(
-                            window,
-                            &mut backend.renderer,
-                            physical_location,
-                            scale,
-                            visual_state.opacity,
-                        ),
+                if !use_full_window_snapshot {
+                    current_window_elements.extend(non_root_surface_elements_for_window(
+                        window,
+                        &mut backend.renderer,
+                        physical_location,
+                        client_physical_geometry,
+                        output_geo.loc,
+                        scale,
+                        source_clip_scale,
                         visual_state,
-                        TtyRenderElements::Window,
-                        TtyRenderElements::TransformedWindow,
+                        visual_state.opacity,
+                        content_clip,
                     ));
                 }
-                current_window_elements.extend(non_root_surface_elements_for_window(
-                    window,
-                    &mut backend.renderer,
-                    physical_location,
-                    client_physical_geometry,
-                    output_geo.loc,
-                    scale,
-                    source_clip_scale,
-                    visual_state,
-                    visual_state.opacity,
-                    content_clip,
-                ));
                 current_window_elements.extend(replace_effects);
             } else {
                 current_window_elements.extend(original_window_body_elements);
