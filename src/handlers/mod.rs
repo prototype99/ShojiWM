@@ -472,3 +472,27 @@ impl DataControlHandler for ShojiWM {
 //
 
 impl OutputHandler for ShojiWM {}
+
+//
+// wlr-screencopy
+//
+
+impl crate::protocols::screencopy::ScreencopyHandler for ShojiWM {
+    fn frame(
+        &mut self,
+        manager: &smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+        screencopy: crate::protocols::screencopy::Screencopy,
+    ) {
+        // Queue both with/without-damage requests for processing on the next
+        // redraw of the captured output. Without-damage requests are always
+        // rendered, while with-damage requests wait until damage exists.
+        self.screencopy_state.push(manager, screencopy);
+        self.schedule_redraw();
+    }
+
+    fn screencopy_state(&mut self) -> &mut crate::protocols::screencopy::ScreencopyManagerState {
+        &mut self.screencopy_state
+    }
+}
+
+crate::delegate_screencopy!(ShojiWM);

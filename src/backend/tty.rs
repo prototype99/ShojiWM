@@ -938,6 +938,7 @@ fn render_surface(
             closing_window_snapshots,
             snapshot_dirty_window_ids,
             transform_snapshot_window_ids,
+            screencopy_state,
             ..
         } = state;
 
@@ -3483,6 +3484,14 @@ fn render_surface(
             render_element_count = elements.len(),
             cursor_status = ?cursor_status_for_log,
             "rendering tty surface"
+        );
+
+        crate::backend::screencopy_render::process_screencopy_queue_for_output(
+            screencopy_state,
+            loop_handle,
+            &mut backend.renderer,
+            &output,
+            &elements,
         );
 
         let result = surface.drm_output.render_frame(

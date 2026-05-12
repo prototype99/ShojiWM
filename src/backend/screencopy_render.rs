@@ -1,0 +1,250 @@
+//! Render path for wlr-screencopy frames.
+//!
+//! Given the elements that were just built for an output's normal render, this
+//! produces a copy of the output (or a sub-region of it) into a client-provided
+//! SHM or DMA-BUF buffer.
+
+use std::ptr;
+
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
+use smithay::backend::renderer::element::RenderElement;
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTarget, GlesTexture};
+use smithay::backend::renderer::sync::SyncPoint;
+use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen, Renderer};
+use smithay::output::Output;
+use smithay::reexports::calloop::LoopHandle;
+use smithay::reexports::wayland_server::protocol::wl_shm;
+use smithay::utils::{Physical, Rectangle, Scale, Size, Transform};
+use smithay::wayland::shm;
+
+use crate::backend::tty::TtyRenderElements;
+use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
+use crate::state::ShojiWM;
+
+/// Render and submit all queued screencopies that target `output`.
+///
+/// For with-damage screencopies, the per-queue damage tracker is consulted and
+/// only submits when there's something new. Without-damage screencopies are
+/// always rendered and submitted.
+pub fn process_screencopy_queue_for_output(
+    screencopy_state: &mut ScreencopyManagerState,
+    loop_handle: &LoopHandle<'_, ShojiWM>,
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    elements: &[TtyRenderElements],
+) {
+    screencopy_state.with_queues_mut(|queue| loop {
+        let (damage_tracker, front) = queue.split();
+        let Some(front) = front else {
+            return;
+        };
+        if front.output() != output {
+            return;
+        }
+        let with_damage = front.with_damage();
+
+        let render_result = render_for_screencopy(renderer, output, elements, damage_tracker, front);
+        match render_result {
+            Ok((sync, damages)) => match damages {
+                Some(damages) => {
+                    if with_damage {
+                        let transform = output.current_transform();
+                        let physical_size = transform.transform_size(front.buffer_size());
+                        let damages = damages
+                            .iter()
+                            .map(|dmg| {
+                                dmg.to_logical(1).to_buffer(
+                                    1,
+                                    transform.invert(),
+                                    &physical_size.to_logical(1),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        front.damage(damages.into_iter());
+                    }
+                    let screencopy = queue.pop();
+                    screencopy.submit_after_sync(false, sync, loop_handle);
+                }
+                None => {
+                    // with_damage and no damage yet — wait for the next frame.
+                    return;
+                }
+            },
+            Err(err) => {
+                tracing::warn!("error rendering for screencopy: {err:?}");
+                // Reset damage tracker so the next attempt reports full damage.
+                *damage_tracker = OutputDamageTracker::new((0, 0), 1.0, Transform::Normal);
+                let _ = queue.pop();
+            }
+        }
+    });
+}
+
+fn render_for_screencopy<'a>(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    elements: &[TtyRenderElements],
+    damage_tracker: &'a mut OutputDamageTracker,
+    screencopy: &Screencopy,
+) -> Result<
+    (
+        Option<SyncPoint>,
+        Option<&'a Vec<Rectangle<i32, Physical>>>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    use smithay::output::OutputModeSource;
+
+    let OutputModeSource::Static {
+        size: last_size,
+        scale: last_scale,
+        transform: last_transform,
+    } = damage_tracker.mode().clone()
+    else {
+        return Err("damage tracker must have static mode".into());
+    };
+
+    let size = screencopy.buffer_size();
+    let scale: Scale<f64> = output.current_scale().fractional_scale().into();
+    let transform = output.current_transform();
+
+    if size != last_size || scale != last_scale || transform != last_transform {
+        *damage_tracker = OutputDamageTracker::new(size, scale, transform);
+    }
+
+    let region_loc = screencopy.region_loc();
+    let relocated_elements = elements
+        .iter()
+        .map(|element| {
+            RelocateRenderElement::from_element(
+                element,
+                region_loc.upscale(-1),
+                Relocate::Relative,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let damages = damage_tracker
+        .damage_output(1, &relocated_elements)
+        .map_err(|e| format!("damage_output error: {e:?}"))?
+        .0;
+    if screencopy.with_damage() && damages.is_none() {
+        return Ok((None, None));
+    }
+
+    let element_iter = relocated_elements.iter().rev();
+
+    let sync = match screencopy.buffer() {
+        ScreencopyBuffer::Dmabuf(dmabuf) => {
+            let sync = render_to_dmabuf(
+                renderer,
+                dmabuf.clone(),
+                size,
+                scale,
+                transform,
+                element_iter,
+            )?;
+            Some(sync)
+        }
+        ScreencopyBuffer::Shm(wl_buffer) => {
+            render_to_shm(renderer, wl_buffer, size, scale, transform, element_iter)?;
+            None
+        }
+    };
+
+    Ok((sync, damages))
+}
+
+fn render_to_dmabuf(
+    renderer: &mut GlesRenderer,
+    mut dmabuf: Dmabuf,
+    size: Size<i32, Physical>,
+    scale: Scale<f64>,
+    transform: Transform,
+    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
+) -> Result<SyncPoint, Box<dyn std::error::Error>> {
+    let mut target = renderer.bind(&mut dmabuf)?;
+    render_elements_to_target(renderer, &mut target, size, scale, transform, elements)
+}
+
+fn render_to_shm(
+    renderer: &mut GlesRenderer,
+    buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
+    size: Size<i32, Physical>,
+    scale: Scale<f64>,
+    transform: Transform,
+    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    shm::with_buffer_contents_mut(buffer, |shm_buffer, shm_len, buffer_data| {
+        if !(buffer_data.format == wl_shm::Format::Xrgb8888
+            && buffer_data.width == size.w
+            && buffer_data.height == size.h
+            && buffer_data.stride == size.w * 4
+            && shm_len == buffer_data.stride as usize * buffer_data.height as usize)
+        {
+            return Err::<(), Box<dyn std::error::Error>>("invalid shm buffer format/size".into());
+        }
+        let mapping = render_and_download(
+            renderer,
+            size,
+            scale,
+            transform,
+            Fourcc::Xrgb8888,
+            elements,
+        )?;
+        let bytes = renderer.map_texture(&mapping)?;
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), shm_buffer.cast(), shm_len);
+        }
+        Ok(())
+    })??;
+    Ok(())
+}
+
+fn render_and_download(
+    renderer: &mut GlesRenderer,
+    size: Size<i32, Physical>,
+    scale: Scale<f64>,
+    transform: Transform,
+    fourcc: Fourcc,
+    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
+) -> Result<smithay::backend::renderer::gles::GlesMapping, Box<dyn std::error::Error>> {
+    let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+    let mut texture: GlesTexture = renderer.create_buffer(fourcc, buffer_size)?;
+    {
+        let mut target = renderer.bind(&mut texture)?;
+        let _ = render_elements_to_target(renderer, &mut target, size, scale, transform, elements)?;
+    }
+    let target = renderer.bind(&mut texture)?;
+    let mapping = renderer.copy_framebuffer(&target, Rectangle::from_size(buffer_size), fourcc)?;
+    Ok(mapping)
+}
+
+fn render_elements_to_target(
+    renderer: &mut GlesRenderer,
+    target: &mut GlesTarget,
+    size: Size<i32, Physical>,
+    scale: Scale<f64>,
+    transform: Transform,
+    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
+) -> Result<SyncPoint, Box<dyn std::error::Error>> {
+    let transform = transform.invert();
+    let output_rect = Rectangle::from_size(transform.transform_size(size));
+
+    let mut frame = renderer.render(target, size, transform)?;
+    frame.clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[output_rect])?;
+
+    for element in elements {
+        let src = element.src();
+        let dst = element.geometry(scale);
+        if let Some(mut damage) = output_rect.intersection(dst) {
+            damage.loc -= dst.loc;
+            element.draw(&mut frame, src, dst, &[damage], &[], None)?;
+        }
+    }
+
+    Ok(frame.finish()?)
+}

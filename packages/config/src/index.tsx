@@ -58,6 +58,12 @@ WINDOW_MANAGER.key.bind("launcher", "Super+A", () => {
 WINDOW_MANAGER.key.bind("clipboard", "Super+V", () => {
     WINDOW_MANAGER.process.spawn({ command: ["qs", "--path", NOCTALIA_SHELL_PATH, "ipc", "call", "launcher", "clipboard"] });
 });
+WINDOW_MANAGER.key.bind("screenshot", "Super+P", () => {
+    WINDOW_MANAGER.process.spawn({ command: ["hyprshot", "-m", "region", "--raw", "|", "swappy", "-f", "-"] });
+});
+WINDOW_MANAGER.key.bind("screenshot-freeze", "Super+Ctrl+P", () => {
+    WINDOW_MANAGER.process.spawn({ command: ["hyprshot", "-m", "region", "--freeze", "--raw", "|", "swappy", "-f", "-"] });
+});
 
 
 WINDOW_MANAGER.output.applyDisplayConfig((display) => {

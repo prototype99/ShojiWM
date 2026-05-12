@@ -193,6 +193,7 @@ pub struct ShojiWM {
     pub commit_timing_manager_state: CommitTimingManagerState,
     pub viewporter_state: ViewporterState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
+    pub screencopy_state: crate::protocols::screencopy::ScreencopyManagerState,
     pub single_pixel_buffer_state: SinglePixelBufferState,
     pub fixes_state: FixesState,
     pub seat_state: SeatState<ShojiWM>,
@@ -488,6 +489,8 @@ impl ShojiWM {
         let commit_timing_manager_state = CommitTimingManagerState::new::<Self>(&dh);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
+        let screencopy_state =
+            crate::protocols::screencopy::ScreencopyManagerState::new::<Self, _>(&dh, |_| true);
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
         let fixes_state = FixesState::new::<Self>(&dh);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
@@ -631,6 +634,7 @@ impl ShojiWM {
             commit_timing_manager_state,
             viewporter_state,
             fractional_scale_manager_state,
+            screencopy_state,
             single_pixel_buffer_state,
             fixes_state,
             seat_state,
