@@ -125,7 +125,7 @@ WINDOW_MANAGER.effect.background_effect = compileEffect({
         dualKawaseBlur({ radius: 4, passes: 2 }),
     ]
 });
-
+/*
 const windowShadowEffect = compileWindowEffect({
     input: windowSource({ include: "full" }),
     outsets: { left: 72, right: 72, top: 56, bottom: 96 },
@@ -168,7 +168,7 @@ WINDOW_MANAGER.effect.window = (window) => ({
     behindRootSurface: windowShadowEffect,
     inFront: windowFrontEffect,
     replace: windowReplaceEffect,
-});
+});*/
 
 WINDOW_MANAGER.event.onOpen((window) => {
     window.setCloseAnimationDuration(seconds(2.0));

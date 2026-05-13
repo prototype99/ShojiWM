@@ -30,6 +30,10 @@ fn commit_rate_debug_enabled() -> bool {
     std::env::var_os("SHOJI_COMMIT_RATE_DEBUG").is_some()
 }
 
+fn mpv_frame_debug_enabled() -> bool {
+    std::env::var_os("SHOJI_MPV_FRAME_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
+}
+
 fn frame_liveness_debug_enabled() -> bool {
     std::env::var_os("SHOJI_FRAME_LIVENESS_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
@@ -331,6 +335,24 @@ impl CompositorHandler for ShojiWM {
                     app_id = ?snapshot.app_id,
                     delta_ms = ?delta_ms,
                     "commit rate debug"
+                );
+            }
+            if mpv_frame_debug_enabled() && snapshot.app_id.as_deref() == Some("mpv") {
+                let delta_ms = self
+                    .window_commit_times
+                    .get(&window)
+                    .and_then(|prev| commit_time.checked_sub(*prev))
+                    .map(|d| d.as_secs_f64() * 1000.0);
+                info!(
+                    window_id = %snapshot.id,
+                    surface = ?surface.id(),
+                    commit_time_ms = commit_time.as_secs_f64() * 1000.0,
+                    delta_ms,
+                    source_damage_count = source_damage.len(),
+                    needs_redraw_before = self.needs_redraw,
+                    window_source_damage_pending_before = self.window_source_damage.len(),
+                    pending_decoration_damage_before = self.pending_decoration_damage.len(),
+                    "mpv frame debug: commit"
                 );
             }
             self.window_commit_times.insert(window.clone(), commit_time);

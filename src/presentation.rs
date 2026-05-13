@@ -19,8 +19,11 @@ use smithay::{
     reexports::wayland_server::{Client, Resource, backend::ClientId},
     utils::{Monotonic, Time},
     wayland::{
-        commit_timing::CommitTimerBarrierStateUserData, compositor::CompositorHandler,
-        fifo::FifoBarrierCachedState, fractional_scale::with_fractional_scale,
+        commit_timing::CommitTimerBarrierStateUserData,
+        compositor::{CompositorHandler, SurfaceAttributes},
+        fifo::FifoBarrierCachedState,
+        fractional_scale::with_fractional_scale,
+        presentation::PresentationFeedbackCachedState,
     },
 };
 use tracing::info;
@@ -72,6 +75,10 @@ fn scale_notify_debug_enabled() -> bool {
 
 fn fifo_debug_enabled() -> bool {
     std::env::var_os("SHOJI_FIFO_DEBUG").is_some()
+}
+
+fn mpv_frame_debug_enabled() -> bool {
+    std::env::var_os("SHOJI_MPV_FRAME_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 /// Returns the previous preferred scale for a surface (by protocol id), for change detection.
@@ -195,6 +202,56 @@ pub fn take_presentation_feedback(
 }
 
 impl ShojiWM {
+    fn log_mpv_pending_surface_callbacks(
+        &self,
+        output: &Output,
+        time: Duration,
+        frame_callback_sequence: Option<u32>,
+        label: &'static str,
+    ) {
+        if !mpv_frame_debug_enabled() {
+            return;
+        }
+
+        self.space.elements().for_each(|window| {
+            let Some(decoration) = self.window_decorations.get(window) else {
+                return;
+            };
+            if decoration.snapshot.app_id.as_deref() != Some("mpv")
+                || !self.space.outputs_for_element(window).contains(output)
+            {
+                return;
+            }
+
+            window.with_surfaces(|surface, states| {
+                let pending_frame_callbacks = states
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .current()
+                    .frame_callbacks
+                    .len();
+                let pending_presentation_feedbacks = states
+                    .cached_state
+                    .get::<PresentationFeedbackCachedState>()
+                    .current()
+                    .callbacks
+                    .len();
+                let primary = surface_primary_scanout_output(surface, states);
+                info!(
+                    output = %output.name(),
+                    surface = ?surface.id(),
+                    pending_frame_callbacks,
+                    pending_presentation_feedbacks,
+                    primary = ?primary.as_ref().map(|output| output.name()),
+                    callback_time_ms = time.as_secs_f64() * 1000.0,
+                    sequence = ?frame_callback_sequence,
+                    label,
+                    "mpv frame debug: pending surface callbacks before send"
+                );
+            });
+        });
+    }
+
     pub fn send_primary_frame_callbacks_for_output(
         &mut self,
         output: &Output,
@@ -204,6 +261,12 @@ impl ShojiWM {
         let throttle = Some(Duration::from_secs(1));
         let debug = frame_callback_debug_enabled() || frame_liveness_debug_enabled();
         let callback_count = std::cell::Cell::new(0usize);
+        self.log_mpv_pending_surface_callbacks(
+            output,
+            time,
+            frame_callback_sequence,
+            "primary-only",
+        );
 
         let should_send =
             |surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
@@ -272,6 +335,7 @@ impl ShojiWM {
         let debug = frame_callback_debug_enabled();
         let throttle_debug = frame_throttle_debug_enabled();
         let callback_count = std::cell::Cell::new(0usize);
+        self.log_mpv_pending_surface_callbacks(output, time, frame_callback_sequence, "all");
 
         let should_send =
             |surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
@@ -347,11 +411,16 @@ impl ShojiWM {
         }
     }
 
-    pub fn pre_repaint(&mut self, output: &Output, frame_target: Time<Monotonic>) {
+    pub fn signal_commit_timing_barriers_for_output(
+        &mut self,
+        output: &Output,
+        frame_target: Time<Monotonic>,
+    ) -> bool {
         #[allow(clippy::mutable_key_type)]
         let mut clients: HashMap<ClientId, Client> = HashMap::new();
 
         let debug_fifo = fifo_debug_enabled();
+        let debug_mpv = mpv_frame_debug_enabled();
         self.space.elements().for_each(|window| {
             if !self.space.outputs_for_element(window).contains(output) {
                 return;
@@ -368,14 +437,27 @@ impl ShojiWM {
                     })
                 })
                 .flatten();
+            let app_id_is_mpv = app_id.as_deref() == Some("mpv");
             window.with_surfaces(|surface, states| {
-                if let Some(mut commit_timer_state) = states
+                let commit_timer_signaled = states
                     .data_map
                     .get::<CommitTimerBarrierStateUserData>()
-                    .map(|commit_timer| commit_timer.lock().unwrap())
-                    && commit_timer_state.signal_until(frame_target)
-                {
-                    if debug_fifo {
+                    .map(|commit_timer| {
+                        let mut commit_timer_state = commit_timer.lock().unwrap();
+                        commit_timer_state.signal_until(frame_target)
+                    });
+                if debug_mpv && app_id_is_mpv {
+                    info!(
+                        surface = ?surface.id(),
+                        output = %output.name(),
+                        has_commit_timer = commit_timer_signaled.is_some(),
+                        commit_timer_signaled,
+                        frame_target_ms = Duration::from(frame_target).as_secs_f64() * 1000.0,
+                        "mpv frame debug: pre_repaint commit timer"
+                    );
+                }
+                if commit_timer_signaled == Some(true) {
+                    if debug_fifo || (debug_mpv && app_id_is_mpv) {
                         info!(
                             surface = ?surface.id(),
                             app_id = ?app_id,
@@ -406,10 +488,72 @@ impl ShojiWM {
         drop(map);
 
         let dh = self.display_handle.clone();
+        let signaled = !clients.is_empty();
         for client in clients.into_values() {
             self.client_compositor_state(&client)
                 .blocker_cleared(self, &dh);
         }
+        signaled
+    }
+
+    pub fn pre_repaint(&mut self, output: &Output, frame_target: Time<Monotonic>) {
+        self.signal_commit_timing_barriers_for_output(output, frame_target);
+    }
+
+    pub fn next_commit_timing_deadline_for_output(&self, output: &Output) -> Option<Duration> {
+        let mut next_deadline: Option<Duration> = None;
+
+        self.space.elements().for_each(|window| {
+            if !self.space.outputs_for_element(window).contains(output) {
+                return;
+            }
+
+            window.with_surfaces(|_, states| {
+                let deadline = states
+                    .data_map
+                    .get::<CommitTimerBarrierStateUserData>()
+                    .and_then(|commit_timer| {
+                        let commit_timer_state = commit_timer.lock().unwrap();
+                        commit_timer_state.next_deadline()
+                    })
+                    .map(|deadline| {
+                        let deadline: Time<Monotonic> = deadline.into();
+                        Duration::from(deadline)
+                    });
+                if let Some(deadline) = deadline {
+                    next_deadline = Some(match next_deadline {
+                        Some(current) => current.min(deadline),
+                        None => deadline,
+                    });
+                }
+            });
+        });
+
+        let map = layer_map_for_output(output);
+        for layer_surface in map.layers() {
+            layer_surface.with_surfaces(|_, states| {
+                let deadline = states
+                    .data_map
+                    .get::<CommitTimerBarrierStateUserData>()
+                    .and_then(|commit_timer| {
+                        let commit_timer_state = commit_timer.lock().unwrap();
+                        commit_timer_state.next_deadline()
+                    })
+                    .map(|deadline| {
+                        let deadline: Time<Monotonic> = deadline.into();
+                        Duration::from(deadline)
+                    });
+                if let Some(deadline) = deadline {
+                    next_deadline = Some(match next_deadline {
+                        Some(current) => current.min(deadline),
+                        None => deadline,
+                    });
+                }
+            });
+        }
+        drop(map);
+
+        next_deadline
     }
 
     pub fn signal_post_repaint_barriers(&mut self, output: &Output) {
@@ -418,6 +562,7 @@ impl ShojiWM {
 
         let debug_scale = scale_notify_debug_enabled();
         let debug_fifo = fifo_debug_enabled();
+        let debug_mpv = mpv_frame_debug_enabled();
         self.space.elements().for_each(|window| {
             if self.space.outputs_for_element(window).contains(output) {
                 let app_id = window
@@ -431,6 +576,7 @@ impl ShojiWM {
                         })
                     })
                     .flatten();
+                let app_id_is_mpv = app_id.as_deref() == Some("mpv");
                 window.with_surfaces(|surface, states| {
                     let primary_scanout_output = surface_primary_scanout_output(surface, states);
                     if let Some(output) = primary_scanout_output.as_ref() {
@@ -458,8 +604,17 @@ impl ShojiWM {
                         .current()
                         .barrier
                         .take();
+                    if debug_mpv && app_id_is_mpv {
+                        info!(
+                            surface = ?surface.id(),
+                            output = %output.name(),
+                            primary = ?primary_scanout_output.as_ref().map(|output| output.name()),
+                            has_fifo_barrier = fifo_barrier.is_some(),
+                            "mpv frame debug: post_repaint fifo barrier"
+                        );
+                    }
                     if let Some(fifo_barrier) = fifo_barrier {
-                        if debug_fifo {
+                        if debug_fifo || (debug_mpv && app_id_is_mpv) {
                             info!(
                                 surface = ?surface.id(),
                                 app_id = ?app_id,

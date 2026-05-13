@@ -135,6 +135,25 @@ fn browser_cpu_debug_enabled() -> bool {
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
+fn mpv_frame_debug_enabled() -> bool {
+    std::env::var_os("SHOJI_MPV_FRAME_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+fn sanitize_next_frame_target(
+    next_frame_target: Option<Duration>,
+    fallback_frame_time: Duration,
+    frame_duration: Duration,
+) -> (Duration, bool) {
+    let stale_before = fallback_frame_time
+        .checked_sub(frame_duration)
+        .unwrap_or(Duration::ZERO);
+    match next_frame_target {
+        Some(target) if target < stale_before => (fallback_frame_time, true),
+        Some(target) => (target, false),
+        None => (fallback_frame_time, false),
+    }
+}
+
 fn browser_cpu_debug_allowed(output_name: &str) -> bool {
     if !browser_cpu_debug_enabled() {
         return false;
@@ -162,6 +181,16 @@ fn output_has_visible_x11_chrome(state: &ShojiWM, output: &Output) -> bool {
             .is_some_and(|class| {
                 class == "google-chrome" || class.contains("chromium") || class.contains("chrome")
             })
+    })
+}
+
+fn output_has_visible_mpv(state: &ShojiWM, output: &Output) -> bool {
+    state.space.elements_for_output(output).any(|window| {
+        state
+            .window_decorations
+            .get(window)
+            .and_then(|decoration| decoration.snapshot.app_id.as_deref())
+            == Some("mpv")
     })
 }
 
@@ -270,6 +299,8 @@ struct SurfaceData {
     skipped_while_pending_count: u32,
     frame_callback_timer_armed: bool,
     frame_callback_timer_generation: u64,
+    commit_timing_timer_armed: bool,
+    commit_timing_timer_generation: u64,
     frame_callback_sequence: u32,
     redraw_state: TtyRedrawState,
     frame_duration: Duration,
@@ -471,7 +502,7 @@ pub fn device_added(
 
 fn frame_finish(
     state: &mut ShojiWM,
-    _loop_handle: &LoopHandle<'_, ShojiWM>,
+    loop_handle: &LoopHandle<'_, ShojiWM>,
     node: DrmNode,
     crtc: crtc::Handle,
     metadata: &mut Option<DrmEventMetadata>,
@@ -596,8 +627,33 @@ fn frame_finish(
     } else {
         TtyRedrawState::Idle
     };
+    if !redraw_needed {
+        // `next_frame_target` predicts the next vblank for already-queued follow-up work.
+        // Once the output goes idle, keeping it would make the next unrelated commit reuse
+        // a stale presentation target, sometimes more than a second in the past.
+        surface.next_frame_target = None;
+    }
+    if mpv_frame_debug_enabled() {
+        info!(
+            output = %surface.output.name(),
+            presentation_clock_ms = presentation_clock.as_secs_f64() * 1000.0,
+            frame_duration_ms = surface.frame_duration.as_secs_f64() * 1000.0,
+            redraw_needed,
+            idle_callback_sent = false,
+            next_redraw_state = ?surface.redraw_state,
+            frame_callback_sequence = surface.frame_callback_sequence,
+            queued_wait_ms,
+            pending_window_damage = state.window_source_damage.len(),
+            pending_lower_layer_damage = state.lower_layer_source_damage.len(),
+            pending_upper_layer_damage = state.upper_layer_source_damage.len(),
+            pending_decoration_damage = state.pending_decoration_damage.len(),
+            "mpv frame debug: frame_finish"
+        );
+    }
     if redraw_needed {
         state.schedule_redraw();
+    } else {
+        schedule_commit_timing_timer(loop_handle, state, node, crtc);
     }
 }
 
@@ -930,6 +986,7 @@ fn render_surface(
         return Ok(RenderSurfaceOutcome::Skipped);
     }
 
+    let has_visible_mpv = mpv_frame_debug_enabled() && output_has_visible_mpv(state, &output);
     let frame_duration = state
         .tty_backends
         .get(&node)
@@ -937,12 +994,22 @@ fn render_surface(
         .map(|surface| surface.frame_duration)
         .unwrap_or(Duration::ZERO);
     let fallback_frame_time = Duration::from(state.clock.now()) + frame_duration;
-    let frame_target = state
+    let raw_frame_target = state
         .tty_backends
         .get(&node)
         .and_then(|backend| backend.surfaces.get(&crtc))
-        .and_then(|surface| surface.next_frame_target)
-        .unwrap_or(fallback_frame_time);
+        .and_then(|surface| surface.next_frame_target);
+    let (frame_target, stale_frame_target) =
+        sanitize_next_frame_target(raw_frame_target, fallback_frame_time, frame_duration);
+    if stale_frame_target && mpv_frame_debug_enabled() && output_has_visible_mpv(state, &output) {
+        info!(
+            output = %output.name(),
+            raw_frame_target_ms = raw_frame_target.map(|target| target.as_secs_f64() * 1000.0),
+            fallback_frame_time_ms = fallback_frame_time.as_secs_f64() * 1000.0,
+            frame_duration_ms = frame_duration.as_secs_f64() * 1000.0,
+            "mpv frame debug: stale next_frame_target ignored before pre_repaint"
+        );
+    }
     state.pre_repaint(&output, frame_target.into());
 
     let mut timing = TtyAnimationTimingMetrics::default();
@@ -1003,11 +1070,26 @@ fn render_surface(
         let backend = tty_backends.get_mut(&node).unwrap();
         let surface = backend.surfaces.get_mut(&crtc).unwrap();
         let render_started_at = Instant::now();
-        let frame_time = surface
-            .next_frame_target
-            .take()
-            .unwrap_or(fallback_frame_time);
+        let raw_frame_time = surface.next_frame_target.take();
+        let (frame_time, stale_frame_time) =
+            sanitize_next_frame_target(raw_frame_time, fallback_frame_time, frame_duration);
         surface.last_frame_callback_at = Some(frame_time);
+        if has_visible_mpv {
+            info!(
+                output = %output.name(),
+                frame_time_ms = frame_time.as_secs_f64() * 1000.0,
+                raw_frame_time_ms = raw_frame_time.map(|target| target.as_secs_f64() * 1000.0),
+                stale_frame_time,
+                fallback_frame_time_ms = fallback_frame_time.as_secs_f64() * 1000.0,
+                frame_duration_ms = frame_duration.as_secs_f64() * 1000.0,
+                pending_window_damage = window_source_damage_snapshot.len(),
+                pending_decoration_damage = extra_damage.len(),
+                redraw_state = ?surface.redraw_state,
+                frame_pending = surface.frame_pending,
+                frame_callback_sequence = surface.frame_callback_sequence,
+                "mpv frame debug: render_start"
+            );
+        }
         let mut cursor_elements: Vec<TtyRenderElements> = Vec::new();
         let mut frame_had_transform_snapshot_damage = false;
         let mut frame_transform_snapshot_window_count = 0usize;
@@ -3625,6 +3707,7 @@ fn render_surface(
             &result.states,
         );
         if !result.is_empty {
+            restore_presented_window_surface_primary_outputs(&state.space, &output, &result.states);
             if frame_liveness_debug_enabled() {
                 tracing::info!(
                     output = %output.name(),
@@ -3821,14 +3904,28 @@ fn render_surface(
                 redraw_needed: false,
             };
             let frame_callback_sequence = surface.frame_callback_sequence;
+            let callback_time = Duration::from(state.clock.now());
+            if has_visible_mpv {
+                info!(
+                    output = %output.name(),
+                    callback_time_ms = callback_time.as_secs_f64() * 1000.0,
+                    frame_time_ms = frame_time.as_secs_f64() * 1000.0,
+                    result_states_count = result.states.states.len(),
+                    total_cpu_elapsed_ms = total_cpu_elapsed.as_secs_f64() * 1000.0,
+                    render_elapsed_ms = timing.render_elapsed_ms,
+                    frame_callback_sequence,
+                    "mpv frame debug: queue_frame"
+                );
+            }
             let _ = surface;
             let _ = backend;
             state.post_repaint_with_sequence(
                 &output,
-                frame_time,
+                callback_time,
                 &result.states,
                 Some(frame_callback_sequence),
             );
+            let _ = state.display_handle.flush_clients();
         } else {
             if frame_liveness_debug_enabled() {
                 tracing::info!(
@@ -4686,6 +4783,51 @@ fn window_effect_element_state(
         state.commit_counter.increment();
     }
     (state.id.clone(), state.commit_counter)
+}
+
+fn restore_presented_window_surface_primary_outputs(
+    space: &smithay::desktop::Space<smithay::desktop::Window>,
+    output: &Output,
+    render_element_states: &smithay::backend::renderer::element::RenderElementStates,
+) {
+    use smithay::backend::renderer::element::{
+        Id, RenderElementPresentationState, RenderElementState, RenderElementStates,
+    };
+    use smithay::desktop::utils::update_surface_primary_scanout_output;
+
+    for window in space.elements_for_output(output) {
+        let mut window_had_presented_surface = false;
+        window.with_surfaces(|surface, _| {
+            if render_element_states.element_was_presented(Id::from_wayland_resource(surface)) {
+                window_had_presented_surface = true;
+            }
+        });
+        if !window_had_presented_surface {
+            continue;
+        }
+
+        let mut synthetic_states = RenderElementStates::default();
+        window.with_surfaces(|surface, _| {
+            synthetic_states.states.insert(
+                Id::from_wayland_resource(surface),
+                RenderElementState {
+                    visible_area: usize::MAX,
+                    presentation_state: RenderElementPresentationState::Rendering { reason: None },
+                    needs_capture: false,
+                },
+            );
+        });
+        window.with_surfaces(|surface, states| {
+            update_surface_primary_scanout_output(
+                surface,
+                output,
+                states,
+                None,
+                &synthetic_states,
+                crate::presentation::area_primary_scanout_compare,
+            );
+        });
+    }
 }
 
 fn window_effect_elements(
@@ -7882,6 +8024,8 @@ fn connector_connected(
         skipped_while_pending_count: 0,
         frame_callback_timer_armed: false,
         frame_callback_timer_generation: 0,
+        commit_timing_timer_armed: false,
+        commit_timing_timer_generation: 0,
         frame_callback_sequence: 0,
         redraw_state: TtyRedrawState::Idle,
         frame_duration,
@@ -8136,6 +8280,113 @@ fn schedule_estimated_vblank_callback(
             ?crtc,
             "failed to schedule tty estimated vblank callback"
         );
+    }
+}
+
+fn schedule_commit_timing_timer(
+    loop_handle: &LoopHandle<'_, ShojiWM>,
+    state: &mut ShojiWM,
+    node: DrmNode,
+    crtc: crtc::Handle,
+) {
+    let Some(output) = state
+        .tty_backends
+        .get(&node)
+        .and_then(|backend| backend.surfaces.get(&crtc))
+        .map(|surface| surface.output.clone())
+    else {
+        return;
+    };
+    let Some(next_deadline) = state.next_commit_timing_deadline_for_output(&output) else {
+        return;
+    };
+    let Some(backend) = state.tty_backends.get_mut(&node) else {
+        return;
+    };
+    let Some(surface) = backend.surfaces.get_mut(&crtc) else {
+        return;
+    };
+
+    if surface.frame_pending
+        || matches!(
+            surface.redraw_state,
+            TtyRedrawState::Queued | TtyRedrawState::WaitingForVBlank { .. }
+        )
+    {
+        return;
+    }
+    if surface.commit_timing_timer_armed {
+        return;
+    }
+
+    let now = Duration::from(state.clock.now());
+    let delay = next_deadline.saturating_sub(now);
+    let generation = surface.commit_timing_timer_generation.wrapping_add(1);
+    surface.commit_timing_timer_generation = generation;
+    surface.commit_timing_timer_armed = true;
+
+    let insert_loop_handle = loop_handle.clone();
+    let callback_loop_handle = loop_handle.clone();
+    if mpv_frame_debug_enabled() && output_has_visible_mpv(state, &output) {
+        info!(
+            output = %output.name(),
+            generation,
+            now_ms = now.as_secs_f64() * 1000.0,
+            next_deadline_ms = next_deadline.as_secs_f64() * 1000.0,
+            delay_ms = delay.as_secs_f64() * 1000.0,
+            "mpv frame debug: commit timing timer armed"
+        );
+    }
+
+    if insert_loop_handle
+        .insert_source(Timer::from_duration(delay), move |_, _, state| {
+            let timer_is_current = {
+                let Some(backend) = state.tty_backends.get_mut(&node) else {
+                    return TimeoutAction::Drop;
+                };
+                let Some(surface) = backend.surfaces.get_mut(&crtc) else {
+                    return TimeoutAction::Drop;
+                };
+                if !surface.commit_timing_timer_armed
+                    || surface.commit_timing_timer_generation != generation
+                {
+                    return TimeoutAction::Drop;
+                }
+                surface.commit_timing_timer_armed = false;
+                true
+            };
+            if !timer_is_current {
+                return TimeoutAction::Drop;
+            }
+
+            let now = Duration::from(state.clock.now());
+            let signaled = state.signal_commit_timing_barriers_for_output(&output, now.into());
+            let _ = state.display_handle.flush_clients();
+
+            if mpv_frame_debug_enabled() && output_has_visible_mpv(state, &output) {
+                info!(
+                    output = %output.name(),
+                    generation,
+                    now_ms = now.as_secs_f64() * 1000.0,
+                    requested_deadline_ms = next_deadline.as_secs_f64() * 1000.0,
+                    signaled,
+                    "mpv frame debug: commit timing timer fired"
+                );
+            }
+
+            schedule_commit_timing_timer(&callback_loop_handle, state, node, crtc);
+            TimeoutAction::Drop
+        })
+        .is_err()
+    {
+        if let Some(surface) = state
+            .tty_backends
+            .get_mut(&node)
+            .and_then(|backend| backend.surfaces.get_mut(&crtc))
+        {
+            surface.commit_timing_timer_armed = false;
+        }
+        warn!(?node, ?crtc, "failed to schedule tty commit timing timer");
     }
 }
 
