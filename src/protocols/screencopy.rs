@@ -191,6 +191,15 @@ where
         _display: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
     ) {
+        if std::env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some()
+            && matches!(
+                request,
+                zwlr_screencopy_manager_v1::Request::CaptureOutput { .. }
+                    | zwlr_screencopy_manager_v1::Request::CaptureOutputRegion { .. }
+            )
+        {
+            tracing::info!("screencopy: capture_output request received from client");
+        }
         let (frame, overlay_cursor, buffer_size, region_loc, output) = match request {
             zwlr_screencopy_manager_v1::Request::CaptureOutput {
                 frame,
@@ -290,11 +299,18 @@ where
         );
 
         if frame.version() >= 3 {
-            frame.linux_dmabuf(
-                Fourcc::Xrgb8888 as u32,
-                buffer_size.w as u32,
-                buffer_size.h as u32,
-            );
+            // Conditionally advertise DMA-BUF. With Intel `Y_TILED_GEN12_RC_CCS_CC`
+            // (the modifier xdp-wlr/PipeWire negotiate by default on this hardware),
+            // OBS-side consumption is slow enough to back-pressure the PipeWire
+            // buffer pool and cap effective fps at ~19. Setting SHOJI_SCREENCOPY_NO_DMABUF=1
+            // forces clients onto the SHM fallback, which uses an uncompressed buffer.
+            if std::env::var_os("SHOJI_SCREENCOPY_NO_DMABUF").is_none() {
+                frame.linux_dmabuf(
+                    Fourcc::Xrgb8888 as u32,
+                    buffer_size.w as u32,
+                    buffer_size.h as u32,
+                );
+            }
             frame.buffer_done();
         }
 
@@ -401,6 +417,13 @@ where
             zwlr_screencopy_frame_v1::Request::CopyWithDamage { buffer } => (buffer, true),
             _ => unreachable!(),
         };
+
+        if std::env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some() {
+            tracing::info!(
+                with_damage,
+                "screencopy: copy request received from client"
+            );
+        }
 
         let size = info.buffer_size;
 

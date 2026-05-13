@@ -39,6 +39,37 @@ WINDOW_MANAGER.output.applyDisplayConfig((display) => {
     }
 });*/
 
+WINDOW_MANAGER.process.once("xdg-portal-env", {
+    command:
+        "export XDG_SESSION_TYPE=wayland && " +
+        "systemctl --user import-environment " +
+        "WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE && " +
+        "systemctl --user reset-failed xdg-desktop-portal xdg-desktop-portal-wlr 2>/dev/null; " +
+        "systemctl --user restart xdg-desktop-portal xdg-desktop-portal-wlr",
+    runPolicy: "once-per-session",
+});
+// Workaround for the xdg-desktop-portal-wlr (xdpw) 30 fps cap.
+//
+// xdpw commit ca7a3e2e dropped PW_STREAM_FLAG_DRIVER, which makes its
+// screencast PipeWire stream piggy-back on the audio sink driver's quantum
+// (default 1024/48000 ≈ 21.3 ms). Combined with the wlr-screencopy
+// request/reply round-trip, OBS / portal-based screen sharing tools cap at
+// ~19-30 fps regardless of the configured target. ShojiWM's own
+// wlr-screencopy implementation is fine — wf-recorder records at full rate
+// without any workaround. See docs/screencast-30fps-xdpw-bug.md and
+// https://github.com/emersion/xdg-desktop-portal-wlr/pull/370 for details.
+//
+// Forcing PipeWire's graph quantum to 256/48000 ≈ 5.3 ms gives the video
+// stream enough headroom to complete its cycle within one display vblank.
+// Audio side-effects are negligible at this quantum on a modern CPU, but
+// because it is a system-wide PipeWire setting, this is opt-in: uncomment
+// the block below if you actually do screencast through OBS / Discord /
+// Vesktop / etc. and want 60 fps.
+//
+// WINDOW_MANAGER.process.once("pipewire-screencast-quantum", {
+//     command: "pw-metadata -n settings 0 clock.force-quantum 256",
+//     runPolicy: "once-per-session",
+// });
 WINDOW_MANAGER.process.once("fcitx5", {
     command: ["fcitx5", "-d"],
     runPolicy: "once-per-session",

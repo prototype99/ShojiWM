@@ -364,7 +364,44 @@ pub fn device_added(
     }
     state.shm_state.update_formats(renderer.shm_formats());
     if state.dmabuf_global.is_none() {
-        let default_feedback = DmabufFeedbackBuilder::new(node.dev_id(), renderer.dmabuf_formats())
+        let all_formats = renderer.dmabuf_formats();
+        // PipeWire/OBS consume DMA-BUF much faster from uncompressed buffers.
+        // When the Intel render-compressed modifier is selected by the
+        // wlr-screencopy → PipeWire → OBS chain, throughput drops to ~19 fps on
+        // a 60-fps target. Setting SHOJI_DMABUF_FEEDBACK_LINEAR_ONLY=1 narrows
+        // the advertised modifiers to LINEAR/INVALID so consumers cannot
+        // negotiate a compressed format.
+        let formats: smithay::backend::allocator::format::FormatSet =
+            if std::env::var_os("SHOJI_DMABUF_FEEDBACK_LINEAR_ONLY").is_some() {
+                use smithay::backend::allocator::Modifier;
+                all_formats
+                    .iter()
+                    .filter(|fmt| {
+                        matches!(fmt.modifier, Modifier::Linear | Modifier::Invalid)
+                    })
+                    .copied()
+                    .collect()
+            } else {
+                all_formats
+            };
+        let modifier_count = formats.iter().count();
+        // List unique modifiers (across fourccs) so we can verify the filter.
+        let mut unique_mods: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for fmt in formats.iter() {
+            unique_mods.insert(Into::<u64>::into(fmt.modifier));
+        }
+        let unique_mods_hex: Vec<String> = unique_mods
+            .iter()
+            .map(|m| format!("0x{:x}", m))
+            .collect();
+        info!(
+            ?node,
+            modifier_count,
+            unique_modifier_count = unique_mods.len(),
+            unique_modifiers = ?unique_mods_hex,
+            "advertising linux-dmabuf modifiers"
+        );
+        let default_feedback = DmabufFeedbackBuilder::new(node.dev_id(), formats)
             .build()
             .unwrap();
         let global = state
@@ -779,6 +816,26 @@ fn render_surface(
         .and_then(|backend| backend.surfaces.get(&crtc))
         .map(|surface| surface.output.clone())
         .unwrap();
+    if std::env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some() {
+        let frame_pending = state
+            .tty_backends
+            .get(&node)
+            .and_then(|backend| backend.surfaces.get(&crtc))
+            .map(|surface| surface.frame_pending)
+            .unwrap_or(false);
+        let redraw_state = state
+            .tty_backends
+            .get(&node)
+            .and_then(|backend| backend.surfaces.get(&crtc))
+            .map(|surface| surface.redraw_state)
+            .unwrap_or(TtyRedrawState::Idle);
+        tracing::info!(
+            output = %output.name(),
+            frame_pending,
+            redraw_state = ?redraw_state,
+            "screencopy: render_surface called"
+        );
+    }
     let gap_threshold_ms = animation_gap_threshold_ms();
     if animation_gap_debug_enabled()
         && let Some(gap_ms) =

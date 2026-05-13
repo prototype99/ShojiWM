@@ -36,6 +36,12 @@ pub fn process_screencopy_queue_for_output(
     output: &Output,
     elements: &[TtyRenderElements],
 ) {
+    let profile = std::env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some();
+    let entry_at = std::time::Instant::now();
+    let mut processed = 0usize;
+    let mut waited = 0usize;
+    let output_name = output.name();
+
     screencopy_state.with_queues_mut(|queue| loop {
         let (damage_tracker, front) = queue.split();
         let Some(front) = front else {
@@ -46,7 +52,14 @@ pub fn process_screencopy_queue_for_output(
         }
         let with_damage = front.with_damage();
 
+        let buffer_kind = match front.buffer() {
+            ScreencopyBuffer::Dmabuf(_) => "dmabuf",
+            ScreencopyBuffer::Shm(_) => "shm",
+        };
+        let render_started_at = std::time::Instant::now();
         let render_result = render_for_screencopy(renderer, output, elements, damage_tracker, front);
+        let render_elapsed = render_started_at.elapsed();
+
         match render_result {
             Ok((sync, damages)) => match damages {
                 Some(damages) => {
@@ -65,22 +78,51 @@ pub fn process_screencopy_queue_for_output(
                             .collect::<Vec<_>>();
                         front.damage(damages.into_iter());
                     }
+                    let has_sync = sync.is_some();
                     let screencopy = queue.pop();
                     screencopy.submit_after_sync(false, sync, loop_handle);
+                    processed += 1;
+                    if profile {
+                        tracing::info!(
+                            output = %output_name,
+                            buffer_kind,
+                            render_ms = render_elapsed.as_secs_f64() * 1000.0,
+                            has_sync,
+                            with_damage,
+                            "screencopy: submitted frame"
+                        );
+                    }
                 }
                 None => {
-                    // with_damage and no damage yet — wait for the next frame.
+                    waited += 1;
+                    if profile {
+                        tracing::info!(
+                            output = %output_name,
+                            buffer_kind,
+                            render_ms = render_elapsed.as_secs_f64() * 1000.0,
+                            "screencopy: no damage, deferring"
+                        );
+                    }
                     return;
                 }
             },
             Err(err) => {
                 tracing::warn!("error rendering for screencopy: {err:?}");
-                // Reset damage tracker so the next attempt reports full damage.
                 *damage_tracker = OutputDamageTracker::new((0, 0), 1.0, Transform::Normal);
                 let _ = queue.pop();
             }
         }
     });
+
+    if profile && (processed > 0 || waited > 0) {
+        tracing::info!(
+            output = %output_name,
+            processed,
+            waited,
+            total_ms = entry_at.elapsed().as_secs_f64() * 1000.0,
+            "screencopy: queue drain done"
+        );
+    }
 }
 
 fn render_for_screencopy<'a>(
@@ -166,8 +208,17 @@ fn render_to_dmabuf(
     transform: Transform,
     elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
 ) -> Result<SyncPoint, Box<dyn std::error::Error>> {
+    let profile = std::env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some();
+    let bind_at = std::time::Instant::now();
     let mut target = renderer.bind(&mut dmabuf)?;
-    render_elements_to_target(renderer, &mut target, size, scale, transform, elements)
+    let bind_ms = bind_at.elapsed().as_secs_f64() * 1000.0;
+    let render_at = std::time::Instant::now();
+    let sync = render_elements_to_target(renderer, &mut target, size, scale, transform, elements)?;
+    let render_ms = render_at.elapsed().as_secs_f64() * 1000.0;
+    if profile {
+        tracing::info!(bind_ms, render_ms, "screencopy: dmabuf bind+render");
+    }
+    Ok(sync)
 }
 
 fn render_to_shm(

@@ -121,7 +121,10 @@ fn prepare_runtime_process_environment(command: &mut Command) {
 
     // Child processes launched by ShojiWM should identify this compositor session,
     // not whichever compositor environment may have existed before ShojiWM started.
-    command.env("XDG_CURRENT_DESKTOP", "ShojiWM");
+    // `sway` is appended so wlr-compatible portal backends accept the desktop name
+    // via their `UseIn` whitelist; see `sanitize_inherited_compositor_environment`
+    // in main.rs for the reasoning.
+    command.env("XDG_CURRENT_DESKTOP", "ShojiWM:sway");
     command.env("XDG_SESSION_DESKTOP", "ShojiWM");
 }
 
