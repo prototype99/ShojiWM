@@ -74,15 +74,20 @@ use crate::{
 use smithay::wayland::presentation::Refresh;
 
 const CLEAR_COLOR: [f32; 4] = [0.08, 0.10, 0.13, 1.0];
-// Match niri's default policy: direct scanout is still allowed on the primary plane and
-// hardware cursor updates may use the cursor plane, but overlay planes stay disabled.
+// Keep hardware cursor updates on the cursor plane, but force window/layer content through
+// the compositor for now.
 //
 // Smithay's `FrameFlags::DEFAULT` includes overlay-plane scanout. That is attractive in theory,
 // but in practice overlay assignment can interact poorly with buffer lifetime/presentation timing
 // on some drivers. Keeping this explicit makes the tradeoff visible and avoids accidentally
 // re-enabling overlays if Smithay's default changes.
-const TTY_FRAME_FLAGS: FrameFlags =
-    FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY.union(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
+//
+// Primary-plane direct scanout is also intentionally disabled until fullscreen rendering has a
+// strict, compositor-owned bypass path. Shoji can now place compositor-owned layers, SSD, and
+// window effects around a client surface; allowing an arbitrary client buffer to replace the
+// composed primary plane can produce a one-frame mismatch where only the scanout candidate is
+// visible while the surrounding compositor elements disappear.
+const TTY_FRAME_FLAGS: FrameFlags = FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
 
 fn frame_liveness_debug_enabled() -> bool {
     std::env::var_os("SHOJI_FRAME_LIVENESS_DEBUG")
@@ -376,9 +381,7 @@ pub fn device_added(
                 use smithay::backend::allocator::Modifier;
                 all_formats
                     .iter()
-                    .filter(|fmt| {
-                        matches!(fmt.modifier, Modifier::Linear | Modifier::Invalid)
-                    })
+                    .filter(|fmt| matches!(fmt.modifier, Modifier::Linear | Modifier::Invalid))
                     .copied()
                     .collect()
             } else {
@@ -390,10 +393,8 @@ pub fn device_added(
         for fmt in formats.iter() {
             unique_mods.insert(Into::<u64>::into(fmt.modifier));
         }
-        let unique_mods_hex: Vec<String> = unique_mods
-            .iter()
-            .map(|m| format!("0x{:x}", m))
-            .collect();
+        let unique_mods_hex: Vec<String> =
+            unique_mods.iter().map(|m| format!("0x{:x}", m)).collect();
         info!(
             ?node,
             modifier_count,
@@ -1120,8 +1121,14 @@ fn render_surface(
         timing.upper_layers_elapsed_ms = upper_layers_elapsed_ms;
         let closing_snapshots_started_at = Instant::now();
         scene_elements.extend(
-            closing_snapshot_elements(&mut backend.renderer, &closing_snapshots, output_geo, scale)
-                .into_iter(),
+            closing_snapshot_elements(
+                &mut backend.renderer,
+                &output,
+                &closing_snapshots,
+                output_geo,
+                scale,
+            )
+            .into_iter(),
         );
         let closing_snapshots_elapsed_ms =
             closing_snapshots_started_at.elapsed().as_secs_f64() * 1000.0;
@@ -7413,6 +7420,7 @@ fn capture_live_snapshot_for_window(
 
 fn closing_snapshot_elements(
     renderer: &mut GlesRenderer,
+    output: &Output,
     closing_snapshots: &[crate::backend::snapshot::ClosingWindowSnapshot],
     output_geo: smithay::utils::Rectangle<i32, Logical>,
     scale: smithay::utils::Scale<f64>,
@@ -7441,63 +7449,346 @@ fn closing_snapshot_elements(
             let root_origin =
                 root_physical_origin(snapshot.decoration.layout.root.rect, output_geo, scale);
 
+            let root_surface_source_elements =
+                closing_root_surface_source_elements(renderer, snapshot, output_geo, scale, visual);
+            let full_window_source_elements = closing_full_window_source_elements(
+                renderer,
+                snapshot,
+                output_geo,
+                scale,
+                root_origin,
+                visual,
+            );
+
+            let replace_effects = if let Some(effect) = snapshot
+                .decoration
+                .window_effects
+                .as_ref()
+                .and_then(|effects| effects.replace.as_ref())
+            {
+                let (rect, source_elements): (_, &[TtyRenderElements]) = match &effect.effect.input
+                {
+                    EffectInput::WindowSource(WindowSourceInclude::Full) => (
+                        transformed_root_rect(
+                            snapshot.decoration.layout.root.rect,
+                            snapshot.transform,
+                        ),
+                        &full_window_source_elements,
+                    ),
+                    EffectInput::WindowSource(WindowSourceInclude::RootSurface) => (
+                        transformed_rect(
+                            snapshot.decoration.client_rect,
+                            snapshot.decoration.layout.root.rect,
+                            snapshot.transform,
+                        ),
+                        &root_surface_source_elements,
+                    ),
+                    _ => (
+                        transformed_root_rect(
+                            snapshot.decoration.layout.root.rect,
+                            snapshot.transform,
+                        ),
+                        &full_window_source_elements,
+                    ),
+                };
+                window_effect_elements(
+                    renderer,
+                    output,
+                    output_geo,
+                    scale,
+                    &snapshot.window_id,
+                    "closing-replace",
+                    smithay::backend::renderer::element::Id::new(),
+                    Default::default(),
+                    rect,
+                    effect,
+                    source_elements,
+                )
+                .inspect_err(|error| {
+                    warn!(
+                        window_id = %snapshot.window_id,
+                        ?error,
+                        "failed to build closing replacement window effect"
+                    );
+                })
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let replacement_source_elements = if replace_effects.is_empty() {
+                None
+            } else {
+                Some(replace_effects.as_slice())
+            };
+
+            let in_front_effects = snapshot
+                .decoration
+                .window_effects
+                .as_ref()
+                .and_then(|effects| effects.in_front.as_ref())
+                .and_then(|effect| {
+                    let (rect, source_elements): (_, &[TtyRenderElements]) =
+                        match &effect.effect.input {
+                            EffectInput::WindowSource(WindowSourceInclude::Full) => (
+                                transformed_root_rect(
+                                    snapshot.decoration.layout.root.rect,
+                                    snapshot.transform,
+                                ),
+                                &full_window_source_elements,
+                            ),
+                            EffectInput::WindowSource(WindowSourceInclude::RootSurface) => (
+                                transformed_rect(
+                                    snapshot.decoration.client_rect,
+                                    snapshot.decoration.layout.root.rect,
+                                    snapshot.transform,
+                                ),
+                                &root_surface_source_elements,
+                            ),
+                            _ => (
+                                transformed_root_rect(
+                                    snapshot.decoration.layout.root.rect,
+                                    snapshot.transform,
+                                ),
+                                replacement_source_elements.unwrap_or(&full_window_source_elements),
+                            ),
+                        };
+                    window_effect_elements(
+                        renderer,
+                        output,
+                        output_geo,
+                        scale,
+                        &snapshot.window_id,
+                        "closing-in-front",
+                        smithay::backend::renderer::element::Id::new(),
+                        Default::default(),
+                        rect,
+                        effect,
+                        source_elements,
+                    )
+                    .inspect_err(|error| {
+                        warn!(
+                            window_id = %snapshot.window_id,
+                            ?error,
+                            "failed to build closing in-front window effect"
+                        );
+                    })
+                    .ok()
+                });
+            let behind_root_surface_effects = snapshot
+                .decoration
+                .window_effects
+                .as_ref()
+                .and_then(|effects| effects.behind_root_surface.as_ref())
+                .and_then(|effect| {
+                    let (rect, source_elements): (_, &[TtyRenderElements]) =
+                        match &effect.effect.input {
+                            EffectInput::WindowSource(WindowSourceInclude::Full) => (
+                                transformed_root_rect(
+                                    snapshot.decoration.layout.root.rect,
+                                    snapshot.transform,
+                                ),
+                                &full_window_source_elements,
+                            ),
+                            EffectInput::WindowSource(WindowSourceInclude::RootSurface) => (
+                                transformed_rect(
+                                    snapshot.decoration.client_rect,
+                                    snapshot.decoration.layout.root.rect,
+                                    snapshot.transform,
+                                ),
+                                &root_surface_source_elements,
+                            ),
+                            _ => (
+                                transformed_root_rect(
+                                    snapshot.decoration.layout.root.rect,
+                                    snapshot.transform,
+                                ),
+                                &full_window_source_elements,
+                            ),
+                        };
+                    window_effect_elements(
+                        renderer,
+                        output,
+                        output_geo,
+                        scale,
+                        &snapshot.window_id,
+                        "closing-behind-root-surface",
+                        smithay::backend::renderer::element::Id::new(),
+                        Default::default(),
+                        rect,
+                        effect,
+                        source_elements,
+                    )
+                    .inspect_err(|error| {
+                        warn!(
+                            window_id = %snapshot.window_id,
+                            ?error,
+                            "failed to build closing root-surface window behind effect"
+                        );
+                    })
+                    .ok()
+                });
+            let behind_effects = snapshot
+                .decoration
+                .window_effects
+                .as_ref()
+                .and_then(|effects| effects.behind.as_ref())
+                .and_then(|effect| {
+                    let (rect, source_elements): (_, &[TtyRenderElements]) =
+                        match &effect.effect.input {
+                            EffectInput::WindowSource(WindowSourceInclude::Full) => (
+                                transformed_root_rect(
+                                    snapshot.decoration.layout.root.rect,
+                                    snapshot.transform,
+                                ),
+                                &full_window_source_elements,
+                            ),
+                            EffectInput::WindowSource(WindowSourceInclude::RootSurface) => (
+                                transformed_rect(
+                                    snapshot.decoration.client_rect,
+                                    snapshot.decoration.layout.root.rect,
+                                    snapshot.transform,
+                                ),
+                                &root_surface_source_elements,
+                            ),
+                            _ => (
+                                transformed_root_rect(
+                                    snapshot.decoration.layout.root.rect,
+                                    snapshot.transform,
+                                ),
+                                replacement_source_elements.unwrap_or(&full_window_source_elements),
+                            ),
+                        };
+                    window_effect_elements(
+                        renderer,
+                        output,
+                        output_geo,
+                        scale,
+                        &snapshot.window_id,
+                        "closing-behind",
+                        smithay::backend::renderer::element::Id::new(),
+                        Default::default(),
+                        rect,
+                        effect,
+                        source_elements,
+                    )
+                    .inspect_err(|error| {
+                        warn!(
+                            window_id = %snapshot.window_id,
+                            ?error,
+                            "failed to build closing window behind effect"
+                        );
+                    })
+                    .ok()
+                });
+
             let mut elements = Vec::new();
-            // Render compositor-drawn decorations through the normal pipeline. The snapshot
-            // texture contains only the client area (live_window_snapshot), so decorations
-            // are always rendered separately here — same as the live loop.
-            if let Ok(icon_elements) = crate::backend::icon::icon_elements_for_decoration(
-                renderer,
-                &snapshot.decoration,
-                output_geo,
-                scale,
-                visual.opacity,
-            ) {
-                if let Ok(transformed) = transform_text_elements(icon_elements, root_origin, visual)
-                {
-                    elements.extend(transformed);
-                }
+            if let Some(in_front_effects) = in_front_effects {
+                elements.extend(in_front_effects);
             }
-            if let Ok(text_elements) = crate::backend::text::text_elements_for_decoration(
-                renderer,
-                &snapshot.decoration,
-                output_geo,
-                scale,
-                visual.opacity,
-            ) {
-                if let Ok(transformed) = transform_text_elements(text_elements, root_origin, visual)
-                {
-                    elements.extend(transformed);
-                }
+            if replace_effects.is_empty() {
+                elements.extend(full_window_source_elements);
+            } else {
+                elements.extend(replace_effects);
             }
-            let mut decoration = snapshot.decoration.clone();
-            if let Ok(background_elements) = decoration::background_elements_for_window(
-                renderer,
-                &mut decoration,
-                output_geo,
-                scale,
-                visual.opacity,
-            ) {
-                if let Ok(transformed) =
-                    transform_decoration_elements(background_elements, root_origin, visual)
-                {
-                    elements.extend(transformed);
-                }
+            if let Some(behind_root_surface_effects) = behind_root_surface_effects {
+                elements.extend(behind_root_surface_effects);
             }
-            // Render the frozen client-area snapshot as the window content.
-            if let Some(element) = snapshot::live_snapshot_element(
-                renderer,
-                &snapshot.live,
-                output_geo,
-                scale,
-                visual.opacity,
-            ) {
-                if let Ok(transformed) = transform_snapshot_elements(vec![element], visual) {
-                    elements.extend(transformed);
-                }
+            if let Some(behind_effects) = behind_effects {
+                elements.extend(behind_effects);
             }
             elements
         })
         .collect()
+}
+
+fn closing_decoration_elements(
+    renderer: &mut GlesRenderer,
+    decoration: &crate::ssd::WindowDecorationState,
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    root_origin: Point<i32, smithay::utils::Physical>,
+    visual: WindowVisualState,
+) -> Vec<TtyRenderElements> {
+    let mut elements = Vec::new();
+    // Render compositor-drawn decorations through the normal pipeline. The snapshot
+    // texture contains only the client area (live_window_snapshot), so decorations
+    // are always rendered separately here — same as the live loop.
+    if let Ok(icon_elements) = crate::backend::icon::icon_elements_for_decoration(
+        renderer,
+        decoration,
+        output_geo,
+        scale,
+        visual.opacity,
+    ) {
+        if let Ok(transformed) = transform_text_elements(icon_elements, root_origin, visual) {
+            elements.extend(transformed);
+        }
+    }
+    if let Ok(text_elements) = crate::backend::text::text_elements_for_decoration(
+        renderer,
+        decoration,
+        output_geo,
+        scale,
+        visual.opacity,
+    ) {
+        if let Ok(transformed) = transform_text_elements(text_elements, root_origin, visual) {
+            elements.extend(transformed);
+        }
+    }
+    let mut decoration = decoration.clone();
+    if let Ok(background_elements) = decoration::background_elements_for_window(
+        renderer,
+        &mut decoration,
+        output_geo,
+        scale,
+        visual.opacity,
+    ) {
+        if let Ok(transformed) =
+            transform_decoration_elements(background_elements, root_origin, visual)
+        {
+            elements.extend(transformed);
+        }
+    }
+    elements
+}
+
+fn closing_full_window_source_elements(
+    renderer: &mut GlesRenderer,
+    snapshot: &crate::backend::snapshot::ClosingWindowSnapshot,
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    root_origin: Point<i32, smithay::utils::Physical>,
+    visual: WindowVisualState,
+) -> Vec<TtyRenderElements> {
+    let mut elements = closing_decoration_elements(
+        renderer,
+        &snapshot.decoration,
+        output_geo,
+        scale,
+        root_origin,
+        visual,
+    );
+    elements.extend(closing_root_surface_source_elements(
+        renderer, snapshot, output_geo, scale, visual,
+    ));
+    elements
+}
+
+fn closing_root_surface_source_elements(
+    renderer: &GlesRenderer,
+    snapshot: &crate::backend::snapshot::ClosingWindowSnapshot,
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    visual: WindowVisualState,
+) -> Vec<TtyRenderElements> {
+    // Render the frozen client-area snapshot as the window content.
+    if let Some(element) =
+        snapshot::live_snapshot_element(renderer, &snapshot.live, output_geo, scale, visual.opacity)
+        && let Ok(transformed) = transform_snapshot_elements(vec![element], visual)
+    {
+        return transformed;
+    }
+    Vec::new()
 }
 
 fn connector_connected(

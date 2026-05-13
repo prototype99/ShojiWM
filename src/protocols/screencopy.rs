@@ -1,15 +1,15 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use smithay::reexports::calloop::generic::Generic;
-use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer, Fourcc};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::output::Output;
+use smithay::reexports::calloop::generic::Generic;
+use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::{
     zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
 };
@@ -164,9 +164,7 @@ where
     ) {
         let manager = data_init.init(manager, ());
         let state = state.screencopy_state();
-        state
-            .queues
-            .insert(manager.clone(), ScreencopyQueue::new());
+        state.queues.insert(manager.clone(), ScreencopyQueue::new());
     }
 
     fn can_view(client: Client, global_data: &ScreencopyManagerGlobalData) -> bool {
@@ -419,10 +417,7 @@ where
         };
 
         if std::env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some() {
-            tracing::info!(
-                with_damage,
-                "screencopy: copy request received from client"
-            );
+            tracing::info!(with_damage, "screencopy: copy request received from client");
         }
 
         let size = info.buffer_size;

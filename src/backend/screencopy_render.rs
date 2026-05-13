@@ -9,8 +9,8 @@ use std::ptr;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::RenderElement;
+use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTarget, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen, Renderer};
@@ -42,74 +42,77 @@ pub fn process_screencopy_queue_for_output(
     let mut waited = 0usize;
     let output_name = output.name();
 
-    screencopy_state.with_queues_mut(|queue| loop {
-        let (damage_tracker, front) = queue.split();
-        let Some(front) = front else {
-            return;
-        };
-        if front.output() != output {
-            return;
-        }
-        let with_damage = front.with_damage();
+    screencopy_state.with_queues_mut(|queue| {
+        loop {
+            let (damage_tracker, front) = queue.split();
+            let Some(front) = front else {
+                return;
+            };
+            if front.output() != output {
+                return;
+            }
+            let with_damage = front.with_damage();
 
-        let buffer_kind = match front.buffer() {
-            ScreencopyBuffer::Dmabuf(_) => "dmabuf",
-            ScreencopyBuffer::Shm(_) => "shm",
-        };
-        let render_started_at = std::time::Instant::now();
-        let render_result = render_for_screencopy(renderer, output, elements, damage_tracker, front);
-        let render_elapsed = render_started_at.elapsed();
+            let buffer_kind = match front.buffer() {
+                ScreencopyBuffer::Dmabuf(_) => "dmabuf",
+                ScreencopyBuffer::Shm(_) => "shm",
+            };
+            let render_started_at = std::time::Instant::now();
+            let render_result =
+                render_for_screencopy(renderer, output, elements, damage_tracker, front);
+            let render_elapsed = render_started_at.elapsed();
 
-        match render_result {
-            Ok((sync, damages)) => match damages {
-                Some(damages) => {
-                    if with_damage {
-                        let transform = output.current_transform();
-                        let physical_size = transform.transform_size(front.buffer_size());
-                        let damages = damages
-                            .iter()
-                            .map(|dmg| {
-                                dmg.to_logical(1).to_buffer(
-                                    1,
-                                    transform.invert(),
-                                    &physical_size.to_logical(1),
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        front.damage(damages.into_iter());
+            match render_result {
+                Ok((sync, damages)) => match damages {
+                    Some(damages) => {
+                        if with_damage {
+                            let transform = output.current_transform();
+                            let physical_size = transform.transform_size(front.buffer_size());
+                            let damages = damages
+                                .iter()
+                                .map(|dmg| {
+                                    dmg.to_logical(1).to_buffer(
+                                        1,
+                                        transform.invert(),
+                                        &physical_size.to_logical(1),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            front.damage(damages.into_iter());
+                        }
+                        let has_sync = sync.is_some();
+                        let screencopy = queue.pop();
+                        screencopy.submit_after_sync(false, sync, loop_handle);
+                        processed += 1;
+                        if profile {
+                            tracing::info!(
+                                output = %output_name,
+                                buffer_kind,
+                                render_ms = render_elapsed.as_secs_f64() * 1000.0,
+                                has_sync,
+                                with_damage,
+                                "screencopy: submitted frame"
+                            );
+                        }
                     }
-                    let has_sync = sync.is_some();
-                    let screencopy = queue.pop();
-                    screencopy.submit_after_sync(false, sync, loop_handle);
-                    processed += 1;
-                    if profile {
-                        tracing::info!(
-                            output = %output_name,
-                            buffer_kind,
-                            render_ms = render_elapsed.as_secs_f64() * 1000.0,
-                            has_sync,
-                            with_damage,
-                            "screencopy: submitted frame"
-                        );
+                    None => {
+                        waited += 1;
+                        if profile {
+                            tracing::info!(
+                                output = %output_name,
+                                buffer_kind,
+                                render_ms = render_elapsed.as_secs_f64() * 1000.0,
+                                "screencopy: no damage, deferring"
+                            );
+                        }
+                        return;
                     }
+                },
+                Err(err) => {
+                    tracing::warn!("error rendering for screencopy: {err:?}");
+                    *damage_tracker = OutputDamageTracker::new((0, 0), 1.0, Transform::Normal);
+                    let _ = queue.pop();
                 }
-                None => {
-                    waited += 1;
-                    if profile {
-                        tracing::info!(
-                            output = %output_name,
-                            buffer_kind,
-                            render_ms = render_elapsed.as_secs_f64() * 1000.0,
-                            "screencopy: no damage, deferring"
-                        );
-                    }
-                    return;
-                }
-            },
-            Err(err) => {
-                tracing::warn!("error rendering for screencopy: {err:?}");
-                *damage_tracker = OutputDamageTracker::new((0, 0), 1.0, Transform::Normal);
-                let _ = queue.pop();
             }
         }
     });
@@ -132,10 +135,7 @@ fn render_for_screencopy<'a>(
     damage_tracker: &'a mut OutputDamageTracker,
     screencopy: &Screencopy,
 ) -> Result<
-    (
-        Option<SyncPoint>,
-        Option<&'a Vec<Rectangle<i32, Physical>>>,
-    ),
+    (Option<SyncPoint>, Option<&'a Vec<Rectangle<i32, Physical>>>),
     Box<dyn std::error::Error>,
 > {
     use smithay::output::OutputModeSource;
@@ -161,11 +161,7 @@ fn render_for_screencopy<'a>(
     let relocated_elements = elements
         .iter()
         .map(|element| {
-            RelocateRenderElement::from_element(
-                element,
-                region_loc.upscale(-1),
-                Relocate::Relative,
-            )
+            RelocateRenderElement::from_element(element, region_loc.upscale(-1), Relocate::Relative)
         })
         .collect::<Vec<_>>();
 
@@ -238,14 +234,8 @@ fn render_to_shm(
         {
             return Err::<(), Box<dyn std::error::Error>>("invalid shm buffer format/size".into());
         }
-        let mapping = render_and_download(
-            renderer,
-            size,
-            scale,
-            transform,
-            Fourcc::Xrgb8888,
-            elements,
-        )?;
+        let mapping =
+            render_and_download(renderer, size, scale, transform, Fourcc::Xrgb8888, elements)?;
         let bytes = renderer.map_texture(&mapping)?;
         unsafe {
             ptr::copy_nonoverlapping(bytes.as_ptr(), shm_buffer.cast(), shm_len);
