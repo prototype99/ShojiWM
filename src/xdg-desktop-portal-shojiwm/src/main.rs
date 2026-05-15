@@ -1,7 +1,8 @@
-mod outputs;
 mod picker;
 mod pipewire_stream;
 mod screencast;
+mod sources;
+mod toplevel_stream;
 
 use std::error::Error;
 use std::sync::Arc;
@@ -30,7 +31,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .build()?,
     );
 
-    let picker_handle = picker::setup();
+    let (picker_handle, thumbnail_tx) = picker::setup();
 
     // Bring up zbus before iced starts spinning.
     let connection = runtime.block_on(async {
@@ -38,7 +39,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .name(BUS_NAME)?
             .serve_at(
                 "/org/freedesktop/portal/desktop",
-                screencast::ScreenCast::new(picker_handle.clone()),
+                screencast::ScreenCast::new(picker_handle.clone(), thumbnail_tx),
             )?
             .build()
             .await

@@ -29,12 +29,20 @@ use crate::state::ShojiWM;
 /// For with-damage screencopies, the per-queue damage tracker is consulted and
 /// only submits when there's something new. Without-damage screencopies are
 /// always rendered and submitted.
+/// Render queued screencopies for `output`.
+///
+/// `content_elements` is the output's normal render minus the cursor;
+/// `cursor_elements` is the cursor stack. The cursor is composited on top of
+/// content only when the client requested `overlay_cursor=1`. That gives us
+/// HIDDEN vs EMBEDDED cursor modes for output captures, since our compositor's
+/// normal render path always includes the cursor.
 pub fn process_screencopy_queue_for_output(
     screencopy_state: &mut ScreencopyManagerState,
     loop_handle: &LoopHandle<'_, ShojiWM>,
     renderer: &mut GlesRenderer,
     output: &Output,
-    elements: &[TtyRenderElements],
+    content_elements: &[TtyRenderElements],
+    cursor_elements: &[TtyRenderElements],
 ) {
     let profile = std::env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some();
     let entry_at = std::time::Instant::now();
@@ -58,8 +66,19 @@ pub fn process_screencopy_queue_for_output(
                 ScreencopyBuffer::Shm(_) => "shm",
             };
             let render_started_at = std::time::Instant::now();
+            // Compose a per-frame element list by reference (TtyRenderElements
+            // isn't Clone-able as a whole). Cursor is included only when the
+            // client requested overlay_cursor (= EMBEDDED in portal terms).
+            let composed_refs: Vec<&TtyRenderElements> = if front.overlay_cursor() {
+                cursor_elements
+                    .iter()
+                    .chain(content_elements.iter())
+                    .collect()
+            } else {
+                content_elements.iter().collect()
+            };
             let render_result =
-                render_for_screencopy(renderer, output, elements, damage_tracker, front);
+                render_for_screencopy(renderer, output, &composed_refs, damage_tracker, front);
             let render_elapsed = render_started_at.elapsed();
 
             match render_result {
@@ -131,7 +150,7 @@ pub fn process_screencopy_queue_for_output(
 fn render_for_screencopy<'a>(
     renderer: &mut GlesRenderer,
     output: &Output,
-    elements: &[TtyRenderElements],
+    elements: &[&TtyRenderElements],
     damage_tracker: &'a mut OutputDamageTracker,
     screencopy: &Screencopy,
 ) -> Result<
@@ -161,7 +180,9 @@ fn render_for_screencopy<'a>(
     let relocated_elements = elements
         .iter()
         .map(|element| {
-            RelocateRenderElement::from_element(element, region_loc.upscale(-1), Relocate::Relative)
+            // `element` is `&&TtyRenderElements`; deref once so the wrapped
+            // type stays `&TtyRenderElements`.
+            RelocateRenderElement::from_element(*element, region_loc.upscale(-1), Relocate::Relative)
         })
         .collect::<Vec<_>>();
 

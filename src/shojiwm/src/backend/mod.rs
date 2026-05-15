@@ -6,6 +6,7 @@ pub mod damage_blink;
 pub mod decoration;
 pub mod icon;
 pub mod rounded;
+pub mod image_copy_capture_render;
 pub mod screencopy_render;
 pub mod shader_effect;
 pub mod snapshot;

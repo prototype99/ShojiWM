@@ -194,6 +194,23 @@ pub struct ShojiWM {
     pub viewporter_state: ViewporterState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
     pub screencopy_state: crate::protocols::screencopy::ScreencopyManagerState,
+    pub foreign_toplevel_list_state:
+        smithay::wayland::foreign_toplevel_list::ForeignToplevelListState,
+    pub image_capture_source_state:
+        smithay::wayland::image_capture_source::ImageCaptureSourceState,
+    pub output_capture_source_state:
+        smithay::wayland::image_capture_source::OutputCaptureSourceState,
+    pub toplevel_capture_source_state:
+        smithay::wayland::image_capture_source::ToplevelCaptureSourceState,
+    pub image_copy_capture_state: smithay::wayland::image_copy_capture::ImageCopyCaptureState,
+    /// Live capture sessions, kept alive so dropping doesn't auto-send
+    /// `stopped` to clients. Keyed by source id.
+    pub image_copy_capture_sessions:
+        std::collections::HashMap<usize, Vec<smithay::wayland::image_copy_capture::Session>>,
+    /// Capture frames the client has requested, waiting to be rendered into
+    /// during the next backend frame. Drained per-output / per-toplevel by
+    /// the render path.
+    pub image_copy_capture_pending: Vec<crate::backend::image_copy_capture_render::PendingCapture>,
     pub single_pixel_buffer_state: SinglePixelBufferState,
     pub fixes_state: FixesState,
     pub seat_state: SeatState<ShojiWM>,
@@ -491,6 +508,16 @@ impl ShojiWM {
         let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
         let screencopy_state =
             crate::protocols::screencopy::ScreencopyManagerState::new::<Self, _>(&dh, |_| true);
+        let foreign_toplevel_list_state =
+            smithay::wayland::foreign_toplevel_list::ForeignToplevelListState::new::<Self>(&dh);
+        let image_capture_source_state =
+            smithay::wayland::image_capture_source::ImageCaptureSourceState::new();
+        let output_capture_source_state =
+            smithay::wayland::image_capture_source::OutputCaptureSourceState::new::<Self>(&dh);
+        let toplevel_capture_source_state =
+            smithay::wayland::image_capture_source::ToplevelCaptureSourceState::new::<Self>(&dh);
+        let image_copy_capture_state =
+            smithay::wayland::image_copy_capture::ImageCopyCaptureState::new::<Self>(&dh);
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
         let fixes_state = FixesState::new::<Self>(&dh);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(&dh);
@@ -635,6 +662,13 @@ impl ShojiWM {
             viewporter_state,
             fractional_scale_manager_state,
             screencopy_state,
+            foreign_toplevel_list_state,
+            image_capture_source_state,
+            output_capture_source_state,
+            toplevel_capture_source_state,
+            image_copy_capture_state,
+            image_copy_capture_sessions: std::collections::HashMap::new(),
+            image_copy_capture_pending: Vec::new(),
             single_pixel_buffer_state,
             fixes_state,
             seat_state,

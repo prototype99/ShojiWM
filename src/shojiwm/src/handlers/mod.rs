@@ -36,6 +36,18 @@ use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::wayland::xdg_activation::{
     XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
 };
+use smithay::wayland::foreign_toplevel_list::{
+    ForeignToplevelHandle, ForeignToplevelListHandler, ForeignToplevelListState,
+};
+use smithay::wayland::image_capture_source::{
+    ImageCaptureSource, ImageCaptureSourceHandler, OutputCaptureSourceHandler,
+    OutputCaptureSourceState, ToplevelCaptureSourceHandler, ToplevelCaptureSourceState,
+};
+use smithay::wayland::image_copy_capture::{
+    BufferConstraints, CaptureFailureReason, Frame, FrameRef, ImageCopyCaptureHandler,
+    ImageCopyCaptureState, Session, SessionRef,
+};
+use smithay::output::WeakOutput;
 use smithay::{backend::{allocator::dmabuf::Dmabuf, renderer::ImportDma}};
 
 use crate::state::ShojiWM;
@@ -86,6 +98,158 @@ impl SeatHandler for ShojiWM {
 }
 
 smithay::delegate_dispatch2!(ShojiWM);
+
+impl ForeignToplevelListHandler for ShojiWM {
+    fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
+        &mut self.foreign_toplevel_list_state
+    }
+}
+
+// ext-image-capture-source-v1 + ext-image-copy-capture-v1 (Phase 5b-i skeleton)
+//
+// This wires up the protocol globals and the four handler traits. Actual
+// frame rendering is deferred to Phase 5b-ii (outputs reusing the existing
+// screencopy_render machinery) and 5b-iii (per-toplevel render). For now
+// `frame()` always fails with Unknown so clients see well-defined behaviour.
+
+impl ImageCaptureSourceHandler for ShojiWM {
+    fn source_destroyed(&mut self, _source: ImageCaptureSource) {}
+}
+
+impl OutputCaptureSourceHandler for ShojiWM {
+    fn output_capture_source_state(&mut self) -> &mut OutputCaptureSourceState {
+        &mut self.output_capture_source_state
+    }
+
+    fn output_source_created(
+        &mut self,
+        source: ImageCaptureSource,
+        output: &smithay::output::Output,
+    ) {
+        // Stash the WeakOutput so capture_constraints / frame can resolve back.
+        source.user_data().insert_if_missing(|| output.downgrade());
+    }
+}
+
+impl ToplevelCaptureSourceHandler for ShojiWM {
+    fn toplevel_capture_source_state(&mut self) -> &mut ToplevelCaptureSourceState {
+        &mut self.toplevel_capture_source_state
+    }
+
+    fn toplevel_source_created(
+        &mut self,
+        source: ImageCaptureSource,
+        toplevel: ForeignToplevelHandle,
+    ) {
+        source.user_data().insert_if_missing(|| toplevel.downgrade());
+    }
+}
+
+impl ImageCopyCaptureHandler for ShojiWM {
+    fn image_copy_capture_state(&mut self) -> &mut ImageCopyCaptureState {
+        &mut self.image_copy_capture_state
+    }
+
+    fn capture_constraints(&mut self, source: &ImageCaptureSource) -> Option<BufferConstraints> {
+        // Resolve the source back to either an Output or a ForeignToplevelHandle
+        // and report its size. SHM Xrgb8888 only for the first cut — dmabuf
+        // negotiation comes later.
+        let size = resolve_source_size(self, source)?;
+        Some(BufferConstraints {
+            size,
+            shm: vec![
+                smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb8888,
+            ],
+            dma: None,
+        })
+    }
+
+    fn new_session(&mut self, session: Session) {
+        let source_id = session.source().id();
+        self.image_copy_capture_sessions
+            .entry(source_id)
+            .or_default()
+            .push(session);
+    }
+
+    fn frame(&mut self, session: &SessionRef, frame: Frame) {
+        // Route the frame to the next render pass for whichever output /
+        // toplevel owns its source. The render code drains the queue.
+        use crate::backend::image_copy_capture_render::{CaptureTarget, PendingCapture};
+
+        let draw_cursor = session.draw_cursor();
+        let source = session.source();
+        if let Some(weak) = source.user_data().get::<WeakOutput>() {
+            self.image_copy_capture_pending.push(PendingCapture {
+                frame,
+                target: CaptureTarget::Output(weak.clone()),
+                draw_cursor,
+            });
+            return;
+        }
+        if let Some(weak) = source
+            .user_data()
+            .get::<smithay::wayland::foreign_toplevel_list::ForeignToplevelWeakHandle>()
+        {
+            self.image_copy_capture_pending.push(PendingCapture {
+                frame,
+                target: CaptureTarget::Toplevel(weak.clone()),
+                draw_cursor,
+            });
+            return;
+        }
+        // Unknown source type — fail it so the client doesn't hang.
+        frame.fail(CaptureFailureReason::Unknown);
+    }
+
+    fn frame_aborted(&mut self, _frame: FrameRef) {}
+
+    fn session_destroyed(&mut self, session: SessionRef) {
+        let source_id = session.source().id();
+        if let Some(vec) = self.image_copy_capture_sessions.get_mut(&source_id) {
+            vec.retain(|s| s.as_ref() != session);
+            if vec.is_empty() {
+                self.image_copy_capture_sessions.remove(&source_id);
+            }
+        }
+    }
+}
+
+/// Resolve an `ImageCaptureSource` to its natural buffer size. Returns `None`
+/// if the source's underlying object is gone (output disconnected, window
+/// closed).
+fn resolve_source_size(
+    state: &ShojiWM,
+    source: &ImageCaptureSource,
+) -> Option<smithay::utils::Size<i32, smithay::utils::Buffer>> {
+    use smithay::utils::Transform;
+    if let Some(weak) = source.user_data().get::<WeakOutput>()
+        && let Some(output) = weak.upgrade()
+    {
+        let mode = output.current_mode()?;
+        // Apply the output's transform so the captured buffer matches what
+        // physically renders.
+        let physical = output.current_transform().transform_size(mode.size);
+        return Some(physical.to_logical(1).to_buffer(1, Transform::Normal));
+    }
+    if let Some(weak) = source
+        .user_data()
+        .get::<smithay::wayland::foreign_toplevel_list::ForeignToplevelWeakHandle>()
+        && let Some(handle) = weak.upgrade()
+    {
+        // Find the window that owns this handle and use its geometry.
+        let window = state.space.elements().find(|w| {
+            w.user_data()
+                .get::<ForeignToplevelHandle>()
+                .is_some_and(|h| h.matches(&handle))
+        })?;
+        let geom = window.geometry();
+        if geom.size.w > 0 && geom.size.h > 0 {
+            return Some(geom.size.to_buffer(1, Transform::Normal));
+        }
+    }
+    None
+}
 
 impl XdgActivationHandler for ShojiWM {
     fn activation_state(&mut self) -> &mut XdgActivationState {

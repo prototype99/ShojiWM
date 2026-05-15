@@ -13,6 +13,7 @@ pub mod backend;
 pub mod config;
 pub mod cursor;
 pub mod drawing;
+pub mod foreign_toplevel;
 pub mod grabs;
 pub mod handlers;
 pub mod input;

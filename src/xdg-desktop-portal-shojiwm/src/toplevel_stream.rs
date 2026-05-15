@@ -1,86 +1,23 @@
-//! Unified PipeWire + wlr-screencopy pipeline for ScreenCast.
+//! Toplevel (single-window) streaming via `ext-image-copy-capture-v1`.
 //!
-//! # Architecture: DRIVER + ALLOC_BUFFERS + wayland-driven queue
+//! Sibling to [`crate::pipewire_stream`], which streams whole outputs through
+//! `zwlr-screencopy-unstable-v1`. Same architecture
+//! (DRIVER + ALLOC_BUFFERS + wayland-driven queue + single-thread integration —
+//! see that module for the long rationale on each piece), with three protocol
+//! differences:
 //!
-//! This module deliberately mirrors xdg-desktop-portal-hyprland's approach
-//! rather than the more obvious "PipeWire pulls, we push" model. The choice
-//! is what gives us full output-refresh framerates (~65 fps on a 66 Hz panel)
-//! instead of being pinned to the PipeWire graph driver's audio quantum
-//! (~46.875 fps = 1024/48000 — the original xdpw bug, see
-//! `docs/screencast-30fps-xdpw-bug.md`).
-//!
-//! ## Why each piece matters
-//!
-//! - **`PW_STREAM_FLAG_DRIVER`** marks our stream as the cycle driver in
-//!   PipeWire's graph. Without it, the graph driver ends up being whatever
-//!   audio sink is running, and that sink ticks at its quantum (typically
-//!   1024/48000 ≈ 21.3 ms = 46.875 Hz). Our video stream is then scheduled
-//!   piggy-back on those ticks — that's exactly the regression
-//!   `xdpw@ca7a3e2e` introduced. With DRIVER we own the cycle pacing.
-//!
-//! - **`PW_STREAM_FLAG_ALLOC_BUFFERS`** tells PipeWire to pre-allocate the
-//!   buffer slots from our `SPA_PARAM_Buffers` advert; our `add_buffer`
-//!   callback fires once per slot with the empty `pw_buffer` so we can
-//!   populate `spa_data{type=MemFd, fd, maxsize}`. The crucial property is
-//!   that **the memfd we install on each pw_buffer is the same memory we
-//!   wrap as a `wl_buffer` via `wl_shm_pool`**. wlr-screencopy writes to the
-//!   `wl_buffer`, PipeWire consumers read from the `pw_buffer`, and there
-//!   is exactly one byte of pixels on the wire: zero-copy.
-//!
-//! - **Wayland-driven queue** is what actually closes the timing loop. With
-//!   DRIVER set, `on_process` no longer fires on its own — there is no
-//!   external pull. We instead let each `wlr-screencopy ready` event call
-//!   `pw_stream_queue_buffer`, which both delivers the frame to consumers
-//!   and advances the PipeWire cycle. The next `capture_output` is issued
-//!   immediately after, so our cycle rate matches the rate at which the
-//!   compositor finishes new screencopy frames — i.e. one per vblank, i.e.
-//!   the output refresh.
-//!
-//!   The earlier "pull" model (no DRIVER, `MAP_BUFFERS`, fill in
-//!   `on_process`) "worked" but observed exactly 46.875 fps because the
-//!   audio sink was driving. The xdph-style "push from wayland" model is
-//!   what severs that link.
-//!
-//! - **Single thread** with `pipewire::loop_::Loop::add_io` attaching the
-//!   wayland socket fd to the same loop the PipeWire main loop polls. This
-//!   removes all cross-thread synchronization around the stream handle: the
-//!   wayland event callbacks (which call `dequeue_raw_buffer` /
-//!   `queue_raw_buffer`) and the PipeWire stream callbacks (which set up
-//!   memfds in `add_buffer`) all run on the same thread, accessing
-//!   `AppState` through one `Rc<RefCell<_>>`.
-//!
-//!   `pipewire::stream::StreamRc` is `Rc`-based (`!Send`), and switching to
-//!   `pw_thread_loop` to get a `Send`-able handle was an option, but the
-//!   unified-loop approach is simpler and matches what xdph does in C.
-//!
-//! ## Flow per frame
-//!
-//!   1. `kick_capture()` sends `capture_output` to the compositor and flushes
-//!      the wayland socket immediately. (Without the flush the request sits
-//!      in the outbound queue forever — the `add_io` callback only wakes on
-//!      *incoming* bytes, so there's a catch-22 if we never push first.)
-//!   2. Compositor sends `Buffer { format, w, h, stride }` advertising the
-//!      pixel layout — we ignore the values (they match what we negotiated
-//!      with PipeWire) and just wait for the synchronization event.
-//!   3. `BufferDone` arrives → `dequeue_raw_buffer()` pops a pw_buffer; we
-//!      look up its paired `wl_buffer` and call `frame.copy(&wl_buffer)`.
-//!      The compositor writes pixels directly into the memfd PipeWire owns.
-//!   4. `Ready` arrives → we set `chunk.size` on the pw_buffer, call
-//!      `queue_raw_buffer()` (this is the wake-up signal for consumers AND
-//!      the cycle advance for the DRIVER stream), then immediately call
-//!      `kick_capture()` for the next frame.
-//!
-//! ## Why not the other architectures we tried
-//!
-//! - `MAP_BUFFERS` + `on_process` pull + cache copy (Phase 4b): worked, but
-//!   audio-quantum-paced at 46.875 fps.
-//! - `DRIVER` + `pw_stream_trigger_process` from a timer (Phase 4a): returned
-//!   `EIO` because the stream never became a real driver in the graph
-//!   negotiation. (Even when it did, this would still couple to whatever
-//!   pace our timer was set at, not vblank.)
-//! - Two-thread design with cross-thread `EventSource::signal()`: works in
-//!   principle but adds locking around the `StreamRc` and is materially
-//!   harder to reason about. Same architecture, more friction.
+//!   1. The capture source is created via
+//!      `ext_foreign_toplevel_image_capture_source_manager_v1::create_source`
+//!      pointed at an `ExtForeignToplevelHandleV1` (looked up by identifier).
+//!   2. A long-lived `ExtImageCopyCaptureSessionV1` advertises
+//!      `buffer_size` / `shm_format` / `done` once at startup, and *those*
+//!      values pick the PipeWire stream dims/format rather than the picker
+//!      hint. (For outputs the picker already knows the right dims; for a
+//!      toplevel the compositor is the only authoritative source.)
+//!   3. Per frame: `dequeue_raw_buffer → session.create_frame →
+//!      frame.attach_buffer → frame.capture → ready → queue_raw_buffer →
+//!      next dequeue`. The "no buffer_done event" sequence is simpler than
+//!      wlr-screencopy's two-step buffer / buffer_done dance.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -88,8 +25,8 @@ use std::io::Cursor;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 
 use pipewire as pw;
@@ -99,23 +36,29 @@ use pw::spa::pod::{ChoiceValue, Object, Pod, Property, Value};
 use pw::spa::support::system::IoFlags;
 use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle};
 use spa::sys as spa_sys;
-use wayland_client::protocol::{
-    wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool,
-};
+use wayland_client::protocol::{wl_buffer, wl_registry, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
-use wayland_protocols_wlr::screencopy::v1::client::{
-    zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
-    zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
+    ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
+    ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
+};
+use wayland_protocols::ext::image_capture_source::v1::client::{
+    ext_foreign_toplevel_image_capture_source_manager_v1::ExtForeignToplevelImageCaptureSourceManagerV1,
+    ext_image_capture_source_v1::ExtImageCaptureSourceV1,
+};
+use wayland_protocols::ext::image_copy_capture::v1::client::{
+    ext_image_copy_capture_frame_v1::{self, ExtImageCopyCaptureFrameV1},
+    ext_image_copy_capture_manager_v1::{self, ExtImageCopyCaptureManagerV1},
+    ext_image_copy_capture_session_v1::{self, ExtImageCopyCaptureSessionV1},
 };
 
 #[derive(Debug, Clone)]
 pub struct StreamSpec {
-    pub output_name: String,
-    pub width: u32,
-    pub height: u32,
+    pub toplevel_identifier: String,
     pub framerate: u32,
-    /// Whether to render the cursor into the captured output. Translates to
-    /// `overlay_cursor=1` on wlr-screencopy's `capture_output`.
+    /// Whether to advertise `paint_cursors` on the session. Honoured by the
+    /// compositor only if it composites cursor for per-toplevel captures
+    /// (which we don't yet — see `image_copy_capture_render.rs`).
     pub cursor_visible: bool,
 }
 
@@ -140,18 +83,24 @@ pub fn start(
     let stop_for_thread = stop.clone();
     let (tx, rx) = mpsc::sync_channel::<Result<u32, String>>(1);
     let join = thread::Builder::new()
-        .name("portal-screencast".into())
+        .name("portal-toplevel-stream".into())
         .spawn(move || {
             if let Err(e) = run(spec, tx, stop_for_thread) {
-                tracing::error!("screencast thread exited: {e}");
+                tracing::error!("toplevel stream thread exited: {e}");
             }
         })?;
     let node_id = rx
         .recv()
-        .map_err(|_| "screencast thread died before reporting node id".to_string())?
+        .map_err(|_| "toplevel stream thread died before reporting node id".to_string())?
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-    tracing::info!(node_id, "screencast stream live");
-    Ok((node_id, StreamHandle { stop, join: Some(join) }))
+    tracing::info!(node_id, "toplevel stream live");
+    Ok((
+        node_id,
+        StreamHandle {
+            stop,
+            join: Some(join),
+        },
+    ))
 }
 
 // ─── Shared state ────────────────────────────────────────────────────────
@@ -162,43 +111,59 @@ struct AppState {
     // Wayland resources
     conn: Option<Connection>,
     qh: QueueHandle<AppState>,
-    manager: Option<ZwlrScreencopyManagerV1>,
-    target_output: Option<wl_output::WlOutput>,
     shm: Option<wl_shm::WlShm>,
+    capture_manager: Option<ExtImageCopyCaptureManagerV1>,
+    toplevel_source_manager: Option<ExtForeignToplevelImageCaptureSourceManagerV1>,
 
-    // PipeWire stream (cloneable Rc handle)
+    // Toplevel discovery (filled during bootstrap roundtrips).
+    toplevels: Vec<DiscoveredToplevel>,
+    toplevel_index: HashMap<u32, usize>,
+    target_toplevel: Option<ExtForeignToplevelHandleV1>,
+
+    // Session + source (created after toplevel found).
+    source: Option<ExtImageCaptureSourceV1>,
+    session: Option<ExtImageCopyCaptureSessionV1>,
+
+    // Session-advertised buffer constraints.
+    adv_width: u32,
+    adv_height: u32,
+    adv_format: Option<wl_shm::Format>,
+    adv_done: bool,
+    session_stopped: bool,
+
+    // PipeWire stream (cloneable Rc handle).
     stream: Option<pw::stream::StreamRc>,
     /// pw_buffer raw ptr → its wrapping wl_buffer + owned memfd.
     pw_buffer_slots: HashMap<usize, BufferSlot>,
     /// pw_buffer raw ptr → its negotiated stride (cached at add_buffer time).
     pw_buffer_stride: HashMap<usize, i32>,
 
-    // wlr-screencopy session state
+    // Per-frame in-flight state.
     pending_frame: Option<PendingFrame>,
-    adv_format: Option<wl_shm::Format>,
-    adv_width: u32,
-    adv_height: u32,
-    adv_stride: u32,
-    adv_flags: zwlr_screencopy_frame_v1::Flags,
 
-    // node-id handoff (taken on first Paused transition)
+    // node-id handoff (taken on first Paused transition).
     node_id_tx: Option<mpsc::SyncSender<Result<u32, String>>>,
 
-    // Diagnostics
+    // Diagnostics.
     frames_completed: u64,
     last_log_at: std::time::Instant,
     capture_kicked: bool,
 
-    // Same dying / stop_flag pattern as toplevel_stream.rs — once the
-    // consumer disconnects we short-circuit every callback so we don't
-    // dereference a stale pw_buffer.
+    // Set when the PW stream transitions to Error/Unconnected (consumer
+    // disconnected, etc.). Every callback short-circuits afterwards so we
+    // never touch a torn-down buffer / stream — which is what produced the
+    // SEGV when OBS quit.
     dying: bool,
     stop_flag: Option<Arc<AtomicBool>>,
 }
 
+struct DiscoveredToplevel {
+    proxy: ExtForeignToplevelHandleV1,
+    identifier: String,
+}
+
 struct PendingFrame {
-    frame: ZwlrScreencopyFrameV1,
-    /// The PW buffer this frame is being copied into.
+    frame: ExtImageCopyCaptureFrameV1,
     pw_buffer: usize,
 }
 
@@ -208,11 +173,8 @@ struct BufferSlot {
     _fd: OwnedFd,
 }
 
-// Raw pw_buffer pointers don't carry Send / Sync inferred by the compiler, but
-// the whole AppState only ever lives on a single thread.
 unsafe impl Send for AppState {}
 
-/// Carrier for an OwnedFd inside `add_io` (which needs `AsRawFd`).
 struct FdHolder(BorrowedFd<'static>);
 impl AsRawFd for FdHolder {
     fn as_raw_fd(&self) -> RawFd {
@@ -232,29 +194,32 @@ fn run(
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
 
-    // Connect Wayland.
     let conn = Connection::connect_to_env()?;
     let mut event_queue: EventQueue<AppState> = conn.new_event_queue();
     let qh = event_queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
 
-    // Stub AppState for the bootstrap roundtrips.
     let mut state = AppState {
         spec: spec.clone(),
         conn: Some(conn.clone()),
         qh: qh.clone(),
-        manager: None,
-        target_output: None,
         shm: None,
+        capture_manager: None,
+        toplevel_source_manager: None,
+        toplevels: Vec::new(),
+        toplevel_index: HashMap::new(),
+        target_toplevel: None,
+        source: None,
+        session: None,
+        adv_width: 0,
+        adv_height: 0,
+        adv_format: None,
+        adv_done: false,
+        session_stopped: false,
         stream: None,
         pw_buffer_slots: HashMap::new(),
         pw_buffer_stride: HashMap::new(),
         pending_frame: None,
-        adv_format: None,
-        adv_width: 0,
-        adv_height: 0,
-        adv_stride: 0,
-        adv_flags: zwlr_screencopy_frame_v1::Flags::empty(),
         node_id_tx: Some(node_id_tx),
         frames_completed: 0,
         last_log_at: std::time::Instant::now(),
@@ -263,60 +228,109 @@ fn run(
         stop_flag: Some(stop.clone()),
     };
 
-    // Bind globals (round 1), then receive wl_output names (round 2).
-    event_queue.roundtrip(&mut state)?;
-    event_queue.roundtrip(&mut state)?;
+    // Bind globals (round 1), receive toplevel list events (round 2 + 3).
+    for _ in 0..3 {
+        event_queue.roundtrip(&mut state)?;
+    }
 
-    if state.manager.is_none() {
-        let _ = state
-            .node_id_tx
-            .take()
-            .map(|tx| tx.send(Err("compositor doesn't expose zwlr_screencopy_manager_v1".into())));
-        return Err("no zwlr_screencopy_manager_v1".into());
+    if state.capture_manager.is_none() {
+        let err = "compositor doesn't expose ext_image_copy_capture_manager_v1";
+        let _ = state.node_id_tx.take().map(|tx| tx.send(Err(err.into())));
+        return Err(err.into());
+    }
+    if state.toplevel_source_manager.is_none() {
+        let err = "compositor doesn't expose ext_foreign_toplevel_image_capture_source_manager_v1";
+        let _ = state.node_id_tx.take().map(|tx| tx.send(Err(err.into())));
+        return Err(err.into());
     }
     if state.shm.is_none() {
-        let _ = state
-            .node_id_tx
-            .take()
-            .map(|tx| tx.send(Err("compositor doesn't expose wl_shm".into())));
-        return Err("no wl_shm".into());
+        let err = "compositor doesn't expose wl_shm";
+        let _ = state.node_id_tx.take().map(|tx| tx.send(Err(err.into())));
+        return Err(err.into());
     }
-    if state.target_output.is_none() {
-        let _ = state.node_id_tx.take().map(|tx| {
-            tx.send(Err(format!(
-                "output {:?} not found",
-                spec.output_name
-            )))
-        });
-        return Err("target output not found".into());
+    state.target_toplevel = state
+        .toplevels
+        .iter()
+        .find(|t| t.identifier == spec.toplevel_identifier)
+        .map(|t| t.proxy.clone());
+    if state.target_toplevel.is_none() {
+        let err = format!(
+            "toplevel with identifier {:?} not found",
+            spec.toplevel_identifier
+        );
+        let _ = state.node_id_tx.take().map(|tx| tx.send(Err(err.clone())));
+        return Err(err.into());
     }
-    tracing::info!(output = spec.output_name, "screencast: globals bound");
 
-    // Build the PipeWire stream.
+    // Create source + session, then wait for the session to advertise its
+    // constraints. The PipeWire stream depends on those dims/format.
+    {
+        let manager = state.toplevel_source_manager.clone().unwrap();
+        let capture = state.capture_manager.clone().unwrap();
+        let toplevel = state.target_toplevel.clone().unwrap();
+        let source = manager.create_source(&toplevel, &qh, ());
+        let options = if spec.cursor_visible {
+            ext_image_copy_capture_manager_v1::Options::PaintCursors
+        } else {
+            ext_image_copy_capture_manager_v1::Options::empty()
+        };
+        let session = capture.create_session(&source, options, &qh, ());
+        state.source = Some(source);
+        state.session = Some(session);
+    }
+    conn.flush()?;
+    for _ in 0..6 {
+        event_queue.roundtrip(&mut state)?;
+        if state.adv_done || state.session_stopped {
+            break;
+        }
+    }
+    if state.session_stopped {
+        let err = "session stopped before advertising constraints";
+        let _ = state.node_id_tx.take().map(|tx| tx.send(Err(err.into())));
+        return Err(err.into());
+    }
+    if !state.adv_done || state.adv_width == 0 || state.adv_height == 0 {
+        let err = "session never finalized buffer constraints";
+        let _ = state.node_id_tx.take().map(|tx| tx.send(Err(err.into())));
+        return Err(err.into());
+    }
+    if !matches!(state.adv_format, Some(wl_shm::Format::Xrgb8888)) {
+        tracing::warn!(
+            advertised = ?state.adv_format,
+            "toplevel session didn't advertise Xrgb8888; forcing it anyway"
+        );
+        state.adv_format = Some(wl_shm::Format::Xrgb8888);
+    }
+    tracing::info!(
+        width = state.adv_width,
+        height = state.adv_height,
+        format = ?state.adv_format,
+        "toplevel session constraints negotiated"
+    );
+
+    // Build PipeWire stream with the negotiated dims.
     let stream = pw::stream::StreamRc::new(
         core,
-        "shojiwm-screencast",
+        "shojiwm-toplevel-screencast",
         pw::properties::properties! {
             *pw::keys::MEDIA_CLASS => "Video/Source",
             *pw::keys::MEDIA_ROLE => "Screen",
-            *pw::keys::NODE_NAME => "shojiwm-portal-stream",
-            *pw::keys::NODE_DESCRIPTION => "ShojiWM portal screencast",
+            *pw::keys::NODE_NAME => "shojiwm-portal-toplevel-stream",
+            *pw::keys::NODE_DESCRIPTION => "ShojiWM portal toplevel screencast",
         },
     )?;
     state.stream = Some(stream.clone());
 
     let state_rc = Rc::new(RefCell::new(state));
 
-    // Register stream listeners — they all funnel into AppState via the Rc.
     let s_state = state_rc.clone();
     let s_add = state_rc.clone();
     let s_remove = state_rc.clone();
     let _listener = stream
         .add_local_listener_with_user_data(())
         .state_changed(move |stream, _ud, old, new| {
-            s_state
-                .borrow_mut()
-                .on_state_changed(stream, old, new);
+            s_state.borrow_mut().on_state_changed(stream, old, new);
         })
         .add_buffer(move |stream, _ud, buffer| {
             s_add.borrow_mut().on_add_buffer(stream, buffer);
@@ -325,15 +339,16 @@ fn run(
             s_remove.borrow_mut().on_remove_buffer(stream, buffer);
         })
         .process(|_, _| {
-            // No-op: the cycle is driven by queue_buffer from the wlr-screencopy
-            // ready handler. on_process firing here is rare under DRIVER and
-            // doesn't need to do anything.
+            // No-op: cycle is driven by queue_buffer from on_frame_ready.
         })
         .register()?;
 
-    // Negotiate format + buffer params.
-    let format_bytes = build_video_format_param(&spec)?;
-    let buffers_bytes = build_buffers_param(&spec)?;
+    let (adv_width, adv_height) = {
+        let s = state_rc.borrow();
+        (s.adv_width, s.adv_height)
+    };
+    let format_bytes = build_video_format_param(adv_width, adv_height, spec.framerate)?;
+    let buffers_bytes = build_buffers_param(adv_width, adv_height)?;
     let format_pod =
         Pod::from_bytes(&format_bytes).ok_or("format POD parse failed".to_string())?;
     let buffers_pod = Pod::from_bytes(&buffers_bytes)
@@ -345,13 +360,10 @@ fn run(
         pw::stream::StreamFlags::DRIVER | pw::stream::StreamFlags::ALLOC_BUFFERS,
         &mut params,
     )?;
-    tracing::info!("screencast: PW stream connected (DRIVER | ALLOC_BUFFERS)");
+    tracing::info!("toplevel screencast: PW stream connected (DRIVER | ALLOC_BUFFERS)");
 
-    // Attach the wayland fd to the PW main loop. Move event_queue into the io
-    // closure — after this point all wayland dispatching is fd-driven.
+    // Attach wayland fd to the PW main loop.
     let wl_fd = conn.as_fd().try_clone_to_owned()?;
-    // SAFETY: we own the OwnedFd for the lifetime of the closure; transmuting
-    // to BorrowedFd<'static> is unsafe but the fd outlives the IoSource.
     let wl_fd_static: BorrowedFd<'static> =
         unsafe { std::mem::transmute::<BorrowedFd<'_>, BorrowedFd<'static>>(wl_fd.as_fd()) };
     let fd_holder = FdHolder(wl_fd_static);
@@ -360,7 +372,6 @@ fn run(
     let conn_for_io = conn.clone();
     let event_queue_cell = RefCell::new(event_queue);
     let _io = mainloop.loop_().add_io(fd_holder, IoFlags::IN, move |_| {
-        // Read whatever wayland has on the socket without blocking.
         if let Some(guard) = conn_for_io.prepare_read() {
             let _ = guard.read();
         }
@@ -371,14 +382,9 @@ fn run(
         }
         let _ = conn_for_io.flush();
     });
-    tracing::info!("wayland fd attached to PW loop");
 
-    // Make sure any pending wayland requests (the registry bind etc.) hit the
-    // wire before mainloop starts blocking on its own poll.
     conn.flush()?;
 
-    // Run forever (until stop flag flips via teardown_loop event below or
-    // process exit).
     let mainloop_for_stop = mainloop.clone();
     let stop_for_event = stop.clone();
     let event_check = mainloop.loop_().add_timer(move |_| {
@@ -393,11 +399,16 @@ fn run(
 
     mainloop.run();
 
-    // Cleanup: detach stream slots; OwnedFds drop closes them.
     let mut state = state_rc.borrow_mut();
     state.pw_buffer_slots.clear();
     state.pending_frame = None;
-    tracing::info!("screencast thread exiting cleanly");
+    if let Some(s) = state.session.take() {
+        s.destroy();
+    }
+    if let Some(s) = state.source.take() {
+        s.destroy();
+    }
+    tracing::info!("toplevel screencast thread exiting cleanly");
     Ok(())
 }
 
@@ -421,137 +432,158 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
             return;
         };
         match interface.as_str() {
-            "wl_output" => {
-                // Bind eagerly; filter by name when we get the Name event.
-                let _output = registry.bind::<wl_output::WlOutput, _, _>(
-                    name,
-                    version.min(4),
-                    qh,
-                    (),
-                );
-            }
             "wl_shm" => {
                 state.shm =
                     Some(registry.bind::<wl_shm::WlShm, _, _>(name, version.min(1), qh, ()));
             }
-            "zwlr_screencopy_manager_v1" => {
-                state.manager = Some(registry.bind::<ZwlrScreencopyManagerV1, _, _>(
+            "ext_image_copy_capture_manager_v1" => {
+                state.capture_manager = Some(registry.bind::<ExtImageCopyCaptureManagerV1, _, _>(
                     name,
-                    version.min(3),
+                    version.min(1),
                     qh,
                     (),
                 ));
+            }
+            "ext_foreign_toplevel_image_capture_source_manager_v1" => {
+                state.toplevel_source_manager = Some(
+                    registry.bind::<ExtForeignToplevelImageCaptureSourceManagerV1, _, _>(
+                        name,
+                        version.min(1),
+                        qh,
+                        (),
+                    ),
+                );
+            }
+            "ext_foreign_toplevel_list_v1" => {
+                registry.bind::<ExtForeignToplevelListV1, _, _>(name, version.min(1), qh, ());
             }
             _ => {}
         }
     }
 }
 
-impl Dispatch<wl_output::WlOutput, ()> for AppState {
+macro_rules! empty_dispatch {
+    ($t:ty) => {
+        impl Dispatch<$t, ()> for AppState {
+            fn event(
+                _: &mut Self,
+                _: &$t,
+                _: <$t as Proxy>::Event,
+                _: &(),
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+            }
+        }
+    };
+}
+empty_dispatch!(wl_shm::WlShm);
+empty_dispatch!(wl_shm_pool::WlShmPool);
+empty_dispatch!(wl_buffer::WlBuffer);
+empty_dispatch!(ExtImageCopyCaptureManagerV1);
+empty_dispatch!(ExtForeignToplevelImageCaptureSourceManagerV1);
+empty_dispatch!(ExtImageCaptureSourceV1);
+
+impl Dispatch<ExtForeignToplevelListV1, ()> for AppState {
     fn event(
-        state: &mut Self,
-        output: &wl_output::WlOutput,
-        event: wl_output::Event,
+        _: &mut Self,
+        _: &ExtForeignToplevelListV1,
+        _: ext_foreign_toplevel_list_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Name { name } = event
-            && name == state.spec.output_name
-            && state.target_output.is_none()
-        {
-            state.target_output = Some(output.clone());
+    }
+    wayland_client::event_created_child!(AppState, ExtForeignToplevelListV1, [
+        ext_foreign_toplevel_list_v1::EVT_TOPLEVEL_OPCODE => (ExtForeignToplevelHandleV1, ()),
+    ]);
+}
+
+impl Dispatch<ExtForeignToplevelHandleV1, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        proxy: &ExtForeignToplevelHandleV1,
+        event: ext_foreign_toplevel_handle_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let id = proxy.id().protocol_id();
+        let idx = if let Some(&existing) = state.toplevel_index.get(&id) {
+            existing
+        } else {
+            state.toplevels.push(DiscoveredToplevel {
+                proxy: proxy.clone(),
+                identifier: String::new(),
+            });
+            let new = state.toplevels.len() - 1;
+            state.toplevel_index.insert(id, new);
+            new
+        };
+        match event {
+            ext_foreign_toplevel_handle_v1::Event::Identifier { identifier } => {
+                state.toplevels[idx].identifier = identifier;
+            }
+            ext_foreign_toplevel_handle_v1::Event::Closed => {
+                if let Some(remove_idx) = state.toplevel_index.remove(&id) {
+                    state.toplevels.remove(remove_idx);
+                    for entry in state.toplevel_index.values_mut() {
+                        if *entry > remove_idx {
+                            *entry -= 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
 
-impl Dispatch<wl_shm::WlShm, ()> for AppState {
-    fn event(
-        _: &mut Self,
-        _: &wl_shm::WlShm,
-        _: wl_shm::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<wl_shm_pool::WlShmPool, ()> for AppState {
-    fn event(
-        _: &mut Self,
-        _: &wl_shm_pool::WlShmPool,
-        _: wl_shm_pool::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<wl_buffer::WlBuffer, ()> for AppState {
-    fn event(
-        _: &mut Self,
-        _: &wl_buffer::WlBuffer,
-        _: wl_buffer::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<ZwlrScreencopyManagerV1, ()> for AppState {
-    fn event(
-        _: &mut Self,
-        _: &ZwlrScreencopyManagerV1,
-        _: <ZwlrScreencopyManagerV1 as Proxy>::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppState {
+impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for AppState {
     fn event(
         state: &mut Self,
-        frame: &ZwlrScreencopyFrameV1,
-        event: zwlr_screencopy_frame_v1::Event,
+        _: &ExtImageCopyCaptureSessionV1,
+        event: ext_image_copy_capture_session_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         match event {
-            zwlr_screencopy_frame_v1::Event::Buffer {
-                format,
-                width,
-                height,
-                stride,
-            } => {
-                if let WEnum::Value(fmt) = format {
-                    state.adv_format = Some(fmt);
-                }
+            ext_image_copy_capture_session_v1::Event::BufferSize { width, height } => {
                 state.adv_width = width;
                 state.adv_height = height;
-                state.adv_stride = stride;
             }
-            zwlr_screencopy_frame_v1::Event::LinuxDmabuf { .. } => {}
-            zwlr_screencopy_frame_v1::Event::BufferDone => {
-                state.on_buffer_done(frame);
-            }
-            zwlr_screencopy_frame_v1::Event::Flags { flags } => {
-                if let WEnum::Value(f) = flags {
-                    state.adv_flags = f;
+            ext_image_copy_capture_session_v1::Event::ShmFormat { format } => {
+                if let WEnum::Value(f) = format {
+                    let is_preferred = matches!(f, wl_shm::Format::Xrgb8888);
+                    if state.adv_format.is_none() || is_preferred {
+                        state.adv_format = Some(f);
+                    }
                 }
             }
-            zwlr_screencopy_frame_v1::Event::Damage { .. } => {}
-            zwlr_screencopy_frame_v1::Event::Ready { .. } => {
-                state.on_frame_ready();
+            ext_image_copy_capture_session_v1::Event::Done => {
+                state.adv_done = true;
             }
-            zwlr_screencopy_frame_v1::Event::Failed => {
-                state.on_frame_failed();
+            ext_image_copy_capture_session_v1::Event::Stopped => {
+                state.session_stopped = true;
             }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _: &ExtImageCopyCaptureFrameV1,
+        event: ext_image_copy_capture_frame_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_image_copy_capture_frame_v1::Event::Ready => state.on_frame_ready(),
+            ext_image_copy_capture_frame_v1::Event::Failed { .. } => state.on_frame_failed(),
             _ => {}
         }
     }
@@ -582,6 +614,9 @@ impl AppState {
             new,
             pw::stream::StreamState::Error(_) | pw::stream::StreamState::Unconnected
         ) {
+            // Consumer disconnected (or stream errored). Drop any in-flight
+            // frame, mark dying so subsequent callbacks short-circuit, and
+            // ask the mainloop to quit on its next tick.
             self.dying = true;
             if let Some(pending) = self.pending_frame.take() {
                 pending.frame.destroy();
@@ -593,10 +628,8 @@ impl AppState {
     }
 
     fn on_add_buffer(&mut self, _stream: &pw::stream::Stream, buffer: *mut pw::sys::pw_buffer) {
-        let stride = (self.spec.width * 4) as i32;
-        let size = stride as usize * self.spec.height as usize;
-
-        // Allocate a memfd for this slot.
+        let stride = (self.adv_width * 4) as i32;
+        let size = stride as usize * self.adv_height as usize;
         let memfd = match rustix::fs::memfd_create(
             "shojiwm-portal-pwbuf",
             rustix::fs::MemfdFlags::CLOEXEC,
@@ -611,27 +644,20 @@ impl AppState {
             tracing::error!("ftruncate: {e}");
             return;
         }
-
-        // Wrap as wl_buffer through wl_shm_pool.
         let Some(shm) = self.shm.as_ref() else {
             return;
         };
         let pool = shm.create_pool(memfd.as_fd(), size as i32, &self.qh, ());
-        let wl_format = wl_shm::Format::Xrgb8888;
         let wl_buf = pool.create_buffer(
             0,
-            self.spec.width as i32,
-            self.spec.height as i32,
+            self.adv_width as i32,
+            self.adv_height as i32,
             stride,
-            wl_format,
+            wl_shm::Format::Xrgb8888,
             &self.qh,
             (),
         );
 
-        // Tell PipeWire about this buffer's storage. We hand the fd over by
-        // dup'ing it (PW expects to own the fd and will close it via
-        // remove_buffer; we still want to keep ours alive for as long as the
-        // wl_buffer references it).
         let fd_for_pw = match memfd.try_clone() {
             Ok(c) => c.into_raw_fd(),
             Err(e) => {
@@ -686,10 +712,9 @@ impl AppState {
             slot.wl_buffer.destroy();
         }
         self.pw_buffer_stride.remove(&key);
-        // If an in-flight wlr-screencopy frame was targeting this buffer,
-        // abandon it. A late Ready event would otherwise call queue_raw_buffer
-        // on the now-freed pointer (use-after-free → SEGV — observed when OBS
-        // disconnects mid-stream).
+        // Abandon any in-flight frame that pointed at this buffer so a late
+        // Ready doesn't dereference freed PipeWire state (the consumer
+        // disconnect SEGV path).
         if let Some(pending) = &self.pending_frame
             && pending.pw_buffer == key
         {
@@ -698,70 +723,45 @@ impl AppState {
         }
     }
 
-    /// Issue the next capture_output request. Must be called when there is
-    /// no in-flight frame.
+    /// Dequeue a PW buffer, create a new wlr frame on the session, attach
+    /// the wl_buffer that wraps the same memfd, and submit. The compositor
+    /// renders straight into the PW-owned memory and answers with Ready.
     fn kick_capture(&mut self) {
         if self.dying {
             return;
         }
-        let (Some(manager), Some(output)) = (self.manager.as_ref(), self.target_output.as_ref())
-        else {
-            tracing::warn!("kick_capture: missing manager or output");
+        let Some(session) = self.session.clone() else {
             return;
         };
-        let overlay_cursor = if self.spec.cursor_visible { 1 } else { 0 };
-        let frame = manager.capture_output(overlay_cursor, output, &self.qh, ());
-        self.pending_frame = Some(PendingFrame {
-            frame,
-            pw_buffer: 0,
-        });
-        // Critical: flush the request to the compositor immediately. The
-        // wayland fd add_io callback only fires when we receive bytes, so
-        // without an explicit flush here the request would sit in the
-        // outbound queue forever and the compositor would never respond.
-        if let Some(conn) = self.conn.as_ref()
-            && let Err(e) = conn.flush()
-        {
-            tracing::warn!("kick_capture: flush failed: {e}");
-        }
-    }
-
-    fn on_buffer_done(&mut self, _frame: &ZwlrScreencopyFrameV1) {
-        if self.dying {
-            return;
-        }
-        // Dequeue a PW buffer to fill.
         let Some(stream) = self.stream.clone() else {
             return;
         };
         let pw_buf = unsafe { stream.dequeue_raw_buffer() };
         if pw_buf.is_null() {
-            // Consumer hasn't returned a buffer yet — all advertised slots
-            // are in flight. Demote to debug (frequent under slow consumers
-            // like OBS at high resolution) and back off a bit before retrying
-            // so we don't busy-loop. Functionally a dropped frame.
-            tracing::debug!("buffer_done: dequeue_raw_buffer returned null");
-            if let Some(p) = self.pending_frame.take() {
-                p.frame.destroy();
-            }
+            // Consumer hasn't returned a buffer yet. Same situation as the
+            // output path: small backoff and let the natural cycle re-kick.
+            tracing::debug!("kick_capture: dequeue_raw_buffer returned null");
             thread::sleep(std::time::Duration::from_millis(2));
-            self.kick_capture();
             return;
         }
         let key = pw_buf as usize;
         let Some(slot) = self.pw_buffer_slots.get(&key) else {
-            tracing::error!("buffer_done: no slot for dequeued pw_buffer {key:#x}");
+            tracing::error!("kick_capture: no slot for dequeued pw_buffer {key:#x}");
             unsafe { stream.queue_raw_buffer(pw_buf) };
             return;
         };
-        // Tell wlr-screencopy to copy into our wl_buffer.
-        let Some(pending) = self.pending_frame.as_mut() else {
-            tracing::error!("buffer_done: no pending frame");
-            unsafe { stream.queue_raw_buffer(pw_buf) };
-            return;
-        };
-        pending.frame.copy(&slot.wl_buffer);
-        pending.pw_buffer = key;
+        let frame = session.create_frame(&self.qh, ());
+        frame.attach_buffer(&slot.wl_buffer);
+        frame.capture();
+        self.pending_frame = Some(PendingFrame {
+            frame,
+            pw_buffer: key,
+        });
+        if let Some(conn) = self.conn.as_ref()
+            && let Err(e) = conn.flush()
+        {
+            tracing::warn!("kick_capture: flush failed: {e}");
+        }
     }
 
     fn on_frame_ready(&mut self) {
@@ -773,10 +773,6 @@ impl AppState {
         };
         pending.frame.destroy();
 
-        // Set the chunk size on the dequeued PW buffer so the consumer reads
-        // the right amount, then queue it. Re-check that the buffer still
-        // exists in our slot map — PW may have freed it between dequeue and
-        // ready (consumer disconnect path).
         if let Some(stream) = self.stream.clone()
             && pending.pw_buffer != 0
             && !self.dying
@@ -793,12 +789,11 @@ impl AppState {
                         (*(*pw_buf).buffer).n_datas as usize,
                     );
                     let data = &mut datas[0];
-                    let stride =
-                        *self.pw_buffer_stride.get(&pending.pw_buffer).unwrap_or(&0);
+                    let stride = *self.pw_buffer_stride.get(&pending.pw_buffer).unwrap_or(&0);
                     let chunk = &mut *data.chunk;
                     chunk.offset = 0;
                     chunk.stride = stride;
-                    chunk.size = (stride as u32) * self.spec.height;
+                    chunk.size = (stride as u32) * self.adv_height;
                 }
                 stream.queue_raw_buffer(pw_buf);
             }
@@ -808,13 +803,11 @@ impl AppState {
         if self.last_log_at.elapsed() >= std::time::Duration::from_secs(2) {
             tracing::info!(
                 frames = self.frames_completed,
-                "screencast: frames queued"
+                "toplevel screencast: frames queued"
             );
             self.last_log_at = std::time::Instant::now();
         }
 
-        // Issue the next capture immediately — Ready arrived at compositor
-        // pace, so this paces our cycle to vblank.
         self.kick_capture();
     }
 
@@ -822,11 +815,9 @@ impl AppState {
         if self.dying {
             return;
         }
-        tracing::warn!("screencast frame failed");
+        tracing::warn!("toplevel screencast frame failed");
         if let Some(pending) = self.pending_frame.take() {
             pending.frame.destroy();
-            // Return the dequeued buffer (if any) without queueing — actually
-            // we still need to queue it back; PW expects buffers to come back.
             if pending.pw_buffer != 0
                 && let Some(stream) = self.stream.clone()
             {
@@ -834,7 +825,6 @@ impl AppState {
                 unsafe { stream.queue_raw_buffer(pw_buf) };
             }
         }
-        // Backoff briefly and retry.
         thread::sleep(std::time::Duration::from_millis(50));
         self.kick_capture();
     }
@@ -843,7 +833,9 @@ impl AppState {
 // ─── POD builders ─────────────────────────────────────────────────────────
 
 fn build_video_format_param(
-    spec: &StreamSpec,
+    width: u32,
+    height: u32,
+    framerate: u32,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let obj = Value::Object(Object {
         type_: spa_sys::SPA_TYPE_OBJECT_Format,
@@ -863,15 +855,12 @@ fn build_video_format_param(
             ),
             Property::new(
                 spa_sys::SPA_FORMAT_VIDEO_size,
-                Value::Rectangle(Rectangle {
-                    width: spec.width,
-                    height: spec.height,
-                }),
+                Value::Rectangle(Rectangle { width, height }),
             ),
             Property::new(
                 spa_sys::SPA_FORMAT_VIDEO_framerate,
                 Value::Fraction(Fraction {
-                    num: spec.framerate,
+                    num: framerate,
                     denom: 1,
                 }),
             ),
@@ -883,10 +872,11 @@ fn build_video_format_param(
 }
 
 fn build_buffers_param(
-    spec: &StreamSpec,
+    width: u32,
+    height: u32,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let stride = (spec.width * 4) as i32;
-    let size = stride * spec.height as i32;
+    let stride = (width * 4) as i32;
+    let size = stride * height as i32;
     let memfd_flag = 1 << spa_sys::SPA_DATA_MemFd;
     let obj = Value::Object(Object {
         type_: spa_sys::SPA_TYPE_OBJECT_ParamBuffers,

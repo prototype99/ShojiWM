@@ -256,6 +256,10 @@ impl CompositorHandler for ShojiWM {
         if let Some((window, source_damage)) = pending_source_damage {
             self.window_scene_generation = self.window_scene_generation.wrapping_add(1);
             window.on_commit();
+            // Title / app_id may have changed via xdg_toplevel set_title /
+            // set_app_id between commits. sync_foreign_toplevel short-circuits
+            // when nothing changed so this is cheap.
+            self.sync_foreign_toplevel(&window);
             let snapshot = self.snapshot_window(&window);
             if browser_geometry_debug_enabled()
                 && matches!(

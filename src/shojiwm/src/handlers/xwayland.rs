@@ -89,6 +89,7 @@ impl XwmHandler for ShojiWM {
         let smithay_window = Window::new_x11_window(window.clone());
         self.space
             .map_element(smithay_window.clone(), location, true);
+        self.install_foreign_toplevel(&smithay_window);
         self.update_xwayland_refresh_override_for_window(&smithay_window, "x11-window-map");
         let bbox = window.geometry();
         let placed = Rectangle::<i32, Logical>::new((location.0, location.1).into(), bbox.size);
@@ -116,6 +117,7 @@ impl XwmHandler for ShojiWM {
 
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
         if let Some(elem) = self.find_x11_window(&window) {
+            self.remove_foreign_toplevel(&elem);
             self.space.unmap_elem(&elem);
         }
         if !window.is_override_redirect() {
@@ -126,8 +128,25 @@ impl XwmHandler for ShojiWM {
         self.schedule_redraw();
     }
 
-    fn destroyed_window(&mut self, _xwm: XwmId, _window: X11Surface) {
+    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(elem) = self.find_x11_window(&window) {
+            self.remove_foreign_toplevel(&elem);
+        }
         self.schedule_redraw();
+    }
+
+    fn property_notify(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        _property: smithay::xwayland::xwm::WmWindowProperty,
+    ) {
+        // Title/class changes arrive as X11 property updates. Re-read and
+        // push to ext-foreign-toplevel-list-v1 clients; sync is cheap when
+        // nothing changed.
+        if let Some(elem) = self.find_x11_window(&window) {
+            self.sync_foreign_toplevel(&elem);
+        }
     }
 
     fn configure_request(

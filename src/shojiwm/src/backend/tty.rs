@@ -1064,6 +1064,7 @@ fn render_surface(
             snapshot_dirty_window_ids,
             transform_snapshot_window_ids,
             screencopy_state,
+            image_copy_capture_pending,
             ..
         } = state;
 
@@ -3612,22 +3613,27 @@ fn render_surface(
         let cursor_status_for_log = cursor_override
             .map(CursorImageStatus::Named)
             .unwrap_or_else(|| cursor_status.clone());
-        let mut elements: Vec<TtyRenderElements> = Vec::new();
-        elements.extend(
+        // Capture paths receive content_for_capture (everything but cursor)
+        // and cursor_elements separately so they can honour the client's
+        // cursor-visibility preference. The normal render to DRM still
+        // composites them together below.
+        let mut content_for_capture: Vec<TtyRenderElements> = Vec::new();
+        content_for_capture.extend(
             damage_blink::elements_for_output(&blink_visible, output_geo, scale)
                 .into_iter()
                 .map(TtyRenderElements::Blink),
         );
-        elements.extend(cursor_elements);
-        elements.extend(content_elements);
-        timing.render_element_count = elements.len();
+        content_for_capture.extend(content_elements);
+        // The element count for diagnostics — final elements is built below
+        // after capture has run against the by-reference slices.
+        timing.render_element_count = cursor_elements.len() + content_for_capture.len();
 
         trace!(
             ?node,
             ?crtc,
             output = %output.name(),
             window_count,
-            render_element_count = elements.len(),
+            render_element_count = timing.render_element_count,
             cursor_status = ?cursor_status_for_log,
             "rendering tty surface"
         );
@@ -3637,8 +3643,36 @@ fn render_surface(
             loop_handle,
             &mut backend.renderer,
             &output,
-            &elements,
+            &content_for_capture,
+            &cursor_elements,
         );
+
+        // Phase 5b-ii: serve ext-image-copy-capture-v1 frames for this output
+        // alongside the existing wlr-screencopy queue.
+        let presented = start_time.elapsed();
+        crate::backend::image_copy_capture_render::process_image_copy_capture_for_output(
+            image_copy_capture_pending,
+            &mut backend.renderer,
+            &output,
+            &content_for_capture,
+            &cursor_elements,
+            presented,
+        );
+        // Phase 5b-iii: drain queued toplevel captures.
+        crate::backend::image_copy_capture_render::process_image_copy_capture_for_toplevels(
+            image_copy_capture_pending,
+            space,
+            &mut backend.renderer,
+            &cursor_elements,
+            presented,
+        );
+
+        // After capture has run against the cursor / content slices by
+        // reference, move them into a single element list for the DRM render.
+        let mut elements: Vec<TtyRenderElements> =
+            Vec::with_capacity(cursor_elements.len() + content_for_capture.len());
+        elements.extend(cursor_elements);
+        elements.extend(content_for_capture);
 
         let result = surface.drm_output.render_frame(
             &mut backend.renderer,

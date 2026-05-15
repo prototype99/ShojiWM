@@ -107,6 +107,10 @@ impl XdgShellHandler for ShojiWM {
 
         self.space
             .map_element(window.clone(), initial_location, false);
+        // Announce the new toplevel on ext-foreign-toplevel-list-v1 so shells
+        // and the portal picker can see it. Has to happen after map so the
+        // initial title/app_id reads from xdg state succeed.
+        self.install_foreign_toplevel(&window);
         if uses_xwayland_refresh_override {
             self.update_xwayland_refresh_override_for_window(&window, "xdg-toplevel-map");
         }
@@ -186,6 +190,7 @@ impl XdgShellHandler for ShojiWM {
             }
         }
 
+        self.remove_foreign_toplevel(&window);
         self.space.unmap_elem(&window);
         self.request_tty_maintenance("xdg-toplevel-destroyed");
         self.schedule_redraw();

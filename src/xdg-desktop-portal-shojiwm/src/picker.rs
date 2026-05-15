@@ -13,23 +13,23 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use iced::widget::{button, column, container, row, scrollable, space, text};
+use iced::widget::{button, column, container, image, row, scrollable, space, text};
 use iced::window;
 use iced::{Element, Length, Subscription, Task};
 use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use crate::outputs::OutputInfo;
+use crate::sources::{SourceInfo, SourceKind, ThumbnailUpdate};
 
 #[derive(Debug, Clone)]
 pub enum PickResult {
-    Output(OutputInfo),
+    Source(SourceInfo),
     Cancelled,
 }
 
 pub struct PickRequest {
-    pub outputs: Vec<OutputInfo>,
+    pub sources: Vec<SourceInfo>,
     pub responder: oneshot::Sender<PickResult>,
 }
 
@@ -40,9 +40,9 @@ pub struct PickerHandle {
 }
 
 impl PickerHandle {
-    pub async fn pick(&self, outputs: Vec<OutputInfo>) -> PickResult {
+    pub async fn pick(&self, sources: Vec<SourceInfo>) -> PickResult {
         let (responder, rx) = oneshot::channel();
-        if self.tx.send(PickRequest { outputs, responder }).is_err() {
+        if self.tx.send(PickRequest { sources, responder }).is_err() {
             tracing::error!("picker thread is gone");
             return PickResult::Cancelled;
         }
@@ -50,22 +50,23 @@ impl PickerHandle {
     }
 }
 
-/// Holds the mpsc Receiver until the iced subscription consumes it.
 type ReceiverSlot = Mutex<Option<mpsc::UnboundedReceiver<PickRequest>>>;
 static PICKER_RX: OnceLock<ReceiverSlot> = OnceLock::new();
 
-/// Build the channel and return both a handle for the D-Bus side and a setup
-/// guard that must be installed before `run_on_main_thread`.
-pub fn setup() -> PickerHandle {
+type ThumbnailRxSlot = Mutex<Option<mpsc::UnboundedReceiver<ThumbnailUpdate>>>;
+static THUMBNAIL_RX: OnceLock<ThumbnailRxSlot> = OnceLock::new();
+
+pub fn setup() -> (PickerHandle, mpsc::UnboundedSender<ThumbnailUpdate>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let _ = PICKER_RX.set(Mutex::new(Some(rx)));
-    PickerHandle { tx }
+    let (thumb_tx, thumb_rx) = mpsc::unbounded_channel();
+    let _ = THUMBNAIL_RX.set(Mutex::new(Some(thumb_rx)));
+    (PickerHandle { tx }, thumb_tx)
 }
 
-/// Run the iced daemon on the calling (main) thread. Blocks forever.
 pub fn run_on_main_thread() -> iced::Result {
     iced::daemon(|| (State::default(), Task::none()), update, view)
-        .title(|_state: &State, _id: window::Id| "ShojiWM — Pick a screen".to_string())
+        .title(|_state: &State, _id: window::Id| "ShojiWM — Pick a source".to_string())
         .subscription(subscription)
         .run()
 }
@@ -77,7 +78,7 @@ struct State {
 }
 
 struct Active {
-    outputs: Vec<OutputInfo>,
+    sources: Vec<SourceInfo>,
     responder: Option<oneshot::Sender<PickResult>>,
     tab: Tab,
 }
@@ -94,41 +95,40 @@ enum Message {
     RequestArrived(RequestArrived),
     WindowOpened(window::Id),
     WindowClosed(window::Id),
-    TabSelected(Tab),
-    OutputClicked(usize),
+    SourceClicked(usize),
     Cancelled,
+    TabSelected(Tab),
+    ThumbnailUpdate(ThumbnailUpdate),
 }
 
 /// Boxed handoff for the responder so Message can stay `Clone`.
 #[derive(Debug, Clone)]
-struct RequestArrived(std::sync::Arc<Mutex<Option<(Vec<OutputInfo>, oneshot::Sender<PickResult>)>>>);
+struct RequestArrived(
+    std::sync::Arc<Mutex<Option<(Vec<SourceInfo>, oneshot::Sender<PickResult>)>>>,
+);
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         Message::RequestArrived(arrived) => {
-            let Some((outputs, responder)) = arrived.0.lock().unwrap().take() else {
+            let Some((sources, responder)) = arrived.0.lock().unwrap().take() else {
                 return Task::none();
             };
-            // If a pick is already in flight, cancel the old one rather than
-            // queue it. We only have one window.
             if let Some(mut prev) = state.active.take()
                 && let Some(r) = prev.responder.take()
             {
                 let _ = r.send(PickResult::Cancelled);
             }
             state.active = Some(Active {
-                outputs,
+                sources,
                 responder: Some(responder),
-                tab: Tab::FullScreen,
+                tab: Tab::default(),
             });
-
             if state.window_id.is_some() {
-                // A window is already open — its view() will just re-render.
                 Task::none()
             } else {
                 let (id, open_task) = window::open(window::Settings {
-                    size: iced::Size::new(540.0, 440.0),
-                    min_size: Some(iced::Size::new(360.0, 240.0)),
+                    size: iced::Size::new(560.0, 520.0),
+                    min_size: Some(iced::Size::new(360.0, 280.0)),
                     ..Default::default()
                 });
                 state.window_id = Some(id);
@@ -140,8 +140,6 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             if state.window_id == Some(id) {
                 state.window_id = None;
             }
-            // Treat unexpected close as cancellation if a request was still
-            // active.
             if let Some(mut active) = state.active.take()
                 && let Some(r) = active.responder.take()
             {
@@ -149,27 +147,38 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::SourceClicked(index) => finish(state, |sources| {
+            sources.get(index).cloned().map(PickResult::Source)
+        }),
+        Message::Cancelled => finish(state, |_| Some(PickResult::Cancelled)),
         Message::TabSelected(tab) => {
             if let Some(active) = state.active.as_mut() {
                 active.tab = tab;
             }
             Task::none()
         }
-        Message::OutputClicked(index) => finish(state, |outputs| {
-            outputs.get(index).cloned().map(PickResult::Output)
-        }),
-        Message::Cancelled => finish(state, |_| Some(PickResult::Cancelled)),
+        Message::ThumbnailUpdate(update) => {
+            if let Some(active) = state.active.as_mut() {
+                for src in &mut active.sources {
+                    if src.id() == update.source_id {
+                        src.thumbnail = Some(update.handle.clone());
+                        break;
+                    }
+                }
+            }
+            Task::none()
+        }
     }
 }
 
 fn finish<F>(state: &mut State, choose: F) -> Task<Message>
 where
-    F: FnOnce(&[OutputInfo]) -> Option<PickResult>,
+    F: FnOnce(&[SourceInfo]) -> Option<PickResult>,
 {
     let Some(mut active) = state.active.take() else {
         return Task::none();
     };
-    let result = choose(&active.outputs).unwrap_or(PickResult::Cancelled);
+    let result = choose(&active.sources).unwrap_or(PickResult::Cancelled);
     if let Some(r) = active.responder.take() {
         let _ = r.send(result);
     }
@@ -185,60 +194,78 @@ fn view(state: &State, _id: window::Id) -> Element<'_, Message> {
         return container(text("Idle.")).padding(16).into();
     };
 
+    // Counts per tab, used to label and empty-state.
+    let (n_outputs, n_windows) = active.sources.iter().fold((0usize, 0usize), |acc, s| {
+        match s.kind {
+            SourceKind::Output(_) => (acc.0 + 1, acc.1),
+            SourceKind::Toplevel(_) => (acc.0, acc.1 + 1),
+        }
+    });
+
     let tabs = row![
-        tab_button("全画面", active.tab == Tab::FullScreen, Tab::FullScreen),
-        tab_button("ウィンドウ", active.tab == Tab::Window, Tab::Window),
+        tab_button(
+            format!("全画面 ({n_outputs})"),
+            active.tab == Tab::FullScreen,
+            Tab::FullScreen
+        ),
+        tab_button(
+            format!("ウィンドウ ({n_windows})"),
+            active.tab == Tab::Window,
+            Tab::Window
+        ),
     ]
     .spacing(8);
 
-    let body: Element<'_, Message> = match active.tab {
-        Tab::FullScreen => {
-            if active.outputs.is_empty() {
-                column![
-                    text("出力が検出できませんでした。"),
-                    text(
-                        "ShojiWM 上で起動しているか、WAYLAND_DISPLAY が設定されているか確認してください。"
-                    ),
-                ]
-                .spacing(8)
-                .into()
-            } else {
-                let mut list = column![].spacing(6);
-                for (i, out) in active.outputs.iter().enumerate() {
-                    let header = if out.description.is_empty() {
-                        out.name.clone()
-                    } else {
-                        format!("{} — {}", out.name, out.description)
-                    };
-                    let detail = format!(
-                        "{}×{} @ {:.2}Hz",
-                        out.width,
-                        out.height,
-                        out.refresh_mhz as f64 / 1000.0,
-                    );
-                    let label: Element<'_, Message> = column![
-                        text(header).size(14),
-                        text(detail).size(12),
-                    ]
-                    .spacing(2)
-                    .into();
-                    list = list.push(
-                        button(label)
-                            .width(Length::Fill)
-                            .padding(10)
-                            .on_press(Message::OutputClicked(i)),
-                    );
-                }
-                scrollable(list).height(Length::Fill).into()
-            }
+    let mut list = column![].spacing(6);
+    let mut shown_any = false;
+    for (i, src) in active.sources.iter().enumerate() {
+        let in_tab = matches!(
+            (active.tab, &src.kind),
+            (Tab::FullScreen, SourceKind::Output(_)) | (Tab::Window, SourceKind::Toplevel(_))
+        );
+        if !in_tab {
+            continue;
         }
-        Tab::Window => column![
-            text("ウィンドウ単位のキャプチャは未実装です。"),
-            text("（compositor 側に ext-image-copy-capture-v1 を実装してから対応します。）"),
-        ]
-        .spacing(8)
-        .into(),
-    };
+        shown_any = true;
+
+        let header = src.label();
+        let detail = src.detail();
+        let text_column: Element<'_, Message> =
+            column![text(header).size(14), text(detail).size(12)]
+                .spacing(2)
+                .into();
+
+        let row_content: Element<'_, Message> = if let Some(handle) = src.thumbnail.as_ref() {
+            row![
+                image(handle.clone())
+                    .width(Length::Fixed(120.0))
+                    .height(Length::Fixed(75.0))
+                    .content_fit(iced::ContentFit::Contain),
+                text_column,
+            ]
+            .spacing(12)
+            .align_y(iced::Center)
+            .into()
+        } else {
+            text_column
+        };
+
+        list = list.push(
+            button(row_content)
+                .width(Length::Fill)
+                .padding(10)
+                .on_press(Message::SourceClicked(i)),
+        );
+    }
+    if !shown_any {
+        let message = match active.tab {
+            Tab::FullScreen => "出力が見つかりません。",
+            Tab::Window => "ウィンドウが見つかりません。",
+        };
+        list = list.push(text(message));
+    }
+
+    let body = scrollable(list).height(Length::Fill);
 
     let footer = row![
         space::horizontal(),
@@ -258,7 +285,7 @@ fn view(state: &State, _id: window::Id) -> Element<'_, Message> {
     .into()
 }
 
-fn tab_button<'a>(label: &'a str, selected: bool, kind: Tab) -> Element<'a, Message> {
+fn tab_button(label: String, selected: bool, kind: Tab) -> Element<'static, Message> {
     let btn = button(text(label));
     let btn = if selected {
         btn.style(button::primary)
@@ -269,8 +296,6 @@ fn tab_button<'a>(label: &'a str, selected: bool, kind: Tab) -> Element<'a, Mess
 }
 
 fn subscription(_state: &State) -> Subscription<Message> {
-    // Bridge mpsc → iced messages. The receiver is taken out of the OnceLock
-    // on first subscription call.
     let request_stream = Subscription::run(|| {
         let rx = PICKER_RX
             .get()
@@ -281,13 +306,24 @@ fn subscription(_state: &State) -> Subscription<Message> {
             .expect("picker subscription started twice");
         UnboundedReceiverStream::new(rx).map(|req| {
             Message::RequestArrived(RequestArrived(std::sync::Arc::new(Mutex::new(Some((
-                req.outputs,
+                req.sources,
                 req.responder,
             ))))))
         })
     });
 
+    let thumbnail_stream = Subscription::run(|| {
+        let rx = THUMBNAIL_RX
+            .get()
+            .expect("picker::setup() not called before run_on_main_thread")
+            .lock()
+            .unwrap()
+            .take()
+            .expect("thumbnail subscription started twice");
+        UnboundedReceiverStream::new(rx).map(Message::ThumbnailUpdate)
+    });
+
     let close_events = window::close_events().map(Message::WindowClosed);
 
-    Subscription::batch([request_stream, close_events])
+    Subscription::batch([request_stream, thumbnail_stream, close_events])
 }
