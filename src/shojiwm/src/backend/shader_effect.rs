@@ -94,7 +94,7 @@ pub struct ShaderEffectSpec {
     pub alpha_bits: u32,
     pub render_scale: f32,
     pub clip_rect: Option<SnappedLogicalRect>,
-    pub clip_radius: i32,
+    pub clip_radius: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -137,7 +137,7 @@ pub struct StableBackdropFramebufferElement {
     alpha: f32,
     render_scale: f32,
     clip_rect: Option<SnappedLogicalRect>,
-    clip_radius: i32,
+    clip_radius: f32,
     kind: Kind,
 }
 
@@ -153,7 +153,7 @@ pub struct StableBackdropTextureElement {
     alpha: f32,
     render_scale: f32,
     clip_rect: Option<SnappedLogicalRect>,
-    clip_radius: i32,
+    clip_radius: f32,
     uv_offset: [f32; 2],
     uv_scale: [f32; 2],
     debug_label: String,
@@ -410,7 +410,7 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
             .clip_rect
             .map(|clip| [clip.x, clip.y, clip.width, clip.height])
             .unwrap_or([0.0, 0.0, 0.0, 0.0]);
-        let radius = self.clip_radius.max(0) as f32;
+        let radius = self.clip_radius.max(0.0);
         let full_size = texture.size();
         let uv_offset = [
             sample_src.loc.x as f32 / full_size.w.max(1) as f32,
@@ -612,7 +612,7 @@ impl RenderElement<GlesRenderer> for StableBackdropTextureElement {
             .clip_rect
             .map(|clip| [clip.x, clip.y, clip.width, clip.height])
             .unwrap_or([0.0, 0.0, 0.0, 0.0]);
-        let radius = self.clip_radius.max(0) as f32;
+        let radius = self.clip_radius.max(0.0);
 
         frame.render_texture_from_to(
             &self.texture,
@@ -1308,7 +1308,7 @@ fn uniforms_for_spec(spec: &ShaderEffectSpec) -> Vec<Uniform<'static>> {
         .clip_rect
         .map(|rect| [rect.x, rect.y, rect.width, rect.height])
         .unwrap_or([0.0f32, 0.0f32, 0.0f32, 0.0f32]);
-    let clip_radius = spec.clip_radius.max(0) as f32;
+    let clip_radius = spec.clip_radius.max(0.0);
     let mut uniforms = vec![
         Uniform::new("render_scale", spec.render_scale.max(1.0)),
         Uniform::new(
@@ -1357,7 +1357,7 @@ pub fn backdrop_shader_element(
     alpha: f32,
     render_scale: f32,
     clip_rect: Option<SnappedLogicalRect>,
-    clip_radius: i32,
+    clip_radius: f32,
     debug_label: String,
 ) -> Result<StableBackdropTextureElement, ShaderEffectError> {
     backdrop_shader_element_with_geometry(
@@ -1402,21 +1402,43 @@ pub fn backdrop_shader_element_with_geometry(
     render_scale: f32,
     sample_uv_phase: [f32; 2],
     clip_rect: Option<SnappedLogicalRect>,
-    clip_radius: i32,
+    clip_radius: f32,
     debug_label: String,
 ) -> Result<StableBackdropTextureElement, ShaderEffectError> {
     let program = compile_display_texture_program(renderer)?;
-    let scale = render_scale.max(0.0001) as f64;
-    let sample_left_px = ((sample_rect.loc.x - captured_rect.loc.x) as f64 * scale).round() as i32;
-    let sample_top_px = ((sample_rect.loc.y - captured_rect.loc.y) as f64 * scale).round() as i32;
-    let sample_right_px = ((sample_rect.loc.x + sample_rect.size.w - captured_rect.loc.x) as f64
-        * scale)
-        .round() as i32;
-    let sample_bottom_px = ((sample_rect.loc.y + sample_rect.size.h - captured_rect.loc.y) as f64
-        * scale)
-        .round() as i32;
-    let captured_width_px = (captured_rect.size.w as f64 * scale).round().max(1.0) as i32;
-    let captured_height_px = (captured_rect.size.h as f64 * scale).round().max(1.0) as i32;
+    let texture_size = texture.size();
+    let captured_width_px = texture_size.w.max(1);
+    let captured_height_px = texture_size.h.max(1);
+    let logical_to_texture_px = |value: f64, logical_size: i32, texture_size: i32| -> i32 {
+        if logical_size <= 0 {
+            return 0;
+        }
+        (value * texture_size as f64 / logical_size as f64).round() as i32
+    };
+    let sample_left_px = logical_to_texture_px(
+        (sample_rect.loc.x - captured_rect.loc.x) as f64,
+        captured_rect.size.w,
+        captured_width_px,
+    )
+    .clamp(0, captured_width_px);
+    let sample_top_px = logical_to_texture_px(
+        (sample_rect.loc.y - captured_rect.loc.y) as f64,
+        captured_rect.size.h,
+        captured_height_px,
+    )
+    .clamp(0, captured_height_px);
+    let sample_right_px = logical_to_texture_px(
+        (sample_rect.loc.x + sample_rect.size.w - captured_rect.loc.x) as f64,
+        captured_rect.size.w,
+        captured_width_px,
+    )
+    .clamp(0, captured_width_px);
+    let sample_bottom_px = logical_to_texture_px(
+        (sample_rect.loc.y + sample_rect.size.h - captured_rect.loc.y) as f64,
+        captured_rect.size.h,
+        captured_height_px,
+    )
+    .clamp(0, captured_height_px);
     let sample_width_px = (sample_right_px - sample_left_px).max(0);
     let sample_height_px = (sample_bottom_px - sample_top_px).max(0);
     let src = Rectangle::new(
@@ -1434,7 +1456,7 @@ pub fn backdrop_shader_element_with_geometry(
     if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
         tracing::info!(
             debug_label = %debug_label,
-            texture_size = ?texture.size(),
+            texture_size = ?texture_size,
             display_rect = ?display_rect,
             geometry = ?geometry,
             sample_rect = ?sample_rect,
@@ -1447,7 +1469,7 @@ pub fn backdrop_shader_element_with_geometry(
             sample_uv_phase = ?sample_uv_phase,
             render_scale,
             clip_rect = ?clip_rect,
-            clip_radius,
+            clip_radius = clip_radius.max(0.0),
             "gap debug backdrop texture element params"
         );
     }
@@ -1462,7 +1484,7 @@ pub fn backdrop_shader_element_with_geometry(
         alpha: alpha.clamp(0.0, 1.0),
         render_scale,
         clip_rect,
-        clip_radius,
+        clip_radius: clip_radius.max(0.0),
         uv_offset,
         uv_scale,
         debug_label,
@@ -1951,7 +1973,7 @@ fn apply_shader_input_stage(
         alpha_bits: 1.0f32.to_bits(),
         render_scale: 1.0,
         clip_rect: None,
-        clip_radius: 0,
+        clip_radius: 0.0,
     };
     let mut state = ShaderEffectElementState::default();
     let element = state.element(renderer, spec)?;

@@ -243,6 +243,42 @@ pub fn precise_logical_rect_in_element_space(
     }
 }
 
+pub fn snapped_precise_logical_rect_in_area_space(
+    rect: PreciseLogicalRect,
+    element_rect: PreciseLogicalRect,
+    area_width: i32,
+    area_height: i32,
+    snap_origin: Point<i32, Logical>,
+    scale: Scale<f64>,
+) -> SnappedLogicalRect {
+    let scale_x = scale.x.abs().max(0.0001) as f32;
+    let scale_y = scale.y.abs().max(0.0001) as f32;
+    let origin_x = snap_origin.x as f32;
+    let origin_y = snap_origin.y as f32;
+
+    let element_left_px = ((element_rect.x - origin_x) * scale_x).round();
+    let element_top_px = ((element_rect.y - origin_y) * scale_y).round();
+    let element_right_px = ((element_rect.x + element_rect.width - origin_x) * scale_x).round();
+    let element_bottom_px = ((element_rect.y + element_rect.height - origin_y) * scale_y).round();
+
+    let clip_left_px = ((rect.x - origin_x) * scale_x).round();
+    let clip_top_px = ((rect.y - origin_y) * scale_y).round();
+    let clip_right_px = ((rect.x + rect.width - origin_x) * scale_x).round();
+    let clip_bottom_px = ((rect.y + rect.height - origin_y) * scale_y).round();
+
+    let element_width_px = (element_right_px - element_left_px).max(1.0);
+    let element_height_px = (element_bottom_px - element_top_px).max(1.0);
+    let area_width = area_width.max(1) as f32;
+    let area_height = area_height.max(1) as f32;
+
+    SnappedLogicalRect {
+        x: (clip_left_px - element_left_px) * area_width / element_width_px,
+        y: (clip_top_px - element_top_px) * area_height / element_height_px,
+        width: (clip_right_px - clip_left_px).max(0.0) * area_width / element_width_px,
+        height: (clip_bottom_px - clip_top_px).max(0.0) * area_height / element_height_px,
+    }
+}
+
 pub fn logical_rect_to_physical_buffer_rect(
     rect: LogicalRect,
     origin: Point<i32, Logical>,
@@ -698,11 +734,11 @@ pub fn relative_physical_rect_from_root_global_edges_precise(
 mod tests {
     use super::{
         PreciseLogicalRect, relative_physical_rect_from_root,
-        relative_physical_rect_from_root_snapped_edges,
+        relative_physical_rect_from_root_snapped_edges, snapped_precise_logical_rect_in_area_space,
         snapped_precise_logical_rect_in_element_space,
     };
     use crate::ssd::LogicalRect;
-    use smithay::utils::{Logical, Rectangle, Scale};
+    use smithay::utils::{Logical, Point, Rectangle, Scale};
 
     #[test]
     fn snapped_edge_relative_rect_is_translation_stable_against_output() {
@@ -757,6 +793,31 @@ mod tests {
             snapped_precise_logical_rect_in_element_space(clip_a, element_a, scale),
             snapped_precise_logical_rect_in_element_space(clip_b, element_b, scale)
         );
+    }
+
+    #[test]
+    fn precise_clip_in_area_space_matches_shader_area_at_fractional_scale() {
+        let scale = Scale::from((1.6, 1.6));
+        let element = PreciseLogicalRect {
+            x: 3.75,
+            y: 3.75,
+            width: 900.0,
+            height: 30.0,
+        };
+
+        let clip = snapped_precise_logical_rect_in_area_space(
+            element,
+            element,
+            900,
+            30,
+            Point::from((0, 0)),
+            scale,
+        );
+
+        assert_eq!(clip.x, 0.0);
+        assert_eq!(clip.y, 0.0);
+        assert_eq!(clip.width, 900.0);
+        assert_eq!(clip.height, 30.0);
     }
 }
 

@@ -1633,44 +1633,56 @@ fn backdrop_shader_elements_for_window(
                         )),
                         (display_rect.width, display_rect.height).into(),
                     );
-                    let clip_rect = cached
-                        .clip_rect
-                        .map(|clip_rect| {
-                            let transformed_clip = if apply_visual_transform {
-                                crate::backend::visual::transformed_rect(
-                                    clip_rect,
-                                    decoration.layout.root.rect,
-                                    decoration.visual_transform,
-                                )
-                            } else {
-                                clip_rect
-                            };
-                            crate::backend::visual::SnappedLogicalRect {
-                                x: (transformed_clip.x - display_rect.x) as f32,
-                                y: (transformed_clip.y - display_rect.y) as f32,
-                                width: transformed_clip.width.max(0) as f32,
-                                height: transformed_clip.height.max(0) as f32,
-                            }
-                        })
-                        .or_else(|| {
-                            display_rect_precise
-                                .zip(cached.clip_rect_precise.map(|clip| {
-                                    if apply_visual_transform {
-                                        crate::backend::visual::transformed_precise_rect(
-                                            clip,
-                                            decoration.layout.root.rect,
-                                            decoration.visual_transform,
-                                        )
-                                    } else {
-                                        clip
-                                    }
-                                }))
-                                .map(|(rect, clip)| {
-                                    crate::backend::visual::precise_logical_rect_in_element_space(
-                                        clip, rect,
+                    let clip_rect = {
+                        let precise_clip = display_rect_precise
+                            .zip(cached.clip_rect_precise.map(|clip| {
+                                if apply_visual_transform {
+                                    crate::backend::visual::transformed_precise_rect(
+                                        clip,
+                                        decoration.layout.root.rect,
+                                        decoration.visual_transform,
                                     )
-                                })
-                        });
+                                } else {
+                                    clip
+                                }
+                            }))
+                            .map(|(rect, clip)| {
+                                crate::backend::visual::snapped_precise_logical_rect_in_area_space(
+                                    clip,
+                                    rect,
+                                    display_rect.width,
+                                    display_rect.height,
+                                    smithay::utils::Point::from((root_rect.x, root_rect.y)),
+                                    scale,
+                                )
+                            });
+                        precise_clip.or_else(|| {
+                            cached.clip_rect.map(|clip_rect| {
+                                let transformed_clip = if apply_visual_transform {
+                                    crate::backend::visual::transformed_rect(
+                                        clip_rect,
+                                        decoration.layout.root.rect,
+                                        decoration.visual_transform,
+                                    )
+                                } else {
+                                    clip_rect
+                                };
+                                let rect = display_rect_precise.unwrap_or_else(|| {
+                                    crate::backend::visual::precise_rect_from_logical(display_rect)
+                                });
+                                crate::backend::visual::snapped_precise_logical_rect_in_area_space(
+                                    crate::backend::visual::precise_rect_from_logical(
+                                        transformed_clip,
+                                    ),
+                                    rect,
+                                    display_rect.width,
+                                    display_rect.height,
+                                    smithay::utils::Point::from((root_rect.x, root_rect.y)),
+                                    scale,
+                                )
+                            })
+                        })
+                    };
                     let local_sample_rect = Rectangle::new(
                         smithay::utils::Point::from((
                             source_effect_rect.x - output_geo.loc.x,
@@ -1710,7 +1722,9 @@ fn backdrop_shader_elements_for_window(
                         scale.x as f32,
                         [0.0, 0.0],
                         clip_rect,
-                        cached.clip_radius,
+                        cached
+                            .clip_radius_precise
+                            .unwrap_or(cached.clip_radius as f32),
                         format!(
                             "window-backdrop:{}:{}",
                             decoration.snapshot.id, cached.stable_key
@@ -1885,44 +1899,54 @@ fn backdrop_shader_elements_for_window(
                 )),
                 (display_rect.width, display_rect.height).into(),
             );
-            let clip_rect = cached
-                .clip_rect
-                .map(|clip_rect| {
-                    let transformed_clip = if apply_visual_transform {
-                        crate::backend::visual::transformed_rect(
-                            clip_rect,
-                            decoration.layout.root.rect,
-                            decoration.visual_transform,
-                        )
-                    } else {
-                        clip_rect
-                    };
-                    crate::backend::visual::SnappedLogicalRect {
-                        x: (transformed_clip.x - display_rect.x) as f32,
-                        y: (transformed_clip.y - display_rect.y) as f32,
-                        width: transformed_clip.width.max(0) as f32,
-                        height: transformed_clip.height.max(0) as f32,
-                    }
-                })
-                .or_else(|| {
-                    display_rect_precise
-                        .zip(cached.clip_rect_precise.map(|clip| {
-                            if apply_visual_transform {
-                                crate::backend::visual::transformed_precise_rect(
-                                    clip,
-                                    decoration.layout.root.rect,
-                                    decoration.visual_transform,
-                                )
-                            } else {
-                                clip
-                            }
-                        }))
-                        .map(|(rect, clip)| {
-                            crate::backend::visual::precise_logical_rect_in_element_space(
-                                clip, rect,
+            let clip_rect = {
+                let precise_clip = display_rect_precise
+                    .zip(cached.clip_rect_precise.map(|clip| {
+                        if apply_visual_transform {
+                            crate::backend::visual::transformed_precise_rect(
+                                clip,
+                                decoration.layout.root.rect,
+                                decoration.visual_transform,
                             )
-                        })
-                });
+                        } else {
+                            clip
+                        }
+                    }))
+                    .map(|(rect, clip)| {
+                        crate::backend::visual::snapped_precise_logical_rect_in_area_space(
+                            clip,
+                            rect,
+                            display_rect.width,
+                            display_rect.height,
+                            smithay::utils::Point::from((root_rect.x, root_rect.y)),
+                            scale,
+                        )
+                    });
+                precise_clip.or_else(|| {
+                    cached.clip_rect.map(|clip_rect| {
+                        let transformed_clip = if apply_visual_transform {
+                            crate::backend::visual::transformed_rect(
+                                clip_rect,
+                                decoration.layout.root.rect,
+                                decoration.visual_transform,
+                            )
+                        } else {
+                            clip_rect
+                        };
+                        let rect = display_rect_precise.unwrap_or_else(|| {
+                            crate::backend::visual::precise_rect_from_logical(display_rect)
+                        });
+                        crate::backend::visual::snapped_precise_logical_rect_in_area_space(
+                            crate::backend::visual::precise_rect_from_logical(transformed_clip),
+                            rect,
+                            display_rect.width,
+                            display_rect.height,
+                            smithay::utils::Point::from((root_rect.x, root_rect.y)),
+                            scale,
+                        )
+                    })
+                })
+            };
             let local_sample_rect = Rectangle::new(
                 smithay::utils::Point::from((
                     source_effect_rect.x - output_geo.loc.x,
@@ -1955,7 +1979,9 @@ fn backdrop_shader_elements_for_window(
                 scale.x as f32,
                 [0.0, 0.0],
                 clip_rect,
-                cached.clip_radius,
+                cached
+                    .clip_radius_precise
+                    .unwrap_or(cached.clip_radius as f32),
                 format!(
                     "window-backdrop:{}:{}",
                     decoration.snapshot.id, cached.stable_key
@@ -2397,7 +2423,7 @@ fn lower_layer_scene_elements(
                         1.0,
                         scale.x as f32,
                         None,
-                        0,
+                        0.0,
                         format!("layer-lower:{}:{}", output.name(), rect_key),
                     ) {
                         elements.push(WinitRenderElements::Backdrop(element));
@@ -2560,7 +2586,7 @@ fn lower_layer_scene_elements(
                 1.0,
                 scale.x as f32,
                 None,
-                0,
+                0.0,
                 format!("layer-lower:{}:{}", output.name(), rect_key),
             ) {
                 elements.push(WinitRenderElements::Backdrop(element));
@@ -2819,7 +2845,7 @@ fn configured_background_effect_elements_for_layer(
                         alpha,
                         scale.x as f32,
                         None,
-                        0,
+                        0.0,
                         format!("layer-lower:{}:{}", output.name(), rect_key),
                     )
                     .ok()
@@ -2969,7 +2995,7 @@ fn configured_background_effect_elements_for_layer(
                 alpha,
                 scale.x as f32,
                 None,
-                0,
+                0.0,
                 format!("layer-lower:{}:{}", output.name(), rect_key),
             )
             .ok()
@@ -3196,7 +3222,7 @@ fn configured_background_effect_elements_for_window(
                         scale.x as f32,
                         [0.0, 0.0],
                         None,
-                        0,
+                        0.0,
                         format!("protocol-window:{}:{}", decoration.snapshot.id, stable_key),
                     )
                     .ok()
@@ -3395,7 +3421,7 @@ fn configured_background_effect_elements_for_window(
                 scale.x as f32,
                 [0.0, 0.0],
                 None,
-                0,
+                0.0,
                 format!("protocol-window:{}:{}", decoration.snapshot.id, stable_key),
             )
             .ok()

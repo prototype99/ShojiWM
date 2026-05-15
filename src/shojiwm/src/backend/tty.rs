@@ -2,7 +2,10 @@ use std::hash::{Hash, Hasher};
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -3128,6 +3131,18 @@ fn render_surface(
                     .into_iter()
                     .map(|(_, element)| element),
             );
+            if let Some(decoration) = window_decorations.get(window) {
+                log_gap_final_composite_readback(
+                    &mut backend.renderer,
+                    scale,
+                    &original_window_body_elements,
+                    decoration,
+                    output_geo,
+                    visual_state,
+                    &output.name(),
+                    &window_id,
+                );
+            }
             let replace_effect_slot = window_decorations
                 .get(window)
                 .and_then(|decoration| decoration.window_effects.as_ref())
@@ -4590,6 +4605,33 @@ fn log_gap_readback_probe(
             opaque += 1;
         }
     }
+    let stride = probe_rect.size.w.max(1) as usize * 4;
+    let sample_raw = |x: i32, y: i32| -> Option<[u8; 4]> {
+        if x < 0 || y < 0 || x >= probe_rect.size.w || y >= probe_rect.size.h {
+            return None;
+        }
+        let index = y as usize * stride + x as usize * 4;
+        bytes
+            .get(index..index + 4)
+            .map(|px| [px[0], px[1], px[2], px[3]])
+    };
+    let sample_points = [
+        (0, 0),
+        (probe_rect.size.w / 2, probe_rect.size.h / 2),
+        (probe_rect.size.w.saturating_sub(1), 0),
+        (
+            probe_rect.size.w.saturating_sub(1),
+            probe_rect.size.h / 2,
+        ),
+        (
+            probe_rect.size.w.saturating_sub(1),
+            probe_rect.size.h.saturating_sub(1),
+        ),
+    ];
+    let raw_samples = sample_points
+        .into_iter()
+        .filter_map(|(x, y)| sample_raw(x, y).map(|raw| format!("({},{}):{:?}", x, y, raw)))
+        .collect::<Vec<_>>();
 
     tracing::info!(
         output = output_name,
@@ -4602,8 +4644,227 @@ fn log_gap_readback_probe(
         opaque_pixels = opaque,
         min_alpha,
         max_alpha,
+        raw_samples = ?raw_samples,
         "gap readback tty client edge probe"
     );
+}
+
+static GAP_FINAL_READBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn gap_final_readback_debug_enabled() -> bool {
+    std::env::var_os("SHOJI_GAP_FINAL_READBACK_DEBUG").is_some()
+}
+
+fn translate_physical_rect(
+    rect: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+    offset: smithay::utils::Point<i32, smithay::utils::Physical>,
+) -> smithay::utils::Rectangle<i32, smithay::utils::Physical> {
+    smithay::utils::Rectangle::new(rect.loc + offset, rect.size)
+}
+
+fn transform_physical_rect_for_visual(
+    rect: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+    visual: WindowVisualState,
+) -> smithay::utils::Rectangle<i32, smithay::utils::Physical> {
+    if is_identity_visual(visual) {
+        return rect;
+    }
+
+    let left =
+        visual.origin.x as f64 + (rect.loc.x - visual.origin.x) as f64 * visual.scale.x
+            + visual.translation.x as f64;
+    let top =
+        visual.origin.y as f64 + (rect.loc.y - visual.origin.y) as f64 * visual.scale.y
+            + visual.translation.y as f64;
+    let right = visual.origin.x as f64
+        + (rect.loc.x + rect.size.w - visual.origin.x) as f64 * visual.scale.x
+        + visual.translation.x as f64;
+    let bottom = visual.origin.y as f64
+        + (rect.loc.y + rect.size.h - visual.origin.y) as f64 * visual.scale.y
+        + visual.translation.y as f64;
+
+    let x = left.min(right).floor() as i32;
+    let y = top.min(bottom).floor() as i32;
+    let width = (left.max(right) - left.min(right)).ceil().max(0.0) as i32;
+    let height = (top.max(bottom) - top.min(bottom)).ceil().max(0.0) as i32;
+    smithay::utils::Rectangle::new(
+        smithay::utils::Point::from((x, y)),
+        smithay::utils::Size::from((width, height)),
+    )
+}
+
+fn log_gap_final_composite_readback(
+    renderer: &mut GlesRenderer,
+    output_scale: Scale<f64>,
+    elements: &[TtyRenderElements],
+    decoration: &crate::ssd::WindowDecorationState,
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    visual: WindowVisualState,
+    output_name: &str,
+    window_id: &str,
+) {
+    if !gap_final_readback_debug_enabled() {
+        return;
+    }
+    if visual.opacity < 0.99 || elements.len() <= 1 {
+        return;
+    }
+    // Keep the debug log bounded. This readback renders several offscreen
+    // probes and is meant for one short reproduction run.
+    if GAP_FINAL_READBACK_COUNT.fetch_add(1, Ordering::Relaxed) >= 12 {
+        return;
+    }
+
+    let root_rect = decoration.layout.root.rect;
+    let root_origin = crate::backend::visual::root_physical_origin(root_rect, output_geo, output_scale);
+    let titlebar_shader = decoration
+        .shader_buffers
+        .iter()
+        .find(|buffer| buffer.stable_key.ends_with(":shader") && buffer.rect.height == 30)
+        .or_else(|| decoration.shader_buffers.first());
+    let Some(titlebar_shader) = titlebar_shader else {
+        return;
+    };
+
+    let titlebar_pre = titlebar_shader
+        .rect_precise
+        .map(|rect| {
+            crate::backend::visual::relative_physical_rect_from_root_precise(
+                rect,
+                root_rect,
+                output_geo,
+                output_scale,
+            )
+        })
+        .unwrap_or_else(|| {
+            crate::backend::visual::relative_physical_rect_from_root_snapped_edges(
+                titlebar_shader.rect,
+                root_rect,
+                output_geo,
+                output_scale,
+            )
+        });
+    let titlebar_geometry =
+        transform_physical_rect_for_visual(translate_physical_rect(titlebar_pre, root_origin), visual);
+
+    let parent_box_border = decoration.buffers.iter().find(|buffer| {
+        buffer.source_kind == "box"
+            && buffer.border_width > 0.0
+            && buffer
+                .hole_rect_precise
+                .is_some_and(|hole| {
+                    let shader = titlebar_shader.rect_precise.unwrap_or_else(|| {
+                        crate::backend::visual::PreciseLogicalRect {
+                            x: titlebar_shader.rect.x as f32,
+                            y: titlebar_shader.rect.y as f32,
+                            width: titlebar_shader.rect.width as f32,
+                            height: titlebar_shader.rect.height as f32,
+                        }
+                    });
+                    shader.x >= hole.x - 1.0
+                        && shader.y >= hole.y - 1.0
+                        && shader.x + shader.width <= hole.x + hole.width + 1.0
+                })
+    });
+
+    let parent_hole_geometry = parent_box_border.and_then(|buffer| {
+        buffer.hole_rect_precise.map(|hole| {
+            let pre = crate::backend::visual::relative_physical_rect_from_root_precise(
+                hole,
+                root_rect,
+                output_geo,
+                output_scale,
+            );
+            transform_physical_rect_for_visual(translate_physical_rect(pre, root_origin), visual)
+        })
+    });
+    let parent_border_geometry = parent_box_border.map(|buffer| {
+        let pre = buffer
+            .rect_precise
+            .map(|rect| {
+                crate::backend::visual::relative_physical_rect_from_root_precise(
+                    rect,
+                    root_rect,
+                    output_geo,
+                    output_scale,
+                )
+            })
+            .unwrap_or_else(|| {
+                crate::backend::visual::relative_physical_rect_from_root_snapped_edges(
+                    buffer.rect,
+                    root_rect,
+                    output_geo,
+                    output_scale,
+                )
+            });
+        transform_physical_rect_for_visual(translate_physical_rect(pre, root_origin), visual)
+    });
+    let titlebar_vs_parent_hole_delta = parent_hole_geometry.map(|hole| {
+        (
+            titlebar_geometry.loc.x - hole.loc.x,
+            titlebar_geometry.loc.y - hole.loc.y,
+            (titlebar_geometry.loc.x + titlebar_geometry.size.w) - (hole.loc.x + hole.size.w),
+            (titlebar_geometry.loc.y + titlebar_geometry.size.h) - (hole.loc.y + hole.size.h),
+        )
+    });
+
+    tracing::info!(
+        output = output_name,
+        window_id,
+        element_count = elements.len(),
+        visual = ?visual,
+        root_rect = ?root_rect,
+        root_origin = ?root_origin,
+        titlebar_key = %titlebar_shader.stable_key,
+        titlebar_rect = ?titlebar_shader.rect,
+        titlebar_rect_precise = ?titlebar_shader.rect_precise,
+        titlebar_geometry = ?titlebar_geometry,
+        parent_box_border_key = ?parent_box_border.map(|buffer| buffer.stable_key.as_str()),
+        parent_border_geometry = ?parent_border_geometry,
+        parent_hole_geometry = ?parent_hole_geometry,
+        titlebar_vs_parent_hole_delta = ?titlebar_vs_parent_hole_delta,
+        "gap final composite geometry"
+    );
+
+    let mut probes = Vec::new();
+    for inset in [0, 1, 2, 3, 4, 8] {
+        if titlebar_geometry.size.w > inset {
+            probes.push((
+                format!("titlebar-right-inset-{inset}px"),
+                smithay::utils::Rectangle::new(
+                    smithay::utils::Point::from((
+                        titlebar_geometry.loc.x + titlebar_geometry.size.w - 1 - inset,
+                        titlebar_geometry.loc.y,
+                    )),
+                    smithay::utils::Size::from((1, titlebar_geometry.size.h)),
+                ),
+            ));
+        }
+    }
+    if let Some(hole) = parent_hole_geometry {
+        for offset in [-2, -1, 0, 1, 2] {
+            probes.push((
+                format!("parent-hole-right-offset-{offset}px"),
+                smithay::utils::Rectangle::new(
+                    smithay::utils::Point::from((hole.loc.x + hole.size.w + offset, titlebar_geometry.loc.y)),
+                    smithay::utils::Size::from((1, titlebar_geometry.size.h)),
+                ),
+            ));
+        }
+    }
+
+    for (side, probe_rect) in probes {
+        log_gap_readback_probe(
+            renderer,
+            output_scale,
+            elements,
+            probe_rect,
+            &side,
+            "final-window-composite",
+            output_name,
+            window_id,
+        );
+    }
 }
 
 fn log_gap_readback_edge_probes(
@@ -5014,7 +5275,7 @@ fn window_effect_elements(
         scale.x as f32,
         [0.0, 0.0],
         None,
-        0,
+        0.0,
         format!(
             "window-effect:{}:{}:{}",
             placement,
@@ -5315,44 +5576,54 @@ fn backdrop_shader_elements_for_window(
                         )),
                         (display_rect.width, display_rect.height).into(),
                     );
-                    let clip_rect = cached
-                        .clip_rect
-                        .map(|clip_rect| {
-                            let clip = if apply_visual_transform {
-                                crate::backend::visual::transformed_rect(
-                                    clip_rect,
-                                    decoration.layout.root.rect,
-                                    decoration.visual_transform,
-                                )
-                            } else {
-                                clip_rect
-                            };
-                            crate::backend::visual::SnappedLogicalRect {
-                                x: (clip.x - display_rect.x) as f32,
-                                y: (clip.y - display_rect.y) as f32,
-                                width: clip.width.max(0) as f32,
-                                height: clip.height.max(0) as f32,
-                            }
-                        })
-                        .or_else(|| {
-                            display_rect_precise
-                                .zip(cached.clip_rect_precise.map(|clip| {
-                                    if apply_visual_transform {
-                                        crate::backend::visual::transformed_precise_rect(
-                                            clip,
-                                            decoration.layout.root.rect,
-                                            decoration.visual_transform,
-                                        )
-                                    } else {
-                                        clip
-                                    }
-                                }))
-                                .map(|(rect, clip)| {
-                                    crate::backend::visual::precise_logical_rect_in_element_space(
-                                        clip, rect,
+                    let clip_rect = {
+                        let precise_clip = display_rect_precise
+                            .zip(cached.clip_rect_precise.map(|clip| {
+                                if apply_visual_transform {
+                                    crate::backend::visual::transformed_precise_rect(
+                                        clip,
+                                        decoration.layout.root.rect,
+                                        decoration.visual_transform,
                                     )
-                                })
-                        });
+                                } else {
+                                    clip
+                                }
+                            }))
+                            .map(|(rect, clip)| {
+                                crate::backend::visual::snapped_precise_logical_rect_in_area_space(
+                                    clip,
+                                    rect,
+                                    display_rect.width,
+                                    display_rect.height,
+                                    Point::from((root_rect.x, root_rect.y)),
+                                    scale,
+                                )
+                            });
+                        precise_clip.or_else(|| {
+                            cached.clip_rect.map(|clip_rect| {
+                                let clip = if apply_visual_transform {
+                                    crate::backend::visual::transformed_rect(
+                                        clip_rect,
+                                        decoration.layout.root.rect,
+                                        decoration.visual_transform,
+                                    )
+                                } else {
+                                    clip_rect
+                                };
+                                let rect = display_rect_precise.unwrap_or_else(|| {
+                                    crate::backend::visual::precise_rect_from_logical(display_rect)
+                                });
+                                crate::backend::visual::snapped_precise_logical_rect_in_area_space(
+                                    crate::backend::visual::precise_rect_from_logical(clip),
+                                    rect,
+                                    display_rect.width,
+                                    display_rect.height,
+                                    Point::from((root_rect.x, root_rect.y)),
+                                    scale,
+                                )
+                            })
+                        })
+                    };
                     let local_sample_rect = smithay::utils::Rectangle::new(
                         smithay::utils::Point::from((
                             source_effect_rect.x - output_geo.loc.x,
@@ -5399,7 +5670,9 @@ fn backdrop_shader_elements_for_window(
                             scale.x as f32,
                             [0.0, 0.0],
                             clip_rect,
-                            cached.clip_radius,
+                            cached
+                                .clip_radius_precise
+                                .unwrap_or(cached.clip_radius as f32),
                             format!(
                                 "window-backdrop:{}:{}",
                                 decoration.snapshot.id, cached.stable_key
@@ -5674,44 +5947,54 @@ fn backdrop_shader_elements_for_window(
                 )),
                 (display_rect.width, display_rect.height).into(),
             );
-            let clip_rect = cached
-                .clip_rect
-                .map(|clip_rect| {
-                    let clip = if apply_visual_transform {
-                        crate::backend::visual::transformed_rect(
-                            clip_rect,
-                            decoration.layout.root.rect,
-                            decoration.visual_transform,
-                        )
-                    } else {
-                        clip_rect
-                    };
-                    crate::backend::visual::SnappedLogicalRect {
-                        x: (clip.x - display_rect.x) as f32,
-                        y: (clip.y - display_rect.y) as f32,
-                        width: clip.width.max(0) as f32,
-                        height: clip.height.max(0) as f32,
-                    }
-                })
-                .or_else(|| {
-                    display_rect_precise
-                        .zip(cached.clip_rect_precise.map(|clip| {
-                            if apply_visual_transform {
-                                crate::backend::visual::transformed_precise_rect(
-                                    clip,
-                                    decoration.layout.root.rect,
-                                    decoration.visual_transform,
-                                )
-                            } else {
-                                clip
-                            }
-                        }))
-                        .map(|(rect, clip)| {
-                            crate::backend::visual::precise_logical_rect_in_element_space(
-                                clip, rect,
+            let clip_rect = {
+                let precise_clip = display_rect_precise
+                    .zip(cached.clip_rect_precise.map(|clip| {
+                        if apply_visual_transform {
+                            crate::backend::visual::transformed_precise_rect(
+                                clip,
+                                decoration.layout.root.rect,
+                                decoration.visual_transform,
                             )
-                        })
-                });
+                        } else {
+                            clip
+                        }
+                    }))
+                    .map(|(rect, clip)| {
+                        crate::backend::visual::snapped_precise_logical_rect_in_area_space(
+                            clip,
+                            rect,
+                            display_rect.width,
+                            display_rect.height,
+                            Point::from((root_rect.x, root_rect.y)),
+                            scale,
+                        )
+                    });
+                precise_clip.or_else(|| {
+                    cached.clip_rect.map(|clip_rect| {
+                        let clip = if apply_visual_transform {
+                            crate::backend::visual::transformed_rect(
+                                clip_rect,
+                                decoration.layout.root.rect,
+                                decoration.visual_transform,
+                            )
+                        } else {
+                            clip_rect
+                        };
+                        let rect = display_rect_precise.unwrap_or_else(|| {
+                            crate::backend::visual::precise_rect_from_logical(display_rect)
+                        });
+                        crate::backend::visual::snapped_precise_logical_rect_in_area_space(
+                            crate::backend::visual::precise_rect_from_logical(clip),
+                            rect,
+                            display_rect.width,
+                            display_rect.height,
+                            Point::from((root_rect.x, root_rect.y)),
+                            scale,
+                        )
+                    })
+                })
+            };
             let local_sample_rect = smithay::utils::Rectangle::new(
                 smithay::utils::Point::from((
                     source_effect_rect.x - output_geo.loc.x,
@@ -5742,7 +6025,9 @@ fn backdrop_shader_elements_for_window(
                 scale.x as f32,
                 [0.0, 0.0],
                 clip_rect,
-                cached.clip_radius,
+                cached
+                    .clip_radius_precise
+                    .unwrap_or(cached.clip_radius as f32),
                 format!(
                     "window-backdrop:{}:{}",
                     decoration.snapshot.id, cached.stable_key
@@ -6410,7 +6695,7 @@ fn configured_background_effect_elements_for_layer(
                         alpha,
                         scale.x as f32,
                         None,
-                        0,
+                        0.0,
                         format!("layer-top:{}:{}", output.name(), rect_key),
                     )?,
                 ));
@@ -6494,7 +6779,7 @@ fn configured_background_effect_elements_for_layer(
                 alpha,
                 scale.x as f32,
                 None,
-                0,
+                0.0,
                 format!("layer-top:{}:{}", output.name(), rect_key),
             )?,
         ));
@@ -6645,7 +6930,7 @@ fn lower_layer_scene_elements(
                                 1.0,
                                 scale.x as f32,
                                 None,
-                                0,
+                                0.0,
                                 format!("layer-lower:{}:{}", output.name(), rect_key),
                             )?,
                         ));
@@ -6796,7 +7081,7 @@ fn lower_layer_scene_elements(
                         1.0,
                         scale.x as f32,
                         None,
-                        0,
+                        0.0,
                         format!("layer-lower:{}:{}", output.name(), rect_key),
                     )?,
                 ));
@@ -7059,7 +7344,7 @@ fn configured_background_effect_elements_for_window(
                         scale.x as f32,
                         [0.0, 0.0],
                         None,
-                        0,
+                        0.0,
                         format!("protocol-window:{}:{}", decoration.snapshot.id, stable_key),
                     )
                     .ok()
@@ -7284,7 +7569,7 @@ fn configured_background_effect_elements_for_window(
                 scale.x as f32,
                 [0.0, 0.0],
                 None,
-                0,
+                0.0,
                 format!("protocol-window:{}:{}", decoration.snapshot.id, stable_key),
             )
             .ok()

@@ -13,10 +13,11 @@ use crate::{
     backend::shader_effect::{ShaderEffectError, ShaderEffectSpec, StableShaderEffectElement},
     backend::text,
     backend::visual::{
-        RectSnapMode, precise_logical_rect_in_element_space, relative_physical_rect_from_root,
-        relative_physical_rect_from_root_precise, relative_physical_rect_from_root_snapped_edges,
-        snapped_logical_radius, snapped_logical_rect_for_element,
-        snapped_logical_rect_from_relative_physical, snapped_precise_logical_rect_in_element_space,
+        RectSnapMode, relative_physical_rect_from_root, relative_physical_rect_from_root_precise,
+        relative_physical_rect_from_root_snapped_edges, snapped_logical_radius,
+        snapped_logical_rect_for_element,
+        snapped_logical_rect_from_relative_physical, snapped_precise_logical_rect_in_area_space,
+        snapped_precise_logical_rect_in_element_space,
     },
     ssd::{ComputedDecorationNode, LogicalRect, StylePosition, WindowDecorationState},
 };
@@ -544,65 +545,6 @@ fn bordered_node_anchor_union_geometry(
     union
 }
 
-fn align_shared_clip_edges_to_outer(
-    mut clip: RoundedClip,
-    clip_rect_precise: Option<crate::backend::visual::PreciseLogicalRect>,
-    clip_rect_logical: Option<LogicalRect>,
-    outer_rect_precise: crate::backend::visual::PreciseLogicalRect,
-    outer_rect_logical: LogicalRect,
-    scale: Scale<f64>,
-) -> RoundedClip {
-    let epsilon_x = (1.0 / scale.x.abs().max(0.0001)) as f32;
-    let epsilon_y = (1.0 / scale.y.abs().max(0.0001)) as f32;
-    let local_right = outer_rect_precise.width.max(0.0);
-    let local_bottom = outer_rect_precise.height.max(0.0);
-
-    let shared_left = clip_rect_precise
-        .map(|rect| (rect.x - outer_rect_precise.x).abs() <= epsilon_x)
-        .or_else(|| clip_rect_logical.map(|rect| rect.x == outer_rect_logical.x))
-        .unwrap_or(false);
-    let shared_top = clip_rect_precise
-        .map(|rect| (rect.y - outer_rect_precise.y).abs() <= epsilon_y)
-        .or_else(|| clip_rect_logical.map(|rect| rect.y == outer_rect_logical.y))
-        .unwrap_or(false);
-    let shared_right = clip_rect_precise
-        .map(|rect| {
-            ((rect.x + rect.width) - (outer_rect_precise.x + outer_rect_precise.width)).abs()
-                <= epsilon_x
-        })
-        .or_else(|| {
-            clip_rect_logical
-                .map(|rect| rect.x + rect.width == outer_rect_logical.x + outer_rect_logical.width)
-        })
-        .unwrap_or(false);
-    let shared_bottom = clip_rect_precise
-        .map(|rect| {
-            ((rect.y + rect.height) - (outer_rect_precise.y + outer_rect_precise.height)).abs()
-                <= epsilon_y
-        })
-        .or_else(|| {
-            clip_rect_logical.map(|rect| {
-                rect.y + rect.height == outer_rect_logical.y + outer_rect_logical.height
-            })
-        })
-        .unwrap_or(false);
-
-    if shared_left {
-        clip.rect.x = 0.0;
-    }
-    if shared_top {
-        clip.rect.y = 0.0;
-    }
-    if shared_right {
-        clip.rect.width = (local_right - clip.rect.x).max(0.0);
-    }
-    if shared_bottom {
-        clip.rect.height = (local_bottom - clip.rect.y).max(0.0);
-    }
-
-    clip
-}
-
 fn clip_contains_local_rect(clip: RoundedClip, local_rect: Rectangle<i32, Logical>) -> bool {
     let epsilon = 1.0;
     let local_right = local_rect.size.w.max(0) as f32;
@@ -635,37 +577,6 @@ fn local_clip_from_physical_geometry(
         },
         radius,
     }
-}
-
-fn corner_radii_from_clip(
-    fallback_radius: f32,
-    clip: RoundedClip,
-    local_rect: Rectangle<i32, Logical>,
-) -> [f32; 4] {
-    let mut radii = [fallback_radius; 4];
-    let epsilon = 1.0;
-    let local_right = local_rect.size.w.max(0) as f32;
-    let local_bottom = local_rect.size.h.max(0) as f32;
-
-    let shares_left = clip.rect.x.abs() <= epsilon;
-    let shares_top = clip.rect.y.abs() <= epsilon;
-    let shares_right = ((clip.rect.x + clip.rect.width) - local_right).abs() <= epsilon;
-    let shares_bottom = ((clip.rect.y + clip.rect.height) - local_bottom).abs() <= epsilon;
-
-    if shares_top && shares_left {
-        radii[0] = clip.radius.max(radii[0]);
-    }
-    if shares_top && shares_right {
-        radii[1] = clip.radius.max(radii[1]);
-    }
-    if shares_bottom && shares_right {
-        radii[2] = clip.radius.max(radii[2]);
-    }
-    if shares_bottom && shares_left {
-        radii[3] = clip.radius.max(radii[3]);
-    }
-
-    radii
 }
 
 pub fn rounded_elements_for_output(
@@ -872,17 +783,6 @@ pub fn ordered_text_elements_for_decoration(
     crate::backend::text::ordered_text_elements_for_decoration(
         renderer, decoration, output_geo, scale, alpha,
     )
-}
-
-fn local_clip_from_precise_rects(
-    clip_rect: crate::backend::visual::PreciseLogicalRect,
-    element_rect: crate::backend::visual::PreciseLogicalRect,
-    radius: f32,
-) -> RoundedClip {
-    RoundedClip {
-        rect: precise_logical_rect_in_element_space(clip_rect, element_rect),
-        radius: radius.max(0.0),
-    }
 }
 
 fn local_clip_from_logical_rects(
@@ -1152,39 +1052,38 @@ fn rounded_rect_element(
         cached
             .clip_rect_precise
             .map(|clip_rect| {
-                let local_clip = local_clip_from_precise_rects(
-                    clip_rect,
-                    outer_rect_precise,
-                    snapped_radius_f32(
+                RoundedClip {
+                    rect: snapped_precise_logical_rect_in_area_space(
+                        clip_rect,
+                        outer_rect_precise,
+                        local_rect.size.w,
+                        local_rect.size.h,
+                        Point::from((decoration.layout.root.rect.x, decoration.layout.root.rect.y)),
+                        scale,
+                    ),
+                    radius: snapped_radius_f32(
                         cached
                             .clip_radius_precise
                             .unwrap_or(cached.clip_radius as f32),
                     ),
-                );
-                align_shared_clip_edges_to_outer(
-                    local_clip,
-                    Some(clip_rect),
-                    None,
-                    outer_rect_precise,
-                    cached.rect,
-                    scale,
-                )
+                }
             })
             .or_else(|| {
                 cached.clip_rect.map(|clip_rect| {
-                    let local_clip = local_clip_from_logical_rects(
-                        clip_rect,
-                        cached.rect,
-                        snapped_logical_radius(cached.clip_radius, scale),
-                    );
-                    align_shared_clip_edges_to_outer(
-                        local_clip,
-                        None,
-                        Some(clip_rect),
-                        outer_rect_precise,
-                        cached.rect,
-                        scale,
-                    )
+                    RoundedClip {
+                        rect: snapped_precise_logical_rect_in_area_space(
+                            crate::backend::visual::precise_rect_from_logical(clip_rect),
+                            outer_rect_precise,
+                            local_rect.size.w,
+                            local_rect.size.h,
+                            Point::from((
+                                decoration.layout.root.rect.x,
+                                decoration.layout.root.rect.y,
+                            )),
+                            scale,
+                        ),
+                        radius: snapped_logical_radius(cached.clip_radius, scale),
+                    }
                 })
             })
     };
@@ -1447,11 +1346,11 @@ fn rounded_rect_element(
             render_outer_radius,
             render_outer_radius,
         ]
-    } else if cached.border_width <= 0.0 {
-        render_clip
-            .map(|clip| corner_radii_from_clip(outer_radius, clip, local_rect))
-            .unwrap_or([outer_radius, outer_radius, outer_radius, outer_radius])
     } else {
+        // The inherited rounded clip is applied separately below. Do not fold
+        // that ancestor radius into the element's own shape: doing so rounds a
+        // child by its own height and then clips it again by the parent, which
+        // creates a visible 1px seam on shared edges at fractional scales.
         [outer_radius, outer_radius, outer_radius, outer_radius]
     };
     let clip = if cached.border_width <= 0.0 {
@@ -1632,6 +1531,7 @@ fn rounded_rect_element(
         let clip_bottom_global = clip_physical_global.map(|rect| rect.loc.y + rect.size.h);
         tracing::info!(
             stable_key = %cached.stable_key,
+            owner_node_id = ?cached.owner_node_id,
             source_kind = %cached.source_kind,
             rect = ?cached.rect,
             rect_precise = ?cached.rect_precise,
@@ -1913,25 +1813,36 @@ fn shader_effect_element(
             None
         } else {
             cached
-                .clip_rect
-                .map(|clip_rect| local_clip_from_logical_rects(clip_rect, cached.rect, 0.0).rect)
-                .or_else(|| {
-                    cached.rect_precise.zip(cached.clip_rect_precise).map(
-                        |(rect_precise, clip_rect)| {
-                            precise_logical_rect_in_element_space(clip_rect, rect_precise)
-                        },
+                .rect_precise
+                .zip(cached.clip_rect_precise.or_else(|| {
+                    cached
+                        .clip_rect
+                        .map(crate::backend::visual::precise_rect_from_logical)
+                }))
+                .map(|(rect_precise, clip_rect)| {
+                    snapped_precise_logical_rect_in_area_space(
+                        clip_rect,
+                        rect_precise,
+                        local_rect.size.w,
+                        local_rect.size.h,
+                        Point::from((decoration.layout.root.rect.x, decoration.layout.root.rect.y)),
+                        scale,
                     )
+                })
+                .or_else(|| {
+                    cached.clip_rect.map(|clip_rect| {
+                        local_clip_from_logical_rects(clip_rect, cached.rect, 0.0).rect
+                    })
                 })
         },
         clip_radius: if gap_disable_decoration_clip_enabled()
             || gap_disable_titlebar_clip_enabled(cached.rect.height)
         {
-            0
+            0.0
         } else {
             cached
                 .clip_radius_precise
-                .map(|radius| radius.round() as i32)
-                .unwrap_or(cached.clip_radius)
+                .unwrap_or(cached.clip_radius as f32)
         },
     };
     if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
@@ -2002,8 +1913,13 @@ fn shader_effect_element(
                 rect.size,
             )
         });
+        let geometry_right = geometry.loc.x + geometry.size.w;
+        let geometry_bottom = geometry.loc.y + geometry.size.h;
+        let clip_right_global = clip_physical_global.map(|rect| rect.loc.x + rect.size.w);
+        let clip_bottom_global = clip_physical_global.map(|rect| rect.loc.y + rect.size.h);
         tracing::info!(
             stable_key = %cached.stable_key,
+            owner_node_id = ?cached.owner_node_id,
             rect = ?cached.rect,
             rect_precise = ?cached.rect_precise,
             root_local_rect_precise = ?root_local_rect_precise,
@@ -2024,6 +1940,12 @@ fn shader_effect_element(
             clip_physical_precise = ?clip_physical_precise,
             clip_physical_global_precise = ?clip_physical_global_precise,
             clip_physical_global = ?clip_physical_global,
+            geometry_right,
+            geometry_bottom,
+            clip_right_global,
+            clip_bottom_global,
+            clip_right_gap_px = clip_right_global.map(|right| geometry_right - right),
+            clip_bottom_gap_px = clip_bottom_global.map(|bottom| geometry_bottom - bottom),
             geometry = ?geometry,
             "gap debug shader decoration element"
         );
