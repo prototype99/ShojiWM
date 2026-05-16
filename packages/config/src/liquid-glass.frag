@@ -1,93 +1,56 @@
-// Rounded-rect liquid glass based on signed distance.
-// For each pixel inside the rounded rect, compute the SDF distance to the border,
-// then sample from a point shifted toward the center. The shift is strongest near
-// the edge and fades toward the interior.
+// Reference : https://medium.com/@aghajari/liquid-glass-ios-effect-explanation-dabadd6414ae
 
-uniform float inset_px;
-uniform float border_radius_px;
-uniform float edge_width_px;
-uniform float edge_softness_px;
-uniform float max_warp_px;
-uniform float interior_warp_px;
-uniform float white_tint;
-uniform float edge_highlight;
+uniform float glass_width_px;
+uniform float glass_height_px;
+uniform float glass_radius_px;
+uniform float distortion_depth;
+uniform float distortion_strength;
+uniform float chromatic_shift_px;
+uniform float glass_tint;
 
-float rounded_rect_sdf(vec2 coords, vec2 rect_size, float radius) {
-    vec2 center;
-    float r;
-
-    if (coords.x < radius && coords.y < radius) {
-        r = radius;
-        center = vec2(r, r);
-        return distance(coords, center) - r;
-    } else if (coords.x > rect_size.x - radius && coords.y < radius) {
-        r = radius;
-        center = vec2(rect_size.x - r, r);
-        return distance(coords, center) - r;
-    } else if (coords.x > rect_size.x - radius && coords.y > rect_size.y - radius) {
-        r = radius;
-        center = vec2(rect_size.x - r, rect_size.y - r);
-        return distance(coords, center) - r;
-    } else if (coords.x < radius && coords.y > rect_size.y - radius) {
-        r = radius;
-        center = vec2(r, rect_size.y - r);
-        return distance(coords, center) - r;
-    }
-
-    float dist_left = coords.x;
-    float dist_right = rect_size.x - coords.x;
-    float dist_top = coords.y;
-    float dist_bottom = rect_size.y - coords.y;
-    return -min(min(dist_left, dist_right), min(dist_top, dist_bottom));
+float sdf(vec2 p, vec2 b, float r) {
+    vec2 d = abs(p) - b + vec2(r);
+    return min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - r;
 }
 
-float rounded_rect_alpha(vec2 p, vec2 rect_size, float radius) {
-    float sdf = rounded_rect_sdf(p, rect_size, radius);
-    return 1.0 - smoothstep(-0.5, 0.5, sdf);
+vec3 getTextureColorAt(vec2 coord, vec2 rect_size) {
+    vec2 sample_uv = clamp(coord / max(rect_size, vec2(1.0)), vec2(0.0), vec2(1.0));
+    return texture2D(tex, sample_uv).rgb;
 }
 
 vec4 shader_main(vec2 uv, vec2 rect_size) {
-    vec2 origin = vec2(inset_px);
-    vec2 size = max(rect_size - vec2(inset_px * 2.0), vec2(1.0));
-    vec2 local = uv * rect_size - origin;
-    float radius = max(border_radius_px - inset_px, 0.0);
+    vec2 fragCoord = uv * rect_size;
+    vec2 glassSize = vec2(
+        glass_width_px > 0.0 ? glass_width_px : rect_size.x,
+        glass_height_px > 0.0 ? glass_height_px : rect_size.y
+    );
+    vec2 glassCenter = rect_size * 0.5;
+    vec2 glassCoord = fragCoord - glassCenter;
 
-    vec4 base = texture2D(tex, uv);
+    float size = max(min(glassSize.x, glassSize.y), 1.0);
+    float inversedSDF = -sdf(glassCoord, glassSize * 0.5, glass_radius_px) / size;
 
-    float sdf = rounded_rect_sdf(local, size, radius);
-    float mask = rounded_rect_alpha(local, size, radius);
-    if (mask <= 0.0) {
-        return base;
+    if (inversedSDF < 0.0) {
+        return vec4(getTextureColorAt(fragCoord, rect_size), 1.0);
     }
 
-    float dist_inside = max(-sdf, 0.0);
-    float edge_band = 1.0 - smoothstep(
-        edge_softness_px,
-        edge_width_px + edge_softness_px,
-        dist_inside
+    float coordLen = length(glassCoord);
+    vec2 normalizedGlassCoord = coordLen > 0.0001
+        ? glassCoord / coordLen
+        : vec2(0.0, 0.0);
+    float distFromCenter = 1.0 - clamp(inversedSDF / max(distortion_depth, 0.0001), 0.0, 1.0);
+    float distortion = 1.0 - sqrt(max(1.0 - pow(distFromCenter, 2.0), 0.0));
+    vec2 offset = distortion * normalizedGlassCoord * glassSize * 0.5 * distortion_strength;
+    vec2 glassColorCoord = fragCoord - offset;
+
+    float edge = smoothstep(0.0, 0.02, inversedSDF);
+    vec2 shift = normalizedGlassCoord * edge * chromatic_shift_px;
+    vec3 glassColor = vec3(
+        getTextureColorAt(glassColorCoord - shift, rect_size).r,
+        getTextureColorAt(glassColorCoord, rect_size).g,
+        getTextureColorAt(glassColorCoord + shift, rect_size).b
     );
-    float interior_band = smoothstep(
-        edge_width_px + edge_softness_px,
-        edge_width_px + edge_softness_px + 24.0,
-        dist_inside
-    );
 
-    vec2 center = size * 0.5;
-    vec2 to_center = center - local;
-    float to_center_len = max(length(to_center), 0.0001);
-    vec2 dir = to_center / to_center_len;
-
-    float edge_weight = pow(clamp(edge_band, 0.0, 1.0), 0.65);
-    float warp_px = edge_weight * max_warp_px + interior_band * interior_warp_px;
-    vec2 warped_local = local + dir * warp_px;
-    vec2 warped_uv = clamp((warped_local + origin) / rect_size, vec2(0.0), vec2(1.0));
-
-    vec4 refracted = texture2D(tex, warped_uv);
-    vec4 color = refracted;
-
-    float edge_light = edge_band * edge_highlight;
-    color.rgb = mix(color.rgb, vec3(1.0), white_tint + edge_light);
-    color.a = 1.0;
-
-    return vec4(mix(base.rgb, color.rgb, mask), 1.0);
+    glassColor *= vec3(glass_tint);
+    return vec4(glassColor, 1.0);
 }

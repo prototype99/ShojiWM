@@ -228,17 +228,31 @@ WINDOW_MANAGER.decoration = (window: WaylandWindow) => {
         input: backdropSource(),
         invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
         pipeline: [
-            dualKawaseBlur({ radius: 4, passes: 2 }),
+            dualKawaseBlur({ radius: 2, passes: 2 }),
             shaderStage(loadShader("./src/liquid-glass.frag"), {
                 uniforms: {
-                    inset_px: 0.0,
-                    border_radius_px: 10.0,
-                    edge_width_px: 10.0,
-                    edge_softness_px: 0.0,
-                    max_warp_px: 20.0,
-                    interior_warp_px: 0.0,
-                    white_tint: 0.0,
-                    edge_highlight: 0.0,
+                    glass_radius_px: 10.0,
+                    distortion_depth: 0.2,
+                    distortion_strength: 0.15,
+                    chromatic_shift_px: 3.0,
+                    glass_tint: 0.9,
+                },
+            }),
+        ],
+    });
+
+    const titleOnlyShader = compileEffect({
+        input: backdropSource(),
+        invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
+        pipeline: [
+            dualKawaseBlur({ radius: 2, passes: 2 }),
+            shaderStage(loadShader("./src/liquid-glass.frag"), {
+                uniforms: {
+                    glass_radius_px: 10.0,
+                    distortion_depth: 0.2,
+                    distortion_strength: 0.05,
+                    chromatic_shift_px: 3.0,
+                    glass_tint: 0.9,
                 },
             }),
         ],
@@ -263,7 +277,7 @@ WINDOW_MANAGER.decoration = (window: WaylandWindow) => {
 
     var innerComponents = (
         <Box direction="column">
-            <ShaderEffect shader={backgroundShader} direction="row" style={titlebarStyle}>
+            <ShaderEffect shader={titleOnlyShader} direction="row" style={titlebarStyle}>
                 {appIcon}
                 {label}
                 {closeButton}
