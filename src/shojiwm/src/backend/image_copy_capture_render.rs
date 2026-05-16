@@ -270,23 +270,21 @@ fn render_frame_for_toplevel(
     )
         .into();
 
-    // Window content: render with origin at (0,0) of the buffer. `geom.loc`
-    // can be non-zero (CSD insets); subtract it (scaled to physical) so the
-    // buffer lines up with the window's natural top-left.
-    let location: smithay::utils::Point<i32, Physical> = (
-        (-(geom.loc.x as f64) * scale.x).round() as i32,
-        (-(geom.loc.y as f64) * scale.y).round() as i32,
-    )
-        .into();
-    let mut elements: Vec<ToplevelCaptureElement<'_, GlesRenderer>> =
-        window.render_elements(renderer, location, scale, 1.0);
+    // Element ordering convention: smithay's render_elements path treats the
+    // FRONT of the slice as the top of the z-stack, and `render_to_shm`
+    // iterates the slice in `.rev()` (so the back is drawn first, the front
+    // last, on top). Cursor must therefore appear *before* the window
+    // content so that — after the reversal — the window is drawn first and
+    // the cursor lands on top.
+    let mut elements: Vec<ToplevelCaptureElement<'_, GlesRenderer>> = Vec::new();
 
-    // Compose cursor on top in window-local coords. Cursor sits at workspace-
-    // physical-at-output-scale; subtract the window's geometry-origin position
-    // in the same coordinate system to land it in buffer-local space.
+    // Cursor (front of slice = drawn on top).
     if !cursor_pointer_elements.is_empty()
         && let Some(window_loc) = space.element_location(&window)
     {
+        // Cursor positions are workspace-physical at the output's scale;
+        // subtract the window's geometry-origin position in the same
+        // coordinate system to land them in buffer-local space.
         let geom_origin_phys: smithay::utils::Point<i32, Physical> = (
             ((window_loc.x + geom.loc.x) as f64 * scale.x).round() as i32,
             ((window_loc.y + geom.loc.y) as f64 * scale.y).round() as i32,
@@ -301,6 +299,18 @@ fn render_frame_for_toplevel(
             elements.push(ToplevelCaptureElement::TranslatedCursor(translated));
         }
     }
+
+    // Window content (back of slice = drawn first / underneath). `geom.loc`
+    // can be non-zero (CSD insets); subtract it (scaled to physical) so the
+    // buffer's top-left lines up with the window's natural top-left.
+    let location: smithay::utils::Point<i32, Physical> = (
+        (-(geom.loc.x as f64) * scale.x).round() as i32,
+        (-(geom.loc.y as f64) * scale.y).round() as i32,
+    )
+        .into();
+    let window_elements: Vec<ToplevelCaptureElement<'_, GlesRenderer>> =
+        window.render_elements(renderer, location, scale, 1.0);
+    elements.extend(window_elements);
 
     let buffer = frame.buffer();
     render_to_shm(
