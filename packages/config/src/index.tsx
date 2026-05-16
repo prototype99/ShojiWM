@@ -170,10 +170,12 @@ WINDOW_MANAGER.effect.window = (window) => ({
     replace: windowReplaceEffect,
 });*/
 
+const OPEN_CLOSE_ANIMATION_DURATION = seconds(1.0)
+
 WINDOW_MANAGER.event.onOpen((window) => {
-    window.setCloseAnimationDuration(seconds(2.0));
+    window.setCloseAnimationDuration(OPEN_CLOSE_ANIMATION_DURATION);
     window.animation.start(openAnimation, {
-        duration: seconds(2.0),
+        duration: OPEN_CLOSE_ANIMATION_DURATION,
         to: 1,
         easing: cubicBezier(0.1, 0.93, 0.1, 0.93)
     });
@@ -182,7 +184,7 @@ WINDOW_MANAGER.event.onOpen((window) => {
 
 WINDOW_MANAGER.event.onStartClose((window) => {
     window.animation.start(openAnimation, {
-        duration: seconds(2.0),
+        duration: OPEN_CLOSE_ANIMATION_DURATION,
         to: 0,
         easing: cubicBezier(0.1, 0.93, 0.1, 0.93)
     });
@@ -242,6 +244,49 @@ WINDOW_MANAGER.decoration = (window: WaylandWindow) => {
         ],
     });
 
+    const appIcon = (<AppIcon icon={window.icon} style={{ width: 16, height: 16 }} />);
+    const label = (
+        <Label
+            text={window.title}
+            style={{
+                color: titleColor,
+                fontFamily: ["Noto Sans CJK JP", "Noto Color Emoji"],
+                fontSize: 13,
+                fontWeight: 600,
+                flexGrow: 1,
+                flexShrink: 1,
+                minWidth: 0,
+            }}
+        />
+    );
+    const closeButton = (<CloseButton window={window} />);
+
+    var innerComponents = (
+        <Box direction="column">
+            <ShaderEffect shader={backgroundShader} direction="row" style={titlebarStyle}>
+                {appIcon}
+                {label}
+                {closeButton}
+            </ShaderEffect>
+            <ClientWindow />
+        </Box>
+    );
+
+    const TERMINALS = ["kitty", "ghostty"];
+
+    if (TERMINALS.includes(window.appId() ?? "")) {
+        innerComponents = (
+            <ShaderEffect shader={backgroundShader} direction="column">
+                <Box direction="row" style={titlebarStyle}>
+                    {appIcon}
+                    {label}
+                    {closeButton}
+                </Box>
+                <ClientWindow />
+            </ShaderEffect>
+        );
+    }
+
     return (
         <WindowBorder
             style={{
@@ -254,25 +299,7 @@ WINDOW_MANAGER.decoration = (window: WaylandWindow) => {
             }}
         >
             <Box direction="row">
-                <Box direction="column">
-                    <ShaderEffect shader={backgroundShader} direction="row" style={titlebarStyle}>
-                        <AppIcon icon={window.icon} style={{ width: 16, height: 16 }} />
-                        <Label
-                            text={window.title}
-                            style={{
-                                color: titleColor,
-                                fontFamily: ["Noto Sans CJK JP", "Noto Color Emoji"],
-                                fontSize: 13,
-                                fontWeight: 600,
-                                flexGrow: 1,
-                                flexShrink: 1,
-                                minWidth: 0,
-                            }}
-                        />
-                        <CloseButton window={window} />
-                    </ShaderEffect>
-                    <ClientWindow />
-                </Box>
+                {innerComponents}
             </Box>
         </WindowBorder>
     );
