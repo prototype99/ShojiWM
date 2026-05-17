@@ -218,8 +218,8 @@ WINDOW_MANAGER.decoration = (window: WaylandWindow) => {
             shaderStage(loadShader("./src/liquid-glass.frag"), {
                 uniforms: {
                     glass_radius_px: 10.0,
-                    distortion_depth: 0.2,
-                    distortion_strength: 0.05,
+                    distortion_depth: 0.3,
+                    distortion_strength: 0.1,
                     chromatic_shift_px: 3.0,
                     glass_tint: 0.9,
                 },
