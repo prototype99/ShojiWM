@@ -835,6 +835,19 @@ impl ShojiWM {
             let window_was_runtime_dirty = self.runtime_dirty_window_ids.contains(&snapshot_id);
             let layout_scale = self.decoration_layout_scale_for_window(&window);
             let window_raster_scale = self.decoration_raster_scale_for_window(&window);
+            let cached_effective_client_rect = self
+                .window_decorations
+                .get(&window)
+                .map(|cached| {
+                    managed_client_rect_for_state(
+                        &cached.tree,
+                        &cached.managed_window,
+                        client_rect,
+                        cached.layout_scale,
+                    )
+                })
+                .transpose()?
+                .unwrap_or(client_rect);
             let had_cached_decoration = self.window_decorations.contains_key(&window);
             let runtime_state_changed = self
                 .window_decorations
@@ -877,9 +890,15 @@ impl ShojiWM {
                 pending_process_config_updates.push(evaluation.process_config.clone());
                 pending_process_actions.extend(evaluation.process_actions.clone());
                 let tree = DecorationTree::new(evaluation.node);
+                let layout_client_rect = managed_client_rect_for_state(
+                    &tree,
+                    &evaluation.managed_window,
+                    client_rect,
+                    layout_scale,
+                )?;
                 let layout_started_at = Instant::now();
                 let layout = tree
-                    .layout_for_client_with_scale(client_rect, layout_scale)
+                    .layout_for_client_with_scale(layout_client_rect, layout_scale)
                     .map_err(super::DecorationEvaluationError::Layout)?;
                 let layout_ms = layout_started_at.elapsed().as_secs_f64() * 1000.0;
                 push_damage_pair(
@@ -955,7 +974,7 @@ impl ShojiWM {
                     None,
                     None,
                 );
-                log_decoration_refresh("rebuild", &snapshot, client_rect, &layout, &buffers);
+                log_decoration_refresh("rebuild", &snapshot, layout_client_rect, &layout, &buffers);
                 let caches = self
                     .window_decorations
                     .remove(&window)
@@ -976,7 +995,7 @@ impl ShojiWM {
                         tree,
                         layout,
                         layout_scale,
-                        client_rect,
+                        client_rect: layout_client_rect,
                         visual_transform: evaluation.transform,
                         managed_window: evaluation.managed_window,
                         window_effects: evaluation.window_effects,
@@ -995,7 +1014,7 @@ impl ShojiWM {
                 self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
                 animation_active_for_target |= evaluation.next_poll_in_ms == Some(0);
             } else if let Some(cached) = self.window_decorations.get_mut(&window) {
-                if cached.client_rect != client_rect {
+                if cached.client_rect != cached_effective_client_rect {
                     let started_at = Instant::now();
                     let finalize_ms = 0.0;
                     let previous_root =
@@ -1023,10 +1042,16 @@ impl ShojiWM {
                     pending_process_config_updates.push(evaluation.process_config.clone());
                     pending_process_actions.extend(evaluation.process_actions.clone());
                     cached.tree = DecorationTree::new(evaluation.node);
+                    let layout_client_rect = managed_client_rect_for_state(
+                        &cached.tree,
+                        &evaluation.managed_window,
+                        client_rect,
+                        layout_scale,
+                    )?;
                     let layout_started_at = Instant::now();
                     cached.layout = cached
                         .tree
-                        .layout_for_client_with_scale(client_rect, layout_scale)
+                        .layout_for_client_with_scale(layout_client_rect, layout_scale)
                         .map_err(super::DecorationEvaluationError::Layout)?;
                     let layout_ms = layout_started_at.elapsed().as_secs_f64() * 1000.0;
                     cached.layout_scale = layout_scale;
@@ -1035,7 +1060,7 @@ impl ShojiWM {
                         Some(previous_root),
                         transformed_root_rect(cached.layout.root.rect, evaluation.transform),
                     );
-                    cached.client_rect = client_rect;
+                    cached.client_rect = layout_client_rect;
                     cached.snapshot = snapshot;
                     cached.visual_transform = evaluation.transform;
                     cached.managed_window = evaluation.managed_window;
@@ -1103,7 +1128,7 @@ impl ShojiWM {
                     log_decoration_refresh(
                         "relayout",
                         &cached.snapshot,
-                        client_rect,
+                        layout_client_rect,
                         &cached.layout,
                         &cached.buffers,
                     );
@@ -1614,9 +1639,9 @@ impl ShojiWM {
                         )?;
                         let position_changed = desired_client.x != closing.decoration.client_rect.x
                             || desired_client.y != closing.decoration.client_rect.y;
-                        let size_changed =
-                            desired_client.width != closing.decoration.client_rect.width
-                                || desired_client.height != closing.decoration.client_rect.height;
+                        let size_changed = desired_client.width
+                            != closing.decoration.client_rect.width
+                            || desired_client.height != closing.decoration.client_rect.height;
                         if size_changed {
                             let layout = closing
                                 .decoration
@@ -1971,6 +1996,7 @@ impl ShojiWM {
                 );
                 managed.managed.then_some((
                     window.clone(),
+                    managed.clip_to_rect,
                     desired_root,
                     decoration.layout.root.rect,
                     decoration.content_clip,
@@ -1980,7 +2006,15 @@ impl ShojiWM {
             })
             .collect::<Vec<_>>();
 
-        for (window, desired_root, current_root, content_clip, current_client, window_id) in windows
+        for (
+            window,
+            clip_to_rect,
+            desired_root,
+            current_root,
+            content_clip,
+            current_client,
+            window_id,
+        ) in windows
         {
             let Some(content_clip) = content_clip else {
                 if managed_rect_debug_enabled() {
@@ -2065,6 +2099,52 @@ impl ShojiWM {
                         );
                     }
                 }
+                let raster_scale = self.decoration_raster_scale_for_rect(desired_root);
+                if clip_to_rect && let Some(decoration) = self.window_decorations.get_mut(&window) {
+                    let previous_shader_buffers = decoration.shader_buffers.clone();
+                    let previous_text_buffers = decoration.text_buffers.clone();
+                    let layout = decoration
+                        .tree
+                        .layout_for_client_with_scale(desired_client, decoration.layout_scale)
+                        .map_err(super::DecorationEvaluationError::Layout)
+                        .ok();
+                    if let Some(layout) = layout {
+                        let shared_edges = build_shared_edge_geometry_map(&layout);
+                        let content_clip =
+                            content_clip_for_layout(&decoration.tree, &layout, &shared_edges);
+                        let order_map = build_render_order_map(&layout);
+                        decoration.layout = layout;
+                        decoration.content_clip = content_clip;
+                        decoration.client_rect = desired_client;
+                        decoration.snapshot.position = WindowPositionSnapshot {
+                            x: desired_client.x,
+                            y: desired_client.y,
+                            width: desired_client.width,
+                            height: desired_client.height,
+                        };
+                        decoration.buffers = build_cached_buffers(&decoration.layout, &order_map);
+                        decoration.shader_buffers =
+                            build_shader_buffers(&decoration.layout, &order_map);
+                        freeze_manual_shader_buffers(
+                            &previous_shader_buffers,
+                            &mut decoration.shader_buffers,
+                        );
+                        decoration.text_buffers = build_text_buffers_with_fallback(
+                            &decoration.layout,
+                            &order_map,
+                            raster_scale,
+                            &mut self.text_rasterizer,
+                            &previous_text_buffers,
+                        );
+                        decoration.icon_buffers = build_icon_buffers(
+                            &decoration.layout,
+                            &order_map,
+                            raster_scale,
+                            &decoration.snapshot,
+                            &mut self.icon_rasterizer,
+                        );
+                    }
+                }
             } else if position_changed {
                 if let Some(decoration) = self.window_decorations.get_mut(&window) {
                     translate_cached_decoration_position(decoration, dx, dy, desired_client);
@@ -2091,6 +2171,32 @@ fn content_clip_for_layout(
     shared_edges: &std::collections::HashMap<String, SharedEdgeNodeGeometry>,
 ) -> Option<ContentClip> {
     slot_content_clip_for_node(&layout.root, None, None, shared_edges)
+}
+
+fn managed_client_rect_for_state(
+    tree: &DecorationTree,
+    managed: &super::ManagedWindowState,
+    fallback_client_rect: LogicalRect,
+    scale: f64,
+) -> Result<LogicalRect, DecorationEvaluationError> {
+    if !(managed.managed && managed.clip_to_rect) {
+        return Ok(fallback_client_rect);
+    }
+
+    let Some(desired_root) = managed.rect else {
+        return Ok(fallback_client_rect);
+    };
+    let desired_root = LogicalRect::new(
+        desired_root.x.round() as i32,
+        desired_root.y.round() as i32,
+        desired_root.width.round() as i32,
+        desired_root.height.round() as i32,
+    );
+    if desired_root.width <= 0 || desired_root.height <= 0 {
+        return Ok(fallback_client_rect);
+    }
+
+    managed_client_rect_for_root(tree, desired_root, scale)
 }
 
 fn managed_client_rect_for_root(

@@ -169,7 +169,7 @@ WINDOW_MANAGER.event.onFocus((window, focused) => {
 });
 
 WINDOW_MANAGER.decoration = (window: WaylandWindow) => {
-    const baseRect = { x: 100, y: 200, width: 700, height: 700 };
+    const baseRect = { x: 100, y: 200, width: 100, height: 100 };
     const openVariable = window.animation.signal(openAnimation);
     const opacity = openVariable;
     const translateY = openVariable(variable => (1 - variable) * 200);
@@ -270,7 +270,7 @@ WINDOW_MANAGER.decoration = (window: WaylandWindow) => {
     }
 
     return (
-        <ManagedWindow rect={rect} opacity={opacity}>
+        <ManagedWindow rect={rect} clipToRect opacity={opacity}>
             <WindowBorder
                 style={{
                     border: { px: 2, color: borderColor },

@@ -150,6 +150,8 @@ pub struct ManagedWindowState {
     #[serde(default = "default_true")]
     pub interactive: bool,
     #[serde(default)]
+    pub clip_to_rect: bool,
+    #[serde(default)]
     pub z_index: i32,
     #[serde(default)]
     pub transform: WindowTransform,
@@ -164,6 +166,7 @@ impl Default for ManagedWindowState {
             visible: true,
             idle: false,
             interactive: true,
+            clip_to_rect: false,
             z_index: 0,
             transform: WindowTransform::default(),
         }

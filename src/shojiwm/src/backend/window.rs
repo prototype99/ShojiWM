@@ -535,6 +535,7 @@ pub fn clipped_surface_elements(
     clip_scale: Scale<f64>,
     alpha: f32,
     clip: Option<ContentClip>,
+    clip_all_surfaces: bool,
 ) -> Result<Vec<WindowClipElement>, smithay::backend::renderer::gles::GlesError> {
     if std::env::var_os("SHOJI_GAP_BYPASS_CLIP").is_some() {
         return Ok(Vec::new());
@@ -648,7 +649,7 @@ pub fn clipped_surface_elements(
                         "gap debug clipped surface candidate",
                     );
                 }
-                if geometry_override.is_some() {
+                if clip_all_surfaces || geometry_override.is_some() {
                     ClippedSurfaceElement::new(
                         renderer,
                         element,
@@ -667,4 +668,31 @@ pub fn clipped_surface_elements(
             .collect(),
         None => Ok(elements.into_iter().map(WindowClipElement::Raw).collect()),
     }
+}
+
+pub fn clipped_popup_elements(
+    window: &Window,
+    renderer: &mut GlesRenderer,
+    location: Point<i32, Physical>,
+    output_origin: Point<i32, Logical>,
+    output_scale: Scale<f64>,
+    clip_scale: Scale<f64>,
+    alpha: f32,
+    clip: ContentClip,
+) -> Result<Vec<ClippedSurfaceElement>, smithay::backend::renderer::gles::GlesError> {
+    popup_elements(window, renderer, location, output_scale, alpha)
+        .into_iter()
+        .map(|element| {
+            ClippedSurfaceElement::new(
+                renderer,
+                element,
+                output_scale,
+                clip_scale,
+                output_origin,
+                clip,
+                None,
+                Some("popup clipped by ManagedWindow.clipToRect".to_owned()),
+            )
+        })
+        .collect()
 }

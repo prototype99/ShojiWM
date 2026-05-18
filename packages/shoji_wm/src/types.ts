@@ -110,6 +110,7 @@ export interface ManagedWindowState {
   visible: boolean;
   idle: boolean;
   interactive: boolean;
+  clipToRect: boolean;
   zIndex: number;
   transform: WindowTransform;
 }
@@ -562,6 +563,7 @@ export interface ManagedWindowProps extends ComponentProps {
   visible?: MaybeSignal<boolean>;
   idle?: MaybeSignal<boolean>;
   interactive?: MaybeSignal<boolean>;
+  clipToRect?: MaybeSignal<boolean>;
   zIndex?: MaybeSignal<number>;
   opacity?: MaybeSignal<number>;
   transform?: MaybeSignal<ManagedWindowTransform>;

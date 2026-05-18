@@ -1751,6 +1751,16 @@ impl ShojiWM {
                 if !decoration.managed_window_allows_input() {
                     return None;
                 }
+                if decoration.managed_window.clip_to_rect {
+                    let logical_pos = LogicalPoint::new(pos.x.floor() as i32, pos.y.floor() as i32);
+                    let transformed_root = transformed_root_rect(
+                        decoration.layout.root.rect,
+                        decoration.visual_transform,
+                    );
+                    if !transformed_root.contains(logical_pos) {
+                        return None;
+                    }
+                }
                 let local_pos = inverse_transform_point(
                     pos,
                     decoration.layout.root.rect,
@@ -1857,6 +1867,15 @@ impl ShojiWM {
                 && !decoration.managed_window_allows_input()
             {
                 return None;
+            }
+            if let Some(decoration) = self.window_decorations.get(window)
+                && decoration.managed_window.clip_to_rect
+            {
+                let transformed_root =
+                    transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
+                if !transformed_root.contains(logical_pos) {
+                    return None;
+                }
             }
             let location = self.space.element_location(window)?;
             let bbox = window.bbox();

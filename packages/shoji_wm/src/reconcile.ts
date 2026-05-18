@@ -321,6 +321,7 @@ function snapshotManagedWindow(
     visible,
     idle,
     interactive: props?.interactive === undefined ? true : read(props.interactive),
+    clipToRect: props?.clipToRect === undefined ? false : read(props.clipToRect),
     zIndex: props?.zIndex === undefined ? 0 : read(props.zIndex),
     transform: {
       ...transform,
