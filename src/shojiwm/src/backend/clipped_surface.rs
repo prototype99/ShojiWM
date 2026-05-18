@@ -95,6 +95,20 @@ fn compute_sample_uv_compensation(
     }
 }
 
+fn union_physical_rect(
+    a: Rectangle<i32, Physical>,
+    b: Rectangle<i32, Physical>,
+) -> Rectangle<i32, Physical> {
+    let left = a.loc.x.min(b.loc.x);
+    let top = a.loc.y.min(b.loc.y);
+    let right = (a.loc.x + a.size.w).max(b.loc.x + b.size.w);
+    let bottom = (a.loc.y + a.size.h).max(b.loc.y + b.size.h);
+    Rectangle::new(
+        Point::from((left, top)),
+        ((right - left).max(0), (bottom - top).max(0)).into(),
+    )
+}
+
 #[derive(Debug)]
 enum ClippedSurfaceInner {
     Mapped(WaylandSurfaceRenderElement<GlesRenderer>),
@@ -261,10 +275,17 @@ impl ClippedSurfaceElement {
 
         let element_geometry = inner.geometry(output_scale);
         // ContentClip callers pass forced_geometry when the compositor has an explicit
-        // destination rectangle for the client slot. Prefer that rectangle even when the
-        // client has not committed the matching buffer size yet; otherwise fast TS-managed
-        // rect changes can leave a visible gap between the stale client buffer and SSD border.
-        let render_geometry = forced_geometry.unwrap_or(element_geometry);
+        // destination rectangle for the client slot. Draw the union of the actual surface
+        // geometry and the forced slot geometry:
+        //
+        // - if the client is smaller than the slot, the quad expands to cover the missing edge;
+        // - if the client is larger than the slot, the quad stays large and the shader clips it.
+        //
+        // Using forced_geometry directly would scale a stale, too-large client buffer down
+        // instead of cropping it during fast TS-managed rect shrink.
+        let render_geometry = forced_geometry
+            .map(|forced| union_physical_rect(element_geometry, forced))
+            .unwrap_or(element_geometry);
         let output_scale_x = output_scale.x.abs().max(0.0001) as f32;
         let output_scale_y = output_scale.y.abs().max(0.0001) as f32;
         // render_geometry.loc is in output-local physical coordinates.

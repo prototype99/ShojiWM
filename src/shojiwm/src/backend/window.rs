@@ -8,7 +8,7 @@ use smithay::{
     backend::renderer::{
         ImportAll, Renderer,
         element::{
-            AsRenderElements, Element, Kind,
+            AsRenderElements, Element, Id, Kind,
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
         },
         gles::GlesRenderer,
@@ -635,31 +635,31 @@ pub fn clipped_surface_elements(
     match clip {
         Some(clip) if matches!(window.underlying_surface(), WindowSurface::Wayland(_)) => {
             // CSS-like parent clipping belongs to the toplevel/root surface. Subsurfaces are
-            // separate protocol surfaces and are allowed to extend outside the root surface, so
-            // keep them raw even when ManagedWindow.clipToRect asks us to force the root content
-            // into a specific rectangle.
-            let root_elements =
-                root_surface_elements(window, renderer, location, output_scale, alpha);
-            let root_count = root_elements.len();
+            // separate protocol surfaces and may intentionally extend outside the root surface
+            // (Chrome uses some subsurfaces like popups). Do not infer the root element from the
+            // render-element order: Smithay traverses the surface tree in paint order, so a
+            // below-sibling subsurface can appear before the root. Match by resource id instead.
+            let root_id = match window.underlying_surface() {
+                WindowSurface::Wayland(surface) => Id::from_wayland_resource(surface.wl_surface()),
+                WindowSurface::X11(_) => unreachable!("Wayland branch already checked"),
+            };
             let mut output = Vec::with_capacity(elements.len());
-            for element in root_elements {
-                output.push(WindowClipElement::Clipped(ClippedSurfaceElement::new(
-                    renderer,
-                    element,
-                    output_scale,
-                    clip_scale,
-                    output_origin,
-                    clip,
-                    geometry,
-                    debug_label.clone(),
-                )?));
+            for element in elements {
+                if Element::id(&element) == &root_id {
+                    output.push(WindowClipElement::Clipped(ClippedSurfaceElement::new(
+                        renderer,
+                        element,
+                        output_scale,
+                        clip_scale,
+                        output_origin,
+                        clip,
+                        geometry,
+                        debug_label.clone(),
+                    )?));
+                } else {
+                    output.push(WindowClipElement::Raw(element));
+                }
             }
-            output.extend(
-                elements
-                    .into_iter()
-                    .skip(root_count)
-                    .map(WindowClipElement::Raw),
-            );
             Ok(output)
         }
         Some(clip) => elements
