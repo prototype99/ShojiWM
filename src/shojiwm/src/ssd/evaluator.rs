@@ -41,6 +41,14 @@ pub trait DecorationEvaluator {
         now_ms: u64,
     ) -> Result<DecorationEvaluationResult, DecorationEvaluationError>;
 
+    fn evaluate_window_preview(
+        &self,
+        window: &WaylandWindowSnapshot,
+        now_ms: u64,
+    ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
+        self.evaluate_window(window, now_ms)
+    }
+
     fn evaluate_cached_window(
         &self,
         _window_id: &str,
@@ -372,6 +380,15 @@ enum RuntimeTransportKind {
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum RuntimeRequest<'a> {
     Evaluate {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        snapshot: &'a WaylandWindowSnapshot,
+        #[serde(rename = "nowMs")]
+        now_ms: u64,
+        #[serde(rename = "displayState")]
+        display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+    },
+    EvaluatePreview {
         #[serde(rename = "requestId")]
         request_id: u64,
         snapshot: &'a WaylandWindowSnapshot,
@@ -1178,6 +1195,97 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             *runtime_guard = None;
             return Err(DecorationEvaluationError::RuntimeProtocol(format!(
                 "mismatched response kind for evaluate: {}",
+                response.kind
+            )));
+        }
+        if !response.ok {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(
+                response
+                    .error
+                    .unwrap_or_else(|| "runtime returned failure".into()),
+            ));
+        }
+
+        let Some(serialized) = response.serialized else {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(
+                "missing serialized tree".into(),
+            ));
+        };
+        let stdout = serde_json::to_string(&serialized)
+            .map_err(|err| DecorationEvaluationError::InvalidResponse(err.to_string()))?;
+        Ok(DecorationEvaluationResult {
+            node: decode_tree_json(stdout.trim()).map_err(DecorationEvaluationError::Bridge)?,
+            transform: response.transform.unwrap_or_default(),
+            managed_window: response.managed_window.unwrap_or_default(),
+            window_effects: response
+                .window_effects
+                .map(TryInto::try_into)
+                .transpose()
+                .map_err(DecorationEvaluationError::Bridge)?,
+            dirty_node_ids: response.dirty_node_ids.unwrap_or_default(),
+            next_poll_in_ms: response.next_poll_in_ms,
+            display_config: response.display_config,
+            key_binding_config: response.key_binding_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+        })
+    }
+
+    fn evaluate_window_preview(
+        &self,
+        window: &WaylandWindowSnapshot,
+        now_ms: u64,
+    ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
+        let mut runtime_guard = self.runtime.lock().map_err(|_| {
+            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
+        })?;
+        let runtime = self.ensure_runtime(&mut runtime_guard)?;
+        let request_id = runtime.next_request_id;
+        runtime.next_request_id += 1;
+        let display_state = self
+            .display_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+
+        let request = serde_json::to_string(&RuntimeRequest::EvaluatePreview {
+            request_id,
+            snapshot: window,
+            now_ms,
+            display_state: &display_state,
+        })
+        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
+        runtime.write_request(&request)?;
+
+        let response: RuntimeEvaluateResponse = if let Some(response) = runtime.read_response()? {
+            response
+        } else {
+            let status = runtime
+                .child
+                .try_wait()?
+                .and_then(|status| status.code())
+                .unwrap_or(-1);
+            let stderr = runtime
+                .stderr_log
+                .lock()
+                .map(|stderr| stderr.clone())
+                .unwrap_or_default();
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
+        };
+        if response.request_id != request_id {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response id: expected {request_id}, got {}",
+                response.request_id
+            )));
+        }
+        if response.kind != "evaluatePreview" {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response kind for evaluatePreview: {}",
                 response.kind
             )));
         }

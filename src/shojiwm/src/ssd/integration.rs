@@ -235,6 +235,17 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         }
     }
 
+    fn evaluate_window_preview(
+        &self,
+        window: &WaylandWindowSnapshot,
+        now_ms: u64,
+    ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
+        match self {
+            Self::Static(evaluator) => evaluator.evaluate_window_preview(window, now_ms),
+            Self::Node(evaluator) => evaluator.evaluate_window_preview(window, now_ms),
+        }
+    }
+
     fn scheduler_tick(
         &self,
         now_ms: u64,
@@ -674,9 +685,12 @@ impl ShojiWM {
     ) -> Result<Option<LogicalRect>, DecorationEvaluationError> {
         self.sync_runtime_display_state();
         let now_ms = Duration::from(self.clock.now()).as_millis() as u64;
+        // Initial configure needs the TS-managed rect before the window's first commit.
+        // This uses a preconfigure runtime evaluation; the runtime keeps onOpen-created
+        // window state but reanchors animations when the first real evaluation arrives.
         let evaluation = self
             .decoration_evaluator
-            .evaluate_window(snapshot, now_ms)?;
+            .evaluate_window_preview(snapshot, now_ms)?;
 
         self.consume_runtime_display_config(evaluation.display_config.clone());
         self.consume_runtime_key_binding_config(evaluation.key_binding_config.clone());

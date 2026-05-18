@@ -584,7 +584,17 @@ export interface WindowBorderProps extends ComponentProps {
   id?: string;
 }
 
-export type DecorationFunction = (window: WaylandWindow) => DecorationRenderable;
+export type DecorationPhase = "preconfigure" | "render";
+
+export interface DecorationContext {
+  readonly phase: DecorationPhase;
+  readonly isPreview: boolean;
+}
+
+export type DecorationFunction = (
+  window: WaylandWindow,
+  context: DecorationContext,
+) => DecorationRenderable;
 
 export interface WindowManagerDefinition {
   decoration: DecorationFunction | null;

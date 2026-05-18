@@ -14,6 +14,7 @@ import {
 } from "./serialize";
 import type {
   DecorationChild,
+  DecorationContext,
   DecorationElementNode,
   DecorationRenderable,
   DecorationFunction,
@@ -60,6 +61,7 @@ export interface DecorationEvaluationCache {
   update(snapshot: WaylandWindowSnapshot): DecorationEvaluationResult | null;
   reevaluate(dirtyNodeIds?: readonly string[]): DecorationEvaluationResult;
   invokeHandler(handlerId: string): boolean;
+  setContext(context: DecorationContext): void;
 }
 
 export function diffWindowSnapshot(
@@ -119,6 +121,7 @@ export function createDecorationEvaluationCache(
   actions: WaylandWindowActions,
   evaluate: DecorationFunction,
   animation?: WindowAnimationController,
+  initialContext: DecorationContext = { phase: "render", isPreview: false },
 ): DecorationEvaluationCache {
   const handle = createReactiveWindow(snapshot, actions, animation);
   const componentStateStore = createComponentStateStore();
@@ -130,6 +133,7 @@ export function createDecorationEvaluationCache(
   let transform: WindowTransform;
   let managedWindow: ManagedWindowState;
   let managedWindowProps: ManagedWindowProps | undefined;
+  let context = initialContext;
   let nextHandlerId = 1;
   let runtimeHandlers = new Map<string, () => void>();
   const handlerIdsByKey = new Map<string, string>();
@@ -154,7 +158,7 @@ export function createDecorationEvaluationCache(
     enterWindowDependencyScope(currentSnapshot.id);
     try {
       const rendered = withComponentRenderRoot(currentSnapshot.id, componentStateStore, () =>
-        evaluate(handle.window)
+        evaluate(handle.window, context)
       );
       const extracted = extractManagedWindowRoot(rendered, handle);
       tree = extracted.tree;
@@ -255,6 +259,9 @@ export function createDecorationEvaluationCache(
 
       handler();
       return true;
+    },
+    setContext(nextContext) {
+      context = nextContext;
     },
   };
 }

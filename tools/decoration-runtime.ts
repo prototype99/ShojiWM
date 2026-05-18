@@ -27,6 +27,7 @@ import {
   createReactiveLayer,
   createWindowAnimationControllerWithStore,
   createDecorationEvaluationCache,
+  type DecorationContext,
   createManagedPoll,
   dropLayerDependencies,
   dropWindowDependencies,
@@ -69,6 +70,14 @@ import {
 interface EvaluateRequest {
   requestId: number;
   kind: "evaluate";
+  snapshot: WaylandWindowSnapshot;
+  nowMs: number;
+  displayState: Record<string, OutputStateSnapshot>;
+}
+
+interface EvaluatePreviewRequest {
+  requestId: number;
+  kind: "evaluatePreview";
   snapshot: WaylandWindowSnapshot;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
@@ -147,6 +156,7 @@ interface EvaluateLayerEffectsRequest {
 
 type RuntimeRequest =
   | EvaluateRequest
+  | EvaluatePreviewRequest
   | SchedulerTickRequest
   | WindowClosedRequest
   | StartCloseRequest
@@ -162,7 +172,7 @@ type RuntimeRequestWithTimestamp = Extract<RuntimeRequest, { nowMs: number }>;
 interface EvaluateSuccess {
   requestId: number;
   ok: true;
-  kind: "evaluate";
+  kind: "evaluate" | "evaluatePreview";
   serialized: unknown;
   transform: WindowTransform;
   managedWindow: ManagedWindowState;
@@ -386,12 +396,24 @@ let nextPollId = 1;
 let currentSchedulerTimeMs = 0;
 let lastAnimationAdvanceMs: number | undefined;
 
+const RENDER_DECORATION_CONTEXT: DecorationContext = {
+  phase: "render",
+  isPreview: false,
+};
+
+const PRECONFIGURE_DECORATION_CONTEXT: DecorationContext = {
+  phase: "preconfigure",
+  isPreview: true,
+};
+
 interface RuntimeCacheEntry {
   latestSnapshot: WaylandWindowSnapshot;
   cache: DecorationEvaluationCache;
+  animationEntries: Map<symbol, unknown>;
   pendingActions: RuntimeWindowAction[];
   closeAnimationDurationMs: number;
   closeStarted: boolean;
+  preconfigured: boolean;
   closePoll?: PollHandle;
 }
 
@@ -505,23 +527,30 @@ async function main() {
       if (hasRuntimeTimestamp(request)) {
         beginRuntimeTurn(request.nowMs);
       }
-      if (request.kind === "evaluate") {
-        const result = evaluateSnapshot(decoration, events, effectConfig, request.snapshot);
+      if (request.kind === "evaluate" || request.kind === "evaluatePreview") {
+        const result = request.kind === "evaluate"
+          ? evaluateSnapshot(decoration, events, effectConfig, request.snapshot, request.nowMs)
+          : evaluatePreconfigure(decoration, events, effectConfig, request.snapshot);
         const keyBindingConfig = pendingKeyBindingConfigPayload();
         const processConfig = pendingProcessConfigPayload();
         const processActions = pendingProcessActionsPayload();
+        const cached = request.kind === "evaluate"
+          ? cacheByWindowId.get(request.snapshot.id)?.cache
+          : undefined;
         await writeResponse(output, {
           requestId: request.requestId,
           ok: true,
-          kind: "evaluate",
+          kind: request.kind,
           serialized: result.serialized,
-          transform: cacheByWindowId.get(request.snapshot.id)?.cache.lastTransform ??
-            identityTransform(),
-          managedWindow: cacheByWindowId.get(request.snapshot.id)?.cache.lastManagedWindow ??
-            identityManagedWindow(),
+          transform: cached?.lastTransform ?? result.transform ?? identityTransform(),
+          managedWindow: cached?.lastManagedWindow ?? result.managedWindow ?? identityManagedWindow(),
           windowEffects: result.windowEffects,
-          dirtyNodeIds: takeDirtyWindowNodeIds(request.snapshot.id),
-          nextPollInMs: hasActiveAnimations() ? 0 : peekNextPollDelay(),
+          dirtyNodeIds: request.kind === "evaluate"
+            ? takeDirtyWindowNodeIds(request.snapshot.id)
+            : [],
+          nextPollInMs: request.kind === "evaluate"
+            ? hasActiveAnimations() ? 0 : peekNextPollDelay()
+            : undefined,
           displayConfig: pendingDisplayConfigPayload(),
           keyBindingConfig,
           processConfig,
@@ -712,10 +741,16 @@ function evaluateSnapshot(
   events: WindowManagerEventController,
   effectConfig: RuntimeEffectConfig,
   snapshot: WaylandWindowSnapshot,
-): { serialized: unknown; windowEffects: WindowEffectAssignment | null } {
+  nowMs: number,
+): {
+  serialized: unknown;
+  transform?: WindowTransform;
+  managedWindow?: ManagedWindowState;
+  windowEffects: WindowEffectAssignment | null;
+} {
   const existing = cacheByWindowId.get(snapshot.id);
   if (!existing) {
-    const entry = createRuntimeCacheEntry(snapshot, decoration);
+    const entry = createRuntimeCacheEntry(snapshot, decoration, RENDER_DECORATION_CONTEXT);
     cacheByWindowId.set(snapshot.id, entry);
     if (!openedWindowIds.has(snapshot.id)) {
       openedWindowIds.add(snapshot.id);
@@ -728,6 +763,14 @@ function evaluateSnapshot(
       windowEffects: evaluateWindowEffects(effectConfig, snapshot.id, entry),
     };
   }
+
+  const wasPreconfigured = existing.preconfigured;
+  if (wasPreconfigured) {
+    existing.preconfigured = false;
+    reanchorAnimationEntries(existing.animationEntries, nowMs);
+    dirtyWindowIds.add(snapshot.id);
+  }
+  existing.cache.setContext(RENDER_DECORATION_CONTEXT);
 
   const focusChanged = existing.latestSnapshot.isFocused !== snapshot.isFocused;
   existing.latestSnapshot = snapshot;
@@ -751,6 +794,51 @@ function evaluateSnapshot(
   };
 }
 
+function evaluatePreconfigure(
+  decoration: DecorationFunction,
+  events: WindowManagerEventController,
+  effectConfig: RuntimeEffectConfig,
+  snapshot: WaylandWindowSnapshot,
+): {
+  serialized: unknown;
+  transform: WindowTransform;
+  managedWindow: ManagedWindowState;
+  windowEffects: WindowEffectAssignment | null;
+} {
+  // Preconfigure evaluation is used before the client has committed its first real frame so
+  // Rust can send an initial configure matching <ManagedWindow rect>. It intentionally goes
+  // through the normal cache/onOpen path so user window state initialized in onOpen is visible
+  // to the layout. The first real evaluate reanchors any animations started here to its own
+  // compositor timestamp, preventing open animations from appearing halfway through.
+  let entry = cacheByWindowId.get(snapshot.id);
+  if (!entry) {
+    entry = createRuntimeCacheEntry(snapshot, decoration, PRECONFIGURE_DECORATION_CONTEXT);
+    cacheByWindowId.set(snapshot.id, entry);
+    if (!openedWindowIds.has(snapshot.id)) {
+      openedWindowIds.add(snapshot.id);
+      events.emitOpen(entry.cache.window);
+    }
+    events.emitFocus(entry.cache.window, snapshot.isFocused);
+  } else {
+    entry.cache.setContext(PRECONFIGURE_DECORATION_CONTEXT);
+    const focusChanged = entry.latestSnapshot.isFocused !== snapshot.isFocused;
+    entry.latestSnapshot = snapshot;
+    entry.cache.update(snapshot);
+    if (focusChanged) {
+      events.emitFocus(entry.cache.window, snapshot.isFocused);
+    }
+    entry.cache.reevaluate(takeDirtyWindowNodeIds(snapshot.id));
+  }
+
+  entry.preconfigured = true;
+  return {
+    serialized: entry.cache.lastSerialized,
+    transform: entry.cache.lastTransform,
+    managedWindow: entry.cache.lastManagedWindow,
+    windowEffects: evaluateWindowEffects(effectConfig, snapshot.id, entry),
+  };
+}
+
 function evaluateWindowEffects(
   effectConfig: RuntimeEffectConfig,
   windowId: string,
@@ -769,9 +857,24 @@ function evaluateWindowEffects(
   }
 }
 
+function reanchorAnimationEntries(entries: Map<symbol, unknown>, nowMs: number): void {
+  for (const rawEntry of entries.values()) {
+    const entry = rawEntry as {
+      progress?: { value: number };
+      timeline?: { startedAtMs: number; from: number };
+    };
+    if (!entry.timeline || !entry.progress) {
+      continue;
+    }
+    entry.timeline.startedAtMs = nowMs;
+    entry.progress.value = entry.timeline.from;
+  }
+}
+
 function createRuntimeCacheEntry(
   snapshot: WaylandWindowSnapshot,
   decoration: DecorationFunction,
+  context: DecorationContext = RENDER_DECORATION_CONTEXT,
 ): RuntimeCacheEntry {
   let latestSnapshot = snapshot;
   const actions: WaylandWindowActions = {
@@ -799,13 +902,15 @@ function createRuntimeCacheEntry(
     snapshot.id,
     animationEntries as Map<symbol, never>,
   );
-  const cache = createDecorationEvaluationCache(snapshot, actions, decoration, animation);
+  const cache = createDecorationEvaluationCache(snapshot, actions, decoration, animation, context);
   const entry: RuntimeCacheEntry = {
     latestSnapshot,
     cache,
+    animationEntries,
     pendingActions: [],
     closeAnimationDurationMs: 0,
     closeStarted: false,
+    preconfigured: false,
   };
   return entry;
 }
@@ -1384,6 +1489,7 @@ function writeResponse(
     | StartCloseSuccess
     | InvokeHandlerSuccess
     | InvokeKeyBindingSuccess
+    | WindowResizeSuccess
     | GetEffectConfigSuccess
     | EvaluateLayerEffectsSuccess
     | RuntimeFailure,
