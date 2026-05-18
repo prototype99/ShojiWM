@@ -1693,6 +1693,10 @@ impl ShojiWM {
         }
 
         let logical_pos = LogicalPoint::new(pos.x.floor() as i32, pos.y.floor() as i32);
+        if let Some(focus) = self.window_non_popup_child_surface_under(pos) {
+            return Some(focus);
+        }
+
         if let Some((window, decoration)) = self.window_under_transformed(logical_pos) {
             let transformed_client = transformed_rect(
                 decoration.client_rect,
@@ -1740,7 +1744,24 @@ impl ShojiWM {
         )
     }
 
-    fn window_popup_surface_under(
+    fn surface_has_popup_ancestor_for_hit_test(&self, surface: &WlSurface) -> bool {
+        let mut current = Some(surface.clone());
+        while let Some(candidate) = current {
+            if self.popups.find_popup(&candidate).is_some() {
+                return true;
+            }
+            current = smithay::wayland::compositor::get_parent(&candidate);
+        }
+        false
+    }
+
+    fn is_window_root_surface(window: &Window, surface: &WlSurface) -> bool {
+        window
+            .toplevel()
+            .is_some_and(|toplevel| toplevel.wl_surface() == surface)
+    }
+
+    fn window_non_popup_child_surface_under(
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
@@ -1751,15 +1772,48 @@ impl ShojiWM {
                 if !decoration.managed_window_allows_input() {
                     return None;
                 }
-                if decoration.managed_window.clip_to_rect {
-                    let logical_pos = LogicalPoint::new(pos.x.floor() as i32, pos.y.floor() as i32);
-                    let transformed_root = transformed_root_rect(
-                        decoration.layout.root.rect,
-                        decoration.visual_transform,
-                    );
-                    if !transformed_root.contains(logical_pos) {
+                let local_pos = inverse_transform_point(
+                    pos,
+                    decoration.layout.root.rect,
+                    decoration.visual_transform,
+                );
+                return window
+                    .surface_under(local_pos - location.to_f64(), WindowSurfaceType::ALL)
+                    .and_then(|(surface, loc)| {
+                        if Self::is_window_root_surface(window, &surface)
+                            || self.surface_has_popup_ancestor_for_hit_test(&surface)
+                        {
+                            return None;
+                        }
+                        let desired_local = (local_pos - location.to_f64()) - loc.to_f64();
+                        let surface_origin = pos - desired_local;
+                        Some((surface, surface_origin))
+                    });
+            }
+
+            window
+                .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
+                .and_then(|(surface, loc)| {
+                    if Self::is_window_root_surface(window, &surface)
+                        || self.surface_has_popup_ancestor_for_hit_test(&surface)
+                    {
                         return None;
                     }
+                    Some((surface, loc.to_f64() + location.to_f64()))
+                })
+        })
+    }
+
+    fn window_popup_surface_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        self.windows_top_to_bottom().into_iter().find_map(|window| {
+            let location = self.space.element_location(window)?;
+
+            if let Some(decoration) = self.window_decorations.get(window) {
+                if !decoration.managed_window_allows_input() {
+                    return None;
                 }
                 let local_pos = inverse_transform_point(
                     pos,
