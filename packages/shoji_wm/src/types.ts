@@ -22,12 +22,69 @@ export type WaylandLayerKind =
   | "top"
   | "overlay";
 
+export type WaylandLayerEdge = "top" | "bottom" | "left" | "right";
+
+export type WaylandLayerKeyboardInteractivity =
+  | "none"
+  | "onDemand"
+  | "exclusive";
+
+/**
+ * Anchored edges. `true` for each edge the client requested. A layer with all
+ * four `true` means it stretches across the entire output; `top + bottom +
+ * left` for example pins to three edges and stretches vertically.
+ */
+export interface WaylandLayerAnchor {
+  readonly top: boolean;
+  readonly bottom: boolean;
+  readonly left: boolean;
+  readonly right: boolean;
+}
+
+/**
+ * Exclusive-zone request from the client. See `zwlr_layer_surface_v1`.
+ *
+ * - `exclusive` — surface reserves `size` logical pixels along its anchored
+ *   edge; other surfaces avoid this strip.
+ * - `neutral` — surface participates in avoidance but reserves nothing.
+ * - `dontCare` — surface opts out; compositor may extend it under reserved
+ *   zones.
+ */
+export type WaylandLayerExclusiveZone =
+  | { readonly mode: "exclusive"; readonly size: number }
+  | { readonly mode: "neutral" }
+  | { readonly mode: "dontCare" };
+
+export interface WaylandLayerMargin {
+  readonly top: number;
+  readonly right: number;
+  readonly bottom: number;
+  readonly left: number;
+}
+
+export interface WaylandLayerDesiredSize {
+  readonly width: number;
+  readonly height: number;
+}
+
 export interface WaylandLayerSnapshot {
   readonly id: string;
   readonly namespace?: string;
   readonly layer: WaylandLayerKind;
   readonly outputName: string;
   readonly position: LayerPosition;
+  readonly anchor: WaylandLayerAnchor;
+  readonly exclusiveZone: WaylandLayerExclusiveZone;
+  /**
+   * The single edge the client wants its exclusive zone applied to (since
+   * layer-shell v5). `null` when the client did not select an unambiguous
+   * edge — fall back to the implicit edge derived from `anchor`.
+   */
+  readonly exclusiveEdge: WaylandLayerEdge | null;
+  readonly margin: WaylandLayerMargin;
+  readonly keyboardInteractivity: WaylandLayerKeyboardInteractivity;
+  /** Size the client asked for in its layer-shell `set_size` request. */
+  readonly desiredSize: WaylandLayerDesiredSize;
 }
 
 export type MaybeSignal<T> = T | import("./signals").ReadonlySignal<T>;
@@ -65,6 +122,12 @@ export interface WaylandLayer {
   readonly layer: import("./signals").ReadonlySignal<WaylandLayerKind>;
   readonly outputName: import("./signals").ReadonlySignal<string>;
   readonly position: LayerPosition;
+  readonly anchor: import("./signals").ReadonlySignal<WaylandLayerAnchor>;
+  readonly exclusiveZone: import("./signals").ReadonlySignal<WaylandLayerExclusiveZone>;
+  readonly exclusiveEdge: import("./signals").ReadonlySignal<WaylandLayerEdge | null>;
+  readonly margin: import("./signals").ReadonlySignal<WaylandLayerMargin>;
+  readonly keyboardInteractivity: import("./signals").ReadonlySignal<WaylandLayerKeyboardInteractivity>;
+  readonly desiredSize: import("./signals").ReadonlySignal<WaylandLayerDesiredSize>;
   readonly animation: import("./animation").AnimationController;
   effect: CompiledEffectHandle | null;
 }
@@ -395,6 +458,66 @@ export interface OutputController {
   applyDisplayConfig(mutator: (display: DisplayConfigDraft) => void): void;
 }
 
+/** Logical-pixel insets reserved by exclusive-zone layers on each edge. */
+export interface LayerInsets {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
+/** Optional filter for usableArea/reservedInsets computations. */
+export interface UsableAreaOptions {
+  /**
+   * If supplied, only layers for which `filter(layer)` returns `true` are
+   * considered when summing exclusive zones. Use this to ignore overlays,
+   * scope to a namespace, etc.
+   */
+  filter?: (layer: WaylandLayerSnapshot) => boolean;
+}
+
+/**
+ * Read-only view onto the layer-shell surfaces the compositor currently has
+ * mapped. Snapshots reflect committed protocol state — anchor, exclusive
+ * zone, margins, keyboard-interactivity — so config code can answer
+ * questions like "how much vertical space is reserved on DP-1?" without
+ * tracking lifecycle events itself.
+ *
+ * The controller is intentionally read-only for now. Per-layer actions
+ * (focus, dismiss, …) and compositor-side placement will land on this same
+ * surface later — adding them is non-breaking.
+ */
+export interface LayerController {
+  /** Ids of every currently-mapped layer surface. */
+  readonly list: string[];
+  /** All current layer snapshots, keyed by id. */
+  readonly current: Record<string, WaylandLayerSnapshot>;
+  /** Snapshots filtered to a single output (matched by `Output.name()`). */
+  forOutput(outputName: string): WaylandLayerSnapshot[];
+  /**
+   * Output rect minus the area reserved by exclusive-zone layers. Returns
+   * the usable rectangle in global logical coordinates, suitable for
+   * placing windows without occluding bars / docks / panels.
+   *
+   * Returns `null` when the output isn't registered or has no current
+   * resolution (so its logical size can't be derived).
+   */
+  usableArea(
+    outputName: string,
+    options?: UsableAreaOptions,
+  ): WindowPosition | null;
+  /**
+   * Per-edge reserved pixels for `outputName`. Useful when you want to do
+   * your own arithmetic on the bare numbers (e.g., snap a tile `+8px` below
+   * the top bar). Always returns an object; missing outputs or empty layer
+   * sets yield zero insets.
+   */
+  reservedInsets(
+    outputName: string,
+    options?: UsableAreaOptions,
+  ): LayerInsets;
+}
+
 export type ProcessEnv = Record<string, string>;
 
 /**
@@ -627,6 +750,7 @@ export interface WindowManagerDefinition {
   key: KeyBindingController;
   pointer: PointerController;
   window: WindowManagerWindowController;
+  layer: LayerController;
   display?: DisplayConfig;
 }
 
@@ -678,6 +802,12 @@ export interface ReactiveWaylandLayerSignals {
   positionY: import("./signals").ReadonlySignal<number>;
   positionWidth: import("./signals").ReadonlySignal<number>;
   positionHeight: import("./signals").ReadonlySignal<number>;
+  anchor: import("./signals").ReadonlySignal<WaylandLayerAnchor>;
+  exclusiveZone: import("./signals").ReadonlySignal<WaylandLayerExclusiveZone>;
+  exclusiveEdge: import("./signals").ReadonlySignal<WaylandLayerEdge | null>;
+  margin: import("./signals").ReadonlySignal<WaylandLayerMargin>;
+  keyboardInteractivity: import("./signals").ReadonlySignal<WaylandLayerKeyboardInteractivity>;
+  desiredSize: import("./signals").ReadonlySignal<WaylandLayerDesiredSize>;
 }
 
 export interface ReactiveWaylandWindow extends WaylandWindow {

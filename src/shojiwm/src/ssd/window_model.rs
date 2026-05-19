@@ -7,7 +7,10 @@ use smithay::{
     },
     wayland::{
         compositor::with_states,
-        shell::wlr_layer::Layer as WlrLayer,
+        shell::wlr_layer::{
+            Anchor as WlrAnchor, ExclusiveZone as WlrExclusiveZone,
+            KeyboardInteractivity as WlrKeyboardInteractivity, Layer as WlrLayer,
+        },
         shell::xdg::{SurfaceCachedState, XdgToplevelSurfaceData},
     },
 };
@@ -190,6 +193,65 @@ pub struct WaylandLayerSnapshot {
     pub layer: LayerKindSnapshot,
     pub output_name: String,
     pub position: LayerPositionSnapshot,
+    pub anchor: LayerAnchorSnapshot,
+    pub exclusive_zone: LayerExclusiveZoneSnapshot,
+    pub exclusive_edge: Option<LayerEdgeSnapshot>,
+    pub margin: LayerMarginSnapshot,
+    pub keyboard_interactivity: KeyboardInteractivitySnapshot,
+    pub desired_size: LayerDesiredSizeSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayerAnchorSnapshot {
+    pub top: bool,
+    pub bottom: bool,
+    pub left: bool,
+    pub right: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "mode", rename_all = "camelCase")]
+pub enum LayerExclusiveZoneSnapshot {
+    /// Surface reserves `size` logical pixels along its anchored edge.
+    Exclusive { size: u32 },
+    /// Surface participates in exclusive-zone avoidance but reserves nothing.
+    Neutral,
+    /// Surface opts out — compositor may extend it to anchored edges.
+    DontCare,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayerEdgeSnapshot {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LayerMarginSnapshot {
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+    pub left: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KeyboardInteractivitySnapshot {
+    None,
+    OnDemand,
+    Exclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LayerDesiredSizeSnapshot {
+    pub width: i32,
+    pub height: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -512,6 +574,7 @@ impl ShojiWM {
         layer: &LayerSurface,
         geometry: smithay::utils::Rectangle<i32, smithay::utils::Logical>,
     ) -> WaylandLayerSnapshot {
+        let state = layer.cached_state();
         WaylandLayerSnapshot {
             id: layer_runtime_id(layer),
             namespace: Some(layer.namespace().to_string()),
@@ -527,6 +590,35 @@ impl ShojiWM {
                 y: geometry.loc.y,
                 width: geometry.size.w,
                 height: geometry.size.h,
+            },
+            anchor: LayerAnchorSnapshot {
+                top: state.anchor.contains(WlrAnchor::TOP),
+                bottom: state.anchor.contains(WlrAnchor::BOTTOM),
+                left: state.anchor.contains(WlrAnchor::LEFT),
+                right: state.anchor.contains(WlrAnchor::RIGHT),
+            },
+            exclusive_zone: match state.exclusive_zone {
+                WlrExclusiveZone::Exclusive(size) => {
+                    LayerExclusiveZoneSnapshot::Exclusive { size }
+                }
+                WlrExclusiveZone::Neutral => LayerExclusiveZoneSnapshot::Neutral,
+                WlrExclusiveZone::DontCare => LayerExclusiveZoneSnapshot::DontCare,
+            },
+            exclusive_edge: state.exclusive_edge.and_then(anchor_to_edge_snapshot),
+            margin: LayerMarginSnapshot {
+                top: state.margin.top,
+                right: state.margin.right,
+                bottom: state.margin.bottom,
+                left: state.margin.left,
+            },
+            keyboard_interactivity: match state.keyboard_interactivity {
+                WlrKeyboardInteractivity::None => KeyboardInteractivitySnapshot::None,
+                WlrKeyboardInteractivity::OnDemand => KeyboardInteractivitySnapshot::OnDemand,
+                WlrKeyboardInteractivity::Exclusive => KeyboardInteractivitySnapshot::Exclusive,
+            },
+            desired_size: LayerDesiredSizeSnapshot {
+                width: state.size.w,
+                height: state.size.h,
             },
         }
     }
@@ -598,6 +690,20 @@ pub fn layer_runtime_id(layer: &LayerSurface) -> String {
         .map(|client| format!("{:?}", client.id()))
         .unwrap_or_else(|| "unknown-client".to_string());
     format!("{client_id}:{protocol_id}")
+}
+
+/// Reduce an `Anchor` bitset (smithay) to the single edge a layer wants its
+/// exclusive zone applied to. Returns `None` for ambiguous combinations (e.g.
+/// corners or empty), since the layer-shell `exclusive_edge` field is only
+/// meaningful when one edge is chosen.
+fn anchor_to_edge_snapshot(anchor: WlrAnchor) -> Option<LayerEdgeSnapshot> {
+    match anchor {
+        a if a == WlrAnchor::TOP => Some(LayerEdgeSnapshot::Top),
+        a if a == WlrAnchor::BOTTOM => Some(LayerEdgeSnapshot::Bottom),
+        a if a == WlrAnchor::LEFT => Some(LayerEdgeSnapshot::Left),
+        a if a == WlrAnchor::RIGHT => Some(LayerEdgeSnapshot::Right),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

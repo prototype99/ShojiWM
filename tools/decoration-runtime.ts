@@ -64,6 +64,7 @@ import {
   type PointerMoveEvent,
   type RuntimeEventConfig,
   updateOutputState,
+  updateLayerSnapshots,
   type WaylandLayerSnapshot,
   type WaylandLayer,
   type WaylandWindowActions,
@@ -1131,6 +1132,7 @@ function syncLayerSnapshots(
   events: WindowManagerEventController,
   snapshots: WaylandLayerSnapshot[],
 ): void {
+  updateLayerSnapshots(snapshots);
   const nextIds = new Set(snapshots.map((snapshot) => snapshot.id));
 
   for (const snapshot of snapshots) {

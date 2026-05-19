@@ -82,8 +82,17 @@ import type {
   ReactiveWaylandLayerHandle,
   ReactiveWaylandLayerSignals,
   WaylandLayer,
+  WaylandLayerAnchor,
+  WaylandLayerDesiredSize,
+  WaylandLayerEdge,
+  WaylandLayerExclusiveZone,
+  WaylandLayerKeyboardInteractivity,
   WaylandLayerKind,
+  WaylandLayerMargin,
   WaylandLayerSnapshot,
+  LayerController,
+  LayerInsets,
+  UsableAreaOptions,
   StartupOnceSpec,
   StartupProcessRunPolicy,
   StartupServiceSpec,
@@ -109,6 +118,7 @@ import {
   takePendingPointerConfig,
 } from "./pointer";
 import { OUTPUT_CONTROLLER } from "./output";
+import { LAYER_CONTROLLER, updateLayerSnapshots } from "./layer";
 import {
   PROCESS_CONTROLLER,
   beginProcessConfigRegistration,
@@ -208,6 +218,7 @@ export {
   takePendingDisplayConfig,
   updateOutputState,
 } from "./output";
+export { LAYER_CONTROLLER, updateLayerSnapshots } from "./layer";
 export {
   KEY_BINDING_CONTROLLER,
   beginKeyBindingRegistration,
@@ -386,8 +397,17 @@ export type {
   ReactiveWaylandLayerHandle,
   ReactiveWaylandLayerSignals,
   WaylandLayer,
+  WaylandLayerAnchor,
+  WaylandLayerDesiredSize,
+  WaylandLayerEdge,
+  WaylandLayerExclusiveZone,
+  WaylandLayerKeyboardInteractivity,
   WaylandLayerKind,
+  WaylandLayerMargin,
   WaylandLayerSnapshot,
+  LayerController,
+  LayerInsets,
+  UsableAreaOptions,
   StartupOnceSpec,
   StartupProcessRunPolicy,
   StartupServiceSpec,
@@ -449,6 +469,7 @@ export const WINDOW_MANAGER: WindowManagerDefinition = {
   key: KEY_BINDING_CONTROLLER,
   pointer: POINTER_CONTROLLER,
   window: WINDOW_CONTROLLER,
+  layer: LAYER_CONTROLLER,
 };
 
 export function windowAction(

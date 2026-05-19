@@ -6,7 +6,13 @@ import type {
   LayerPosition,
   ReactiveWaylandLayer,
   ReactiveWaylandLayerHandle,
+  WaylandLayerAnchor,
+  WaylandLayerDesiredSize,
+  WaylandLayerEdge,
+  WaylandLayerExclusiveZone,
+  WaylandLayerKeyboardInteractivity,
   WaylandLayerKind,
+  WaylandLayerMargin,
   WaylandLayerSnapshot,
 } from "./types";
 
@@ -19,6 +25,12 @@ interface MutableLayerSignals {
   positionY: Signal<number>;
   positionWidth: Signal<number>;
   positionHeight: Signal<number>;
+  anchor: Signal<WaylandLayerAnchor>;
+  exclusiveZone: Signal<WaylandLayerExclusiveZone>;
+  exclusiveEdge: Signal<WaylandLayerEdge | null>;
+  margin: Signal<WaylandLayerMargin>;
+  keyboardInteractivity: Signal<WaylandLayerKeyboardInteractivity>;
+  desiredSize: Signal<WaylandLayerDesiredSize>;
 }
 
 export function createReactiveLayer(
@@ -34,6 +46,12 @@ export function createReactiveLayer(
     positionY: signal(snapshot.position.y),
     positionWidth: signal(snapshot.position.width),
     positionHeight: signal(snapshot.position.height),
+    anchor: signal(snapshot.anchor),
+    exclusiveZone: signal(snapshot.exclusiveZone),
+    exclusiveEdge: signal(snapshot.exclusiveEdge),
+    margin: signal(snapshot.margin),
+    keyboardInteractivity: signal(snapshot.keyboardInteractivity),
+    desiredSize: signal(snapshot.desiredSize),
   };
 
   let effect: CompiledEffectHandle | null = null;
@@ -63,6 +81,12 @@ export function createReactiveLayer(
     get position() {
       return position;
     },
+    anchor: signals.anchor,
+    exclusiveZone: signals.exclusiveZone,
+    exclusiveEdge: signals.exclusiveEdge,
+    margin: signals.margin,
+    keyboardInteractivity: signals.keyboardInteractivity,
+    desiredSize: signals.desiredSize,
     animation,
     get effect() {
       return effect;
@@ -85,6 +109,12 @@ export function createReactiveLayer(
       signals.positionY.value = nextSnapshot.position.y;
       signals.positionWidth.value = nextSnapshot.position.width;
       signals.positionHeight.value = nextSnapshot.position.height;
+      signals.anchor.value = nextSnapshot.anchor;
+      signals.exclusiveZone.value = nextSnapshot.exclusiveZone;
+      signals.exclusiveEdge.value = nextSnapshot.exclusiveEdge;
+      signals.margin.value = nextSnapshot.margin;
+      signals.keyboardInteractivity.value = nextSnapshot.keyboardInteractivity;
+      signals.desiredSize.value = nextSnapshot.desiredSize;
     },
   };
 }

@@ -119,6 +119,17 @@ export const OUTPUT_CONTROLLER: OutputController = {
   },
 };
 
+/**
+ * Internal: peek at the currently-stored snapshot for `outputName` without
+ * cloning. Callers MUST treat the result as read-only — mutating it would
+ * corrupt `OUTPUT_CONTROLLER.current`.
+ */
+export function peekOutputState(
+  outputName: string,
+): OutputStateSnapshot | undefined {
+  return currentOutputState[outputName];
+}
+
 export function getDesiredOutputConfig(): DisplayConfigDraft {
   return cloneDisplayDraft(desiredOutputConfig);
 }
