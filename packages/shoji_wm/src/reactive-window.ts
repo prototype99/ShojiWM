@@ -2,7 +2,7 @@ import { signal, type Signal } from "./signals";
 import { createWindowAnimationController, type WindowAnimationController } from "./animation";
 import { createWindowStateStore } from "./window-state";
 import type {
-  DecorationInteractionSnapshot,
+  WindowCompositionInteractionSnapshot,
   MaybeSignal,
   ReactiveWaylandWindow,
   ReactiveWaylandWindowHandle,
@@ -33,7 +33,7 @@ interface MutableWindowSignals {
   isTransient: Signal<boolean>;
   parentId: Signal<string | undefined>;
   icon: Signal<WindowIcon | undefined>;
-  interaction: Signal<DecorationInteractionSnapshot>;
+  interaction: Signal<WindowCompositionInteractionSnapshot>;
   transformOriginX: Signal<number>;
   transformOriginY: Signal<number>;
   transformTranslateX: Signal<number>;

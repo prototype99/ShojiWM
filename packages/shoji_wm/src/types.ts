@@ -13,7 +13,7 @@ export interface WaylandWindowSnapshot {
   readonly isTransient: boolean;
   readonly parentId?: string;
   readonly icon?: WindowIcon;
-  readonly interaction: DecorationInteractionSnapshot;
+  readonly interaction: WindowCompositionInteractionSnapshot;
 }
 
 export type WaylandLayerKind =
@@ -50,7 +50,7 @@ export interface WaylandWindow {
   readonly isTransient: import("./signals").ReadonlySignal<boolean>;
   readonly parentId: import("./signals").ReadonlySignal<string | undefined>;
   readonly icon: import("./signals").ReadonlySignal<WindowIcon | undefined>;
-  readonly interaction: import("./signals").ReadonlySignal<DecorationInteractionSnapshot>;
+  readonly interaction: import("./signals").ReadonlySignal<WindowCompositionInteractionSnapshot>;
   close(): void;
   maximize(): void;
   minimize(): void;
@@ -138,30 +138,30 @@ export interface ManagedWindowState {
 export type PrimitiveChild = string | number;
 export type WindowIcon = string | { name?: string; bytes?: Uint8Array };
 
-export interface DecorationInteractionSnapshot {
+export interface WindowCompositionInteractionSnapshot {
   hoveredIds: string[];
   activeIds: string[];
 }
 
 export type InteractionChangeHandler = (state: boolean) => void;
 
-export interface DecorationElementNode {
+export interface CompositionElementNode {
   kind: "element";
-  type: DecorationNodeType;
+  type: CompositionNodeType;
   key: string | number | null;
   props: Record<string, unknown>;
-  children: DecorationChild[];
+  children: CompositionChild[];
 }
 
-export type DecorationChild = DecorationElementNode | PrimitiveChild;
-export type DecorationRenderable =
-  | DecorationChild
+export type CompositionChild = CompositionElementNode | PrimitiveChild;
+export type CompositionRenderable =
+  | CompositionChild
   | null
   | undefined
   | false
   | true;
 
-export type DecorationNodeType =
+export type CompositionNodeType =
   | "Box"
   | "Label"
   | "Button"
@@ -174,14 +174,14 @@ export type DecorationNodeType =
   | "Fragment";
 
 export interface ComponentProps {
-  children?: DecorationRenderable | DecorationRenderable[];
+  children?: CompositionRenderable | CompositionRenderable[];
   onHoverChange?: InteractionChangeHandler;
   onActiveChange?: InteractionChangeHandler;
 }
 
 export type Component<TProps extends ComponentProps = ComponentProps> = (
   props: TProps,
-) => DecorationRenderable;
+) => CompositionRenderable;
 
 export type Direction = "row" | "column" | "horizontal" | "vertical";
 export type AlignItems = "start" | "center" | "end" | "stretch";
@@ -607,20 +607,19 @@ export interface WindowBorderProps extends ComponentProps {
   id?: string;
 }
 
-export type DecorationPhase = "preconfigure" | "render";
+export type WindowCompositionPhase = "preconfigure" | "render";
 
-export interface DecorationContext {
-  readonly phase: DecorationPhase;
+export interface WindowCompositionContext {
+  readonly phase: WindowCompositionPhase;
   readonly isPreview: boolean;
 }
 
-export type DecorationFunction = (
+export type WindowCompositionFunction = (
   window: WaylandWindow,
-  context: DecorationContext,
-) => DecorationRenderable;
+  context: WindowCompositionContext,
+) => CompositionRenderable;
 
 export interface WindowManagerDefinition {
-  decoration: DecorationFunction | null;
   event: import("./events").WindowManagerEventController;
   effect: WindowManagerEffectConfig;
   output: OutputController;
@@ -660,7 +659,7 @@ export interface ReactiveWaylandWindowSignals {
   isTransient: import("./signals").ReadonlySignal<boolean>;
   parentId: import("./signals").ReadonlySignal<string | undefined>;
   icon: import("./signals").ReadonlySignal<WindowIcon | undefined>;
-  interaction: import("./signals").ReadonlySignal<DecorationInteractionSnapshot>;
+  interaction: import("./signals").ReadonlySignal<WindowCompositionInteractionSnapshot>;
   transformOriginX: import("./signals").Signal<number>;
   transformOriginY: import("./signals").Signal<number>;
   transformTranslateX: import("./signals").Signal<number>;
@@ -700,9 +699,19 @@ export interface WaylandWindowActions {
 
 export interface WindowManagerWindowController {
   /**
+   * Per-window composition function. Returns the scene tree (chrome,
+   * managed-window placements, effects) for a given `WaylandWindow`. The
+   * compositor reevaluates this whenever the window's reactive inputs
+   * change, so signal reads inside the function automatically track
+   * dependencies.
+   *
+   * Set to `null` (the default) to leave windows undecorated.
+   */
+  composition: WindowCompositionFunction | null;
+  /**
    * Request keyboard focus for `window`. The compositor raises it, updates
    * keyboard focus, and emits the usual focus-changed notifications — so
-   * `isFocused` signals, decoration reevaluation, and
+   * `isFocused` signals, composition reevaluation, and
    * `WINDOW_MANAGER.event.onFocus` listeners all fire just as they would for
    * a user-initiated focus change.
    */
@@ -728,13 +737,13 @@ export interface WindowActionDescriptor {
   action: WindowActionType;
 }
 
-export type SerializableDecorationChild =
-  | SerializedDecorationNode
+export type SerializableCompositionChild =
+  | SerializedCompositionNode
   | PrimitiveChild;
 
-export interface SerializedDecorationNode {
-  kind: DecorationNodeType;
+export interface SerializedCompositionNode {
+  kind: CompositionNodeType;
   nodeId: string;
   props: Record<string, unknown>;
-  children: SerializableDecorationChild[];
+  children: SerializableCompositionChild[];
 }

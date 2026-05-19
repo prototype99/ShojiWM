@@ -1,5 +1,5 @@
 import { type WaylandWindow } from "shoji_wm";
-import { defaultWindowDecoration } from "shoji_wm/default-decoration";
+import { defaultWindowComposition } from "shoji_wm/default-composition";
 
-export const exampleDecoration = (window: WaylandWindow) =>
-  defaultWindowDecoration(window);
+export const exampleComposition = (window: WaylandWindow) =>
+  defaultWindowComposition(window);

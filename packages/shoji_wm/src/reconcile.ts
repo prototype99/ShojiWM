@@ -8,21 +8,21 @@ import {
   leaveWindowDependencyScope,
 } from "./runtime-hooks";
 import {
-  patchSerializedDecorationTree,
-  serializeDecorationTree,
-  type DecorationSerializationContext,
+  patchSerializedCompositionTree,
+  serializeCompositionTree,
+  type CompositionSerializationContext,
 } from "./serialize";
 import type {
-  DecorationChild,
-  DecorationContext,
-  DecorationElementNode,
-  DecorationRenderable,
-  DecorationFunction,
+  CompositionChild,
+  WindowCompositionContext,
+  CompositionElementNode,
+  CompositionRenderable,
+  WindowCompositionFunction,
   ManagedWindowProps,
   ManagedWindowRect,
   ManagedWindowState,
   ReactiveWaylandWindowHandle,
-  SerializableDecorationChild,
+  SerializableCompositionChild,
   WaylandWindowActions,
   WaylandWindowSnapshot,
   WindowPosition,
@@ -43,25 +43,25 @@ export interface WindowSnapshotDiff {
   xwayland: boolean;
 }
 
-export interface DecorationEvaluationResult {
-  tree: DecorationChild;
-  serialized: SerializableDecorationChild;
+export interface CompositionEvaluationResult {
+  tree: CompositionChild;
+  serialized: SerializableCompositionChild;
   transform: WindowTransform;
   managedWindow: ManagedWindowState;
   version: number;
 }
 
-export interface DecorationEvaluationCache {
+export interface CompositionEvaluationCache {
   readonly window: ReactiveWaylandWindowHandle["window"];
   readonly version: number;
-  readonly lastSerialized: SerializableDecorationChild;
-  readonly lastTree: DecorationChild;
+  readonly lastSerialized: SerializableCompositionChild;
+  readonly lastTree: CompositionChild;
   readonly lastTransform: WindowTransform;
   readonly lastManagedWindow: ManagedWindowState;
-  update(snapshot: WaylandWindowSnapshot): DecorationEvaluationResult | null;
-  reevaluate(dirtyNodeIds?: readonly string[]): DecorationEvaluationResult;
+  update(snapshot: WaylandWindowSnapshot): CompositionEvaluationResult | null;
+  reevaluate(dirtyNodeIds?: readonly string[]): CompositionEvaluationResult;
   invokeHandler(handlerId: string): boolean;
-  setContext(context: DecorationContext): void;
+  setContext(context: WindowCompositionContext): void;
 }
 
 export function diffWindowSnapshot(
@@ -103,33 +103,33 @@ export function diffWindowSnapshot(
 }
 
 /**
- * Minimal policy for when a decoration needs reevaluation.
+ * Minimal policy for when a composition tree needs reevaluation.
  *
  * This is intentionally structural:
  * runtime-only state such as focus and interaction is expected to flow through
  * signals and runtime dirty tracking rather than forcing a snapshot rebuild.
  */
-export function shouldReevaluateDecoration(
+export function shouldReevaluateComposition(
   previous: WaylandWindowSnapshot,
   next: WaylandWindowSnapshot,
 ): boolean {
   return diffWindowSnapshot(previous, next).changed;
 }
 
-export function createDecorationEvaluationCache(
+export function createCompositionEvaluationCache(
   snapshot: WaylandWindowSnapshot,
   actions: WaylandWindowActions,
-  evaluate: DecorationFunction,
+  evaluate: WindowCompositionFunction,
   animation?: WindowAnimationController,
-  initialContext: DecorationContext = { phase: "render", isPreview: false },
-): DecorationEvaluationCache {
+  initialContext: WindowCompositionContext = { phase: "render", isPreview: false },
+): CompositionEvaluationCache {
   const handle = createReactiveWindow(snapshot, actions, animation);
   const componentStateStore = createComponentStateStore();
 
   let currentSnapshot = snapshot;
   let version = 1;
-  let tree: DecorationChild;
-  let serialized: SerializableDecorationChild;
+  let tree: CompositionChild;
+  let serialized: SerializableCompositionChild;
   let transform: WindowTransform;
   let managedWindow: ManagedWindowState;
   let managedWindowProps: ManagedWindowProps | undefined;
@@ -138,7 +138,7 @@ export function createDecorationEvaluationCache(
   let runtimeHandlers = new Map<string, () => void>();
   const handlerIdsByKey = new Map<string, string>();
 
-  const serializationContext: DecorationSerializationContext = {
+  const serializationContext: CompositionSerializationContext = {
     registerClickHandler(key, handler) {
       const handlerId = handlerIdsByKey.get(key) ?? `click-${nextHandlerId++}`;
       handlerIdsByKey.set(key, handlerId);
@@ -153,7 +153,7 @@ export function createDecorationEvaluationCache(
     },
   };
 
-  const evaluateCurrentTree = (): DecorationEvaluationResult => {
+  const evaluateCurrentTree = (): CompositionEvaluationResult => {
     runtimeHandlers = new Map();
     enterWindowDependencyScope(currentSnapshot.id);
     try {
@@ -165,7 +165,7 @@ export function createDecorationEvaluationCache(
       managedWindow = extracted.managedWindow;
       managedWindowProps = extracted.props;
       handle.updateManagedWindow(managedWindow);
-      serialized = serializeDecorationTree(tree, serializationContext);
+      serialized = serializeCompositionTree(tree, serializationContext);
       transform = managedWindow.transform;
     } finally {
       leaveWindowDependencyScope();
@@ -181,7 +181,7 @@ export function createDecorationEvaluationCache(
     };
   };
 
-  const patchCurrentTree = (dirtyNodeIds: readonly string[]): DecorationEvaluationResult => {
+  const patchCurrentTree = (dirtyNodeIds: readonly string[]): CompositionEvaluationResult => {
     if (dirtyNodeIds.length === 0) {
       return evaluateCurrentTree();
     }
@@ -189,7 +189,7 @@ export function createDecorationEvaluationCache(
     enterWindowDependencyScope(currentSnapshot.id);
     try {
       const dirtyNodeIdSet = new Set(dirtyNodeIds);
-      serialized = patchSerializedDecorationTree(
+      serialized = patchSerializedCompositionTree(
         tree,
         serialized,
         dirtyNodeIdSet,
@@ -235,7 +235,7 @@ export function createDecorationEvaluationCache(
       return managedWindow;
     },
     update(nextSnapshot) {
-      if (!shouldReevaluateDecoration(currentSnapshot, nextSnapshot)) {
+      if (!shouldReevaluateComposition(currentSnapshot, nextSnapshot)) {
         handle.update(nextSnapshot);
         currentSnapshot = nextSnapshot;
         return null;
@@ -266,7 +266,7 @@ export function createDecorationEvaluationCache(
   };
 }
 
-function normalizeRootDecoration(rendered: DecorationRenderable): DecorationChild {
+function normalizeRootComposition(rendered: CompositionRenderable): CompositionChild {
   if (rendered == null || rendered === false || rendered === true) {
     return createElementNode("Fragment", {});
   }
@@ -275,14 +275,14 @@ function normalizeRootDecoration(rendered: DecorationRenderable): DecorationChil
 }
 
 function extractManagedWindowRoot(
-  rendered: DecorationRenderable,
+  rendered: CompositionRenderable,
   handle: ReactiveWaylandWindowHandle,
 ): {
-  tree: DecorationChild;
+  tree: CompositionChild;
   managedWindow: ManagedWindowState;
   props?: ManagedWindowProps;
 } {
-  const normalized = normalizeRootDecoration(rendered);
+  const normalized = normalizeRootComposition(rendered);
   if (!isManagedWindowNode(normalized)) {
     return {
       tree: normalized,
@@ -297,7 +297,7 @@ function extractManagedWindowRoot(
   };
 }
 
-function managedWindowChildrenAsRoot(node: DecorationElementNode): DecorationChild {
+function managedWindowChildrenAsRoot(node: CompositionElementNode): CompositionChild {
   if (node.children.length === 1) {
     return node.children[0] ?? createElementNode("Fragment", {});
   }
@@ -307,7 +307,7 @@ function managedWindowChildrenAsRoot(node: DecorationElementNode): DecorationChi
   });
 }
 
-function isManagedWindowNode(node: DecorationChild): node is DecorationElementNode {
+function isManagedWindowNode(node: CompositionChild): node is CompositionElementNode {
   return typeof node !== "string" && typeof node !== "number" && node.type === "ManagedWindow";
 }
 

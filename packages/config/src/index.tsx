@@ -26,7 +26,7 @@ import {
     createWindowState,
     createWindowStack,
 } from "shoji_wm";
-import type { DecorationRenderable, ManagedWindowRect, WindowPosition } from "shoji_wm/types";
+import type { CompositionRenderable, ManagedWindowRect, WindowPosition } from "shoji_wm/types";
 
 const NOCTALIA_SHELL_PATH = "/home/bea4dev/Documents/development/noctalia-shell-shojiwm";
 
@@ -194,7 +194,7 @@ WINDOW_MANAGER.event.onWindowMove((event) => {
     event.window.state[WINDOW_STATE_RECT].set(event.currentRect);
 });
 
-WINDOW_MANAGER.decoration = (window: WaylandWindow) => {
+WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
     const openVariable = window.animation.signal(openAnimation);
     const opacity = openVariable;
     const translateY = openVariable(variable => (1 - variable) * 200);
@@ -329,7 +329,7 @@ const CloseButton = ({ window }: { window: WaylandWindow }) => {
 
     const background = hover(hover => hover ? "#F08080" : "#F0808080");
 
-    var icon: DecorationRenderable | null = null;
+    var icon: CompositionRenderable | null = null;
     if (hover()) {
         icon = (
             <Image

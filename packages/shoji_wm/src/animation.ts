@@ -5,7 +5,7 @@ import { markWindowDirty } from "./runtime-hooks";
  * Stable token used to address a logical animation track on a per-window basis.
  *
  * Create the token once at module scope, then reuse it from event handlers and
- * decoration code.
+ * composition code.
  *
  * @example
  * ```ts

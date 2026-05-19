@@ -14,7 +14,7 @@ import {
 
 const TITLEBAR_HEIGHT = 30;
 
-export const defaultWindowDecoration = (window: WaylandWindow) => {
+export const defaultWindowComposition = (window: WaylandWindow) => {
   const isFocused = window.isFocused();
   const [closeHovered, setCloseHovered] = useState(false);
   const [closeActive, setCloseActive] = useState(false);

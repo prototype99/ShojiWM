@@ -1,8 +1,8 @@
 import type {
-  DecorationChild,
-  DecorationElementNode,
-  SerializableDecorationChild,
-  SerializedDecorationNode,
+  CompositionChild,
+  CompositionElementNode,
+  SerializableCompositionChild,
+  SerializedCompositionNode,
   WindowActionDescriptor,
 } from "./types";
 import { isSignal } from "./signals";
@@ -11,23 +11,23 @@ import {
   leaveWindowNodeDependencyScope,
 } from "./runtime-hooks";
 
-export class DecorationSerializationError extends Error {
+export class CompositionSerializationError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = "DecorationSerializationError";
+    this.name = "CompositionSerializationError";
   }
 }
 
-export interface DecorationSerializationContext {
+export interface CompositionSerializationContext {
   registerClickHandler(key: string, handler: () => void): string;
   registerInteractionHandler(key: string, handler: () => void): string;
 }
 
-export function serializeDecorationTree(
-  node: DecorationChild,
-  context?: DecorationSerializationContext,
+export function serializeCompositionTree(
+  node: CompositionChild,
+  context?: CompositionSerializationContext,
   path = "root",
-): SerializableDecorationChild {
+): SerializableCompositionChild {
   if (typeof node === "string" || typeof node === "number") {
     return node;
   }
@@ -35,18 +35,18 @@ export function serializeDecorationTree(
   return serializeElementNode(node, context, path);
 }
 
-export function patchSerializedDecorationTree(
-  node: DecorationChild,
-  previous: SerializableDecorationChild,
+export function patchSerializedCompositionTree(
+  node: CompositionChild,
+  previous: SerializableCompositionChild,
   dirtyNodeIds: ReadonlySet<string>,
-  context?: DecorationSerializationContext,
+  context?: CompositionSerializationContext,
   path = "root",
-): SerializableDecorationChild {
+): SerializableCompositionChild {
   if (typeof node === "string" || typeof node === "number") {
     return previous;
   }
   if (typeof previous === "string" || typeof previous === "number") {
-    return serializeDecorationTree(node, context, path);
+    return serializeCompositionTree(node, context, path);
   }
 
   const shouldReplaceSelf = dirtyNodeIds.has(path);
@@ -62,18 +62,18 @@ export function patchSerializedDecorationTree(
       const childPath = childNodePath(path, child, index);
       const previousChild = previous.children[index];
       if (previousChild === undefined) {
-        return serializeDecorationTree(child, context, childPath);
+        return serializeCompositionTree(child, context, childPath);
       }
-      return patchSerializedDecorationTree(child, previousChild, dirtyNodeIds, context, childPath);
+      return patchSerializedCompositionTree(child, previousChild, dirtyNodeIds, context, childPath);
     }),
   };
 }
 
 function serializeElementNode(
-  node: DecorationElementNode,
-  context?: DecorationSerializationContext,
+  node: CompositionElementNode,
+  context?: CompositionSerializationContext,
   path = "root",
-): SerializedDecorationNode {
+): SerializedCompositionNode {
   enterWindowNodeDependencyScope(path);
   try {
     return {
@@ -81,7 +81,7 @@ function serializeElementNode(
       nodeId: path,
       props: serializeProps(node.props, context, path),
       children: node.children.map((child, index) =>
-        serializeDecorationTree(child, context, childNodePath(path, child, index))
+        serializeCompositionTree(child, context, childNodePath(path, child, index))
       ),
     };
   } finally {
@@ -91,7 +91,7 @@ function serializeElementNode(
 
 function serializeProps(
   props: Record<string, unknown>,
-  context?: DecorationSerializationContext,
+  context?: CompositionSerializationContext,
   path = "root",
 ): Record<string, unknown> {
   const serialized: Record<string, unknown> = {};
@@ -126,7 +126,7 @@ function serializeProps(
     }
 
     if (typeof value === "function") {
-      throw new DecorationSerializationError(
+      throw new CompositionSerializationError(
         `function prop "${key}" is not serializable`,
       );
     }
@@ -139,13 +139,13 @@ function serializeProps(
 
 function serializeInteractionChangeHandler(
   value: unknown,
-  context: DecorationSerializationContext | undefined,
+  context: CompositionSerializationContext | undefined,
   handlerKey: string,
   propName: string,
 ): unknown {
   if (typeof value === "function") {
     if (!context) {
-      throw new DecorationSerializationError(
+      throw new CompositionSerializationError(
         `${propName} function handlers require a serialization context`,
       );
     }
@@ -162,14 +162,14 @@ function serializeInteractionChangeHandler(
     return undefined;
   }
 
-  throw new DecorationSerializationError(
+  throw new CompositionSerializationError(
     `${propName} must be a function handler`,
   );
 }
 
 function serializeOnClick(
   value: unknown,
-  context?: DecorationSerializationContext,
+  context?: CompositionSerializationContext,
   handlerKey?: string,
 ): unknown {
   if (isWindowActionDescriptor(value)) {
@@ -178,12 +178,12 @@ function serializeOnClick(
 
   if (typeof value === "function") {
     if (!context) {
-      throw new DecorationSerializationError(
+      throw new CompositionSerializationError(
         "onClick function handlers require a serialization context",
       );
     }
     if (!handlerKey) {
-      throw new DecorationSerializationError(
+      throw new CompositionSerializationError(
         "onClick function handlers require a stable handler key",
       );
     }
@@ -198,7 +198,7 @@ function serializeOnClick(
     return undefined;
   }
 
-  throw new DecorationSerializationError(
+  throw new CompositionSerializationError(
     "onClick must be a serializable window action descriptor or runtime handler",
   );
 }
@@ -233,7 +233,7 @@ function serializeValue(value: unknown): unknown {
         continue;
       }
       if (typeof nested === "function") {
-        throw new DecorationSerializationError(
+        throw new CompositionSerializationError(
           `function value at "${key}" is not serializable`,
         );
       }
@@ -242,14 +242,14 @@ function serializeValue(value: unknown): unknown {
     return serialized;
   }
 
-  throw new DecorationSerializationError(
+  throw new CompositionSerializationError(
     `unsupported prop value type: ${typeof value}`,
   );
 }
 
 function childNodePath(
   parentPath: string,
-  child: DecorationChild,
+  child: CompositionChild,
   index: number,
 ): string {
   if (typeof child === "string" || typeof child === "number") {

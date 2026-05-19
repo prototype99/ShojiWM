@@ -1,9 +1,9 @@
 import type {
   ComponentProps,
-  DecorationChild,
-  DecorationRenderable,
-  DecorationElementNode,
-  DecorationNodeType,
+  CompositionChild,
+  CompositionRenderable,
+  CompositionElementNode,
+  CompositionNodeType,
 } from "./types";
 import { computed, signal, type ReadonlySignal, type SignalTuple } from "./signals";
 
@@ -56,10 +56,10 @@ interface RefHookSlot<T> {
 }
 
 export function createElementNode(
-  type: DecorationNodeType,
+  type: CompositionNodeType,
   props: ComponentProps = {},
   key?: string | number | null,
-): DecorationElementNode {
+): CompositionElementNode {
   const { children, ...rest } = props;
 
   return {
@@ -71,7 +71,7 @@ export function createElementNode(
   };
 }
 
-export function normalizeChildren(children: unknown): DecorationChild[] {
+export function normalizeChildren(children: unknown): CompositionChild[] {
   if (children == null || children === false || children === true) {
     return [];
   }
@@ -80,7 +80,7 @@ export function normalizeChildren(children: unknown): DecorationChild[] {
     return children.flatMap(normalizeChildren);
   }
 
-  return [children as DecorationChild];
+  return [children as CompositionChild];
 }
 
 export function createComponentStateStore(): ComponentStateStore {
@@ -137,10 +137,10 @@ export function withComponentRenderRoot<T>(
 }
 
 export function renderComponent<TProps extends ComponentProps>(
-  type: (props: TProps) => DecorationRenderable,
+  type: (props: TProps) => CompositionRenderable,
   props: TProps,
   key?: string | number | null,
-): DecorationRenderable {
+): CompositionRenderable {
   const parentFrame = renderFrames[renderFrames.length - 1];
   const root = activeRenderRoot;
   if (!root) {

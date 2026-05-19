@@ -3,9 +3,9 @@ import { pathToFileURL } from "node:url";
 import { existsSync } from "node:fs";
 
 import {
-  createDecorationEvaluationCache,
+  createCompositionEvaluationCache,
   installAssetResolverBridge,
-  type DecorationFunction,
+  type WindowCompositionFunction,
   type WaylandWindowActions,
   type WaylandWindowSnapshot,
 } from "shoji_wm";
@@ -49,7 +49,7 @@ async function main() {
   const moduleUrl = pathToFileURL(resolve(configPath)).href;
   installAssetResolverBridge(findConfigRoot(configPath));
   const loaded = await import(moduleUrl);
-  const decoration = resolveDecoration(loaded);
+  const composition = resolveComposition(loaded);
 
   const actions: WaylandWindowActions = {
     close() {
@@ -72,28 +72,29 @@ async function main() {
     },
   };
 
-  const cache = createDecorationEvaluationCache(snapshot, actions, decoration);
+  const cache = createCompositionEvaluationCache(snapshot, actions, composition);
   const serialized = cache.reevaluate().serialized;
 
   console.log(JSON.stringify(serialized, null, 2));
 }
 
-function resolveDecoration(
+function resolveComposition(
   loaded: Record<string, unknown>,
-): DecorationFunction {
-  const maybeDecoration =
-    (loaded.WINDOW_MANAGER as { decoration?: DecorationFunction } | undefined)
-      ?.decoration ??
-    (loaded.default as { decoration?: DecorationFunction } | undefined)?.decoration ??
-    (loaded.decoration as DecorationFunction | undefined);
+): WindowCompositionFunction {
+  type WindowSlot = { composition?: WindowCompositionFunction };
+  type WmSlot = { window?: WindowSlot };
+  const maybeComposition =
+    (loaded.WINDOW_MANAGER as WmSlot | undefined)?.window?.composition ??
+    (loaded.default as WmSlot | undefined)?.window?.composition ??
+    (loaded.composition as WindowCompositionFunction | undefined);
 
-  if (!maybeDecoration) {
+  if (!maybeComposition) {
     throw new Error(
-      "config module did not export WINDOW_MANAGER.decoration",
+      "config module did not export WINDOW_MANAGER.window.composition",
     );
   }
 
-  return maybeDecoration;
+  return maybeComposition;
 }
 
 function findConfigRoot(entryPath: string): string {

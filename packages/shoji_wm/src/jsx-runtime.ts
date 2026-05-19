@@ -6,34 +6,34 @@ import type {
   ImageProps,
   ManagedWindowProps,
   ShaderEffectProps,
-  DecorationChild,
-  DecorationRenderable,
-  DecorationNodeType,
+  CompositionChild,
+  CompositionRenderable,
+  CompositionNodeType,
 } from "./types";
 
 export function jsx(
-  type: DecorationNodeType | Component<any>,
+  type: CompositionNodeType | Component<any>,
   props: ComponentProps,
   key?: string,
-): DecorationRenderable {
+): CompositionRenderable {
   return createJsxNode(type, props, key);
 }
 
 export function jsxs(
-  type: DecorationNodeType | Component<any>,
+  type: CompositionNodeType | Component<any>,
   props: ComponentProps,
   key?: string,
-): DecorationRenderable {
+): CompositionRenderable {
   return createJsxNode(type, props, key);
 }
 
-export const Fragment = "Fragment" satisfies DecorationNodeType;
+export const Fragment = "Fragment" satisfies CompositionNodeType;
 
 function createJsxNode(
-  type: DecorationNodeType | Component<any>,
+  type: CompositionNodeType | Component<any>,
   props: ComponentProps = {},
   key?: string,
-): DecorationRenderable {
+): CompositionRenderable {
   const normalizedProps = {
     ...props,
     children: normalizeChildren(props.children),
@@ -47,8 +47,8 @@ function createJsxNode(
 }
 
 export namespace JSX {
-  export type Element = DecorationRenderable;
-  export type ElementType = DecorationNodeType | Component<any>;
+  export type Element = CompositionRenderable;
+  export type ElementType = CompositionNodeType | Component<any>;
   export interface ElementChildrenAttribute {
     children: {};
   }
@@ -70,4 +70,4 @@ export namespace JSX {
   }
 }
 
-export type { DecorationChild };
+export type { CompositionChild };

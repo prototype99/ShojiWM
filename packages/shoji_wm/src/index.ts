@@ -3,16 +3,16 @@ import type {
   ImageProps,
   Component,
   ComponentProps,
-  DecorationInteractionSnapshot,
-  DecorationContext,
-  DecorationFunction,
-  DecorationPhase,
-  DecorationChild,
-  DecorationElementNode,
+  WindowCompositionInteractionSnapshot,
+  WindowCompositionContext,
+  WindowCompositionFunction,
+  WindowCompositionPhase,
+  CompositionChild,
+  CompositionElementNode,
   ReactiveWaylandWindow,
   ReactiveWaylandWindowHandle,
   ReactiveWaylandWindowSignals,
-  DecorationNodeType,
+  CompositionNodeType,
   DisplayConfig,
   DisplayConfigDraft,
   DisplayModePreference,
@@ -59,8 +59,8 @@ import type {
   WindowEffectAssignment,
   WindowEffectHandle,
   WindowSourceHandle,
-  SerializableDecorationChild,
-  SerializedDecorationNode,
+  SerializableCompositionChild,
+  SerializedCompositionNode,
   WindowActionDescriptor,
   WindowActionType,
   WindowBorderProps,
@@ -120,7 +120,7 @@ import {
 import { createElementNode } from "./runtime";
 import { computed as createComputedSignal, isSignal as isReadonlySignal } from "./signals";
 import { resolveAssetPath } from "./shader";
-import { serializeDecorationTree } from "./serialize";
+import { serializeCompositionTree } from "./serialize";
 export {
   advanceAnimationFrame,
   hasActiveAnimations,
@@ -243,11 +243,11 @@ export {
   withComponentRenderRoot,
 } from "./runtime";
 export {
-  createDecorationEvaluationCache,
+  createCompositionEvaluationCache,
   diffWindowSnapshot,
-  shouldReevaluateDecoration,
-  type DecorationEvaluationCache,
-  type DecorationEvaluationResult,
+  shouldReevaluateComposition,
+  type CompositionEvaluationCache,
+  type CompositionEvaluationResult,
   type WindowSnapshotDiff,
 } from "./reconcile";
 export {
@@ -310,16 +310,16 @@ export type {
   ImageFit,
   ImageProps,
   Component,
-  DecorationInteractionSnapshot,
-  DecorationContext,
-  DecorationFunction,
-  DecorationPhase,
-  DecorationChild,
-  DecorationElementNode,
+  WindowCompositionInteractionSnapshot,
+  WindowCompositionContext,
+  WindowCompositionFunction,
+  WindowCompositionPhase,
+  CompositionChild,
+  CompositionElementNode,
   ReactiveWaylandWindow,
   ReactiveWaylandWindowHandle,
   ReactiveWaylandWindowSignals,
-  DecorationNodeType,
+  CompositionNodeType,
   DisplayConfig,
   DisplayModePreference,
   EffectInvalidationPolicyHandle,
@@ -363,8 +363,8 @@ export type {
   WindowEffectAssignment,
   WindowEffectHandle,
   WindowSourceHandle,
-  SerializableDecorationChild,
-  SerializedDecorationNode,
+  SerializableCompositionChild,
+  SerializedCompositionNode,
   WindowActionDescriptor,
   WindowActionType,
   WindowBorderProps,
@@ -398,9 +398,9 @@ export type {
   KeyBindingEventPhase,
   PointerController,
 } from "./types";
-export { DecorationSerializationError, serializeDecorationTree } from "./serialize";
+export { CompositionSerializationError, serializeCompositionTree } from "./serialize";
 
-export type DecorationNode = DecorationChild;
+export type CompositionNode = CompositionChild;
 
 /**
  * M2-T2 note:
@@ -430,6 +430,7 @@ export const Window = ClientWindow;
 export const WindowBorder = defineIntrinsicComponent<WindowBorderProps>("WindowBorder");
 
 const WINDOW_CONTROLLER: WindowManagerWindowController = {
+  composition: null,
   focus(window) {
     window.focus();
   },
@@ -439,7 +440,6 @@ const WINDOW_CONTROLLER: WindowManagerWindowController = {
  * Placeholder namespace for future WM-level entrypoints.
  */
 export const WINDOW_MANAGER: WindowManagerDefinition = {
-  decoration: null,
   event: createWindowManagerEventController(),
   effect: {
     background_effect: null,
@@ -461,9 +461,9 @@ export function windowAction(
 }
 
 function defineIntrinsicComponent<TProps extends ComponentProps>(
-  type: DecorationNodeType,
+  type: CompositionNodeType,
 ): Component<TProps> {
-  return function IntrinsicComponent(props: TProps): DecorationElementNode {
+  return function IntrinsicComponent(props: TProps): CompositionElementNode {
     return createElementNode(type, props as Record<string, unknown>);
   };
 }

@@ -28,8 +28,8 @@ import {
   type CompiledEffectHandle,
   createReactiveLayer,
   createWindowAnimationControllerWithStore,
-  createDecorationEvaluationCache,
-  type DecorationContext,
+  createCompositionEvaluationCache,
+  type WindowCompositionContext,
   createManagedPoll,
   dropLayerDependencies,
   dropWindowDependencies,
@@ -52,9 +52,9 @@ import {
   takeDirtyWindowNodeIds,
   type WindowManagerEventController,
   installSchedulerBridge,
-  type DecorationEvaluationCache,
+  type CompositionEvaluationCache,
   type DisplayConfigDraft,
-  type DecorationFunction,
+  type WindowCompositionFunction,
   type OutputStateSnapshot,
   type PollCallback,
   type PollDirtyMode,
@@ -403,7 +403,7 @@ interface RuntimeLayerEffectAssignment {
 
 interface RuntimeEffectConfig {
   background_effect: CompiledEffectHandle | null;
-  window?: (window: ReturnType<typeof createDecorationEvaluationCache>["window"]) => WindowEffectAssignment | null;
+  window?: (window: ReturnType<typeof createCompositionEvaluationCache>["window"]) => WindowEffectAssignment | null;
 }
 
 interface RuntimeProcessConfigEntry {
@@ -489,19 +489,19 @@ let nextPollId = 1;
 let currentSchedulerTimeMs = 0;
 let lastAnimationAdvanceMs: number | undefined;
 
-const RENDER_DECORATION_CONTEXT: DecorationContext = {
+const RENDER_COMPOSITION_CONTEXT: WindowCompositionContext = {
   phase: "render",
   isPreview: false,
 };
 
-const PRECONFIGURE_DECORATION_CONTEXT: DecorationContext = {
+const PRECONFIGURE_COMPOSITION_CONTEXT: WindowCompositionContext = {
   phase: "preconfigure",
   isPreview: true,
 };
 
 interface RuntimeCacheEntry {
   latestSnapshot: WaylandWindowSnapshot;
-  cache: DecorationEvaluationCache;
+  cache: CompositionEvaluationCache;
   animationEntries: Map<symbol, unknown>;
   pendingActions: RuntimeWindowAction[];
   closeAnimationDurationMs: number;
@@ -556,7 +556,7 @@ function beginRuntimeTurn(nowMs: number): void {
   // A runtime turn may evaluate declarations or run user handlers, both of
   // which can start animations. Synchronizing once at the turn boundary keeps
   // every newly-created timeline anchored to the compositor timestamp for this
-  // request instead of the previous decoration evaluation.
+  // request instead of the previous composition evaluation.
   advanceAnimationFrame(nowMs);
 }
 
@@ -564,7 +564,7 @@ async function main() {
   const configPath = process.argv[2];
   const socketPath = process.argv[3];
   if (!configPath) {
-    throw new Error("usage: tsx tools/decoration-runtime.ts <config-path> [socket-path]");
+    throw new Error("usage: tsx tools/composition-runtime.ts <config-path> [socket-path]");
   }
   installRuntimeConsoleBridge();
 
@@ -596,7 +596,7 @@ async function main() {
     commitPointerConfigRegistration();
     commitProcessConfigRegistration();
   });
-  const decoration = resolveDecoration(loaded);
+  const composition = resolveComposition(loaded);
   const events = resolveEvents(loaded);
   const effectConfig = resolveEffectConfig(loaded);
 
@@ -624,8 +624,8 @@ async function main() {
       }
       if (request.kind === "evaluate" || request.kind === "evaluatePreview") {
         const result = request.kind === "evaluate"
-          ? evaluateSnapshot(decoration, events, effectConfig, request.snapshot, request.nowMs)
-          : evaluatePreconfigure(decoration, events, effectConfig, request.snapshot);
+          ? evaluateSnapshot(composition, events, effectConfig, request.snapshot, request.nowMs)
+          : evaluatePreconfigure(composition, events, effectConfig, request.snapshot);
         const keyBindingConfig = pendingKeyBindingConfigPayload();
         const pointerConfig = pendingPointerConfigPayload();
         const eventConfig = pendingEventConfigPayload(events);
@@ -892,7 +892,7 @@ function evaluateCached(
 }
 
 function evaluateSnapshot(
-  decoration: DecorationFunction,
+  composition: WindowCompositionFunction,
   events: WindowManagerEventController,
   effectConfig: RuntimeEffectConfig,
   snapshot: WaylandWindowSnapshot,
@@ -905,7 +905,7 @@ function evaluateSnapshot(
 } {
   const existing = cacheByWindowId.get(snapshot.id);
   if (!existing) {
-    const entry = createRuntimeCacheEntry(snapshot, decoration, RENDER_DECORATION_CONTEXT);
+    const entry = createRuntimeCacheEntry(snapshot, composition, RENDER_COMPOSITION_CONTEXT);
     cacheByWindowId.set(snapshot.id, entry);
     if (!openedWindowIds.has(snapshot.id)) {
       openedWindowIds.add(snapshot.id);
@@ -925,7 +925,7 @@ function evaluateSnapshot(
     reanchorAnimationEntries(existing.animationEntries, nowMs);
     dirtyWindowIds.add(snapshot.id);
   }
-  existing.cache.setContext(RENDER_DECORATION_CONTEXT);
+  existing.cache.setContext(RENDER_COMPOSITION_CONTEXT);
 
   const focusChanged = existing.latestSnapshot.isFocused !== snapshot.isFocused;
   existing.latestSnapshot = snapshot;
@@ -950,7 +950,7 @@ function evaluateSnapshot(
 }
 
 function evaluatePreconfigure(
-  decoration: DecorationFunction,
+  composition: WindowCompositionFunction,
   events: WindowManagerEventController,
   effectConfig: RuntimeEffectConfig,
   snapshot: WaylandWindowSnapshot,
@@ -967,7 +967,7 @@ function evaluatePreconfigure(
   // compositor timestamp, preventing open animations from appearing halfway through.
   let entry = cacheByWindowId.get(snapshot.id);
   if (!entry) {
-    entry = createRuntimeCacheEntry(snapshot, decoration, PRECONFIGURE_DECORATION_CONTEXT);
+    entry = createRuntimeCacheEntry(snapshot, composition, PRECONFIGURE_COMPOSITION_CONTEXT);
     cacheByWindowId.set(snapshot.id, entry);
     if (!openedWindowIds.has(snapshot.id)) {
       openedWindowIds.add(snapshot.id);
@@ -975,7 +975,7 @@ function evaluatePreconfigure(
     }
     events.emitFocus(entry.cache.window, snapshot.isFocused);
   } else {
-    entry.cache.setContext(PRECONFIGURE_DECORATION_CONTEXT);
+    entry.cache.setContext(PRECONFIGURE_COMPOSITION_CONTEXT);
     const focusChanged = entry.latestSnapshot.isFocused !== snapshot.isFocused;
     entry.latestSnapshot = snapshot;
     entry.cache.update(snapshot);
@@ -1028,8 +1028,8 @@ function reanchorAnimationEntries(entries: Map<symbol, unknown>, nowMs: number):
 
 function createRuntimeCacheEntry(
   snapshot: WaylandWindowSnapshot,
-  decoration: DecorationFunction,
-  context: DecorationContext = RENDER_DECORATION_CONTEXT,
+  composition: WindowCompositionFunction,
+  context: WindowCompositionContext = RENDER_COMPOSITION_CONTEXT,
 ): RuntimeCacheEntry {
   let latestSnapshot = snapshot;
   const actions: WaylandWindowActions = {
@@ -1060,7 +1060,7 @@ function createRuntimeCacheEntry(
     snapshot.id,
     animationEntries as Map<symbol, never>,
   );
-  const cache = createDecorationEvaluationCache(snapshot, actions, decoration, animation, context);
+  const cache = createCompositionEvaluationCache(snapshot, actions, composition, animation, context);
   const entry: RuntimeCacheEntry = {
     latestSnapshot,
     cache,
@@ -1565,7 +1565,7 @@ function invokeHandler(
   const actions = entry.pendingActions.splice(0, entry.pendingActions.length);
   if (process.env.SHOJI_SSD_HANDLER_DEBUG) {
     console.debug(
-      "runtime handler decoration result",
+      "runtime handler composition result",
       JSON.stringify({
         windowId,
         handlerId,
@@ -1644,22 +1644,23 @@ function drainPendingActions(): RuntimeWindowAction[] {
   return actions;
 }
 
-function resolveDecoration(
+function resolveComposition(
   loaded: Record<string, unknown>,
-): DecorationFunction {
-  const maybeDecoration =
-    (loaded.WINDOW_MANAGER as { decoration?: DecorationFunction } | undefined)
-      ?.decoration ??
-    (loaded.default as { decoration?: DecorationFunction } | undefined)?.decoration ??
-    (loaded.decoration as DecorationFunction | undefined);
+): WindowCompositionFunction {
+  type WindowSlot = { composition?: WindowCompositionFunction };
+  type WmSlot = { window?: WindowSlot };
+  const maybeComposition =
+    (loaded.WINDOW_MANAGER as WmSlot | undefined)?.window?.composition ??
+    (loaded.default as WmSlot | undefined)?.window?.composition ??
+    (loaded.composition as WindowCompositionFunction | undefined);
 
-  if (!maybeDecoration) {
+  if (!maybeComposition) {
     throw new Error(
-      "config module did not export WINDOW_MANAGER.decoration",
+      "config module did not export WINDOW_MANAGER.window.composition",
     );
   }
 
-  return maybeDecoration;
+  return maybeComposition;
 }
 
 function resolveEvents(
