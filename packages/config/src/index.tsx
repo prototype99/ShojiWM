@@ -25,8 +25,6 @@ import {
     ManagedWindow,
     createWindowState,
     createWindowStack,
-    createManagedPoll,
-    type PollHandle,
 } from "shoji_wm";
 import type { DecorationRenderable, ManagedWindowRect, WindowPosition } from "shoji_wm/types";
 
@@ -148,173 +146,11 @@ const DEFAULT_WINDOW_RECT: WindowPosition = { x: 100, y: 200, width: 1000, heigh
 const WINDOW_STATE_RECT = createWindowState<ManagedWindowRect>("rect", {
     default: (window) => window.rect ?? DEFAULT_WINDOW_RECT,
 });
-const WINDOW_STATE_HOCKEY_TINT = createWindowState<number>("hockeyTint", {
-    default: 0,
-});
 const windowStack = createWindowStack();
-
-// Lower values keep momentum longer. Increase this when the hockey windows feel too slippery.
-let HOCKEY_FRICTION_PER_SECOND = 0.16;
-const HOCKEY_POLL_INTERVAL_MS = 8;
-const HOCKEY_STOP_SPEED = 18;
-const HOCKEY_MAX_SPEED = 3600;
-
-interface HockeyBody {
-    window: WaylandWindow;
-    vx: number;
-    vy: number;
-    lastMs: number;
-}
-
-interface HockeyDragSample {
-    x: number;
-    y: number;
-    timeMs: number;
-    vx: number;
-    vy: number;
-}
-
-const hockeyBodies = new Map<string, HockeyBody>();
-const hockeyDragSamples = new Map<string, HockeyDragSample>();
-let hockeyPoll: PollHandle | null = null;
-
-function startHockeyPoll() {
-    if (hockeyPoll && !hockeyPoll.cancelled) {
-        return;
-    }
-
-    hockeyPoll = createManagedPoll(HOCKEY_POLL_INTERVAL_MS, (poll) => {
-        if (hockeyBodies.size === 0) {
-            poll.cancel();
-            hockeyPoll = null;
-            return;
-        }
-
-        for (const [windowId, body] of Array.from(hockeyBodies)) {
-            const rectSignal = body.window.state[WINDOW_STATE_RECT];
-            const rect = rectSignal.peek();
-            const nowMs = poll.nowMs;
-            const dt = Math.min(0.05, Math.max(1 / 240, (nowMs - body.lastMs) / 1000));
-            body.lastMs = nowMs;
-
-            const bounds = hockeyPlayArea(rect);
-            let nextX = rect.x + body.vx * dt;
-            let nextY = rect.y + body.vy * dt;
-            let bounced = false;
-
-            const minX = bounds.left;
-            const minY = bounds.top;
-            const maxX = Math.max(minX, bounds.right - rect.width);
-            const maxY = Math.max(minY, bounds.bottom - rect.height);
-
-            if (nextX < minX) {
-                nextX = minX + (minX - nextX);
-                body.vx = Math.abs(body.vx);
-                bounced = true;
-            } else if (nextX > maxX) {
-                nextX = maxX - (nextX - maxX);
-                body.vx = -Math.abs(body.vx);
-                bounced = true;
-            }
-
-            if (nextY < minY) {
-                nextY = minY + (minY - nextY);
-                body.vy = Math.abs(body.vy);
-                bounced = true;
-            } else if (nextY > maxY) {
-                nextY = maxY - (nextY - maxY);
-                body.vy = -Math.abs(body.vy);
-                bounced = true;
-            }
-
-            nextX = clamp(nextX, minX, maxX);
-            nextY = clamp(nextY, minY, maxY);
-
-            if (bounced) {
-                const tint = body.window.state[WINDOW_STATE_HOCKEY_TINT];
-                tint.set(tint.peek() > 0.5 ? 0 : 1);
-            }
-
-            const damping = Math.exp(-HOCKEY_FRICTION_PER_SECOND * dt);
-            body.vx *= damping;
-            body.vy *= damping;
-
-            const speed = Math.hypot(body.vx, body.vy);
-            if (speed < HOCKEY_STOP_SPEED) {
-                hockeyBodies.delete(windowId);
-            }
-
-            rectSignal.set({
-                x: nextX,
-                y: nextY,
-                width: rect.width,
-                height: rect.height,
-            });
-        }
-    }, "none");
-}
-
-function hockeyPlayArea(rect: WindowPosition) {
-    const outputs = Object.values(WINDOW_MANAGER.output.current)
-        .filter(output => output.resolution && output.scale > 0);
-
-    if (outputs.length === 0) {
-        return {
-            left: 0,
-            top: 0,
-            right: Math.max(1920, rect.x + rect.width),
-            bottom: Math.max(1080, rect.y + rect.height),
-        };
-    }
-
-    let left = Number.POSITIVE_INFINITY;
-    let top = Number.POSITIVE_INFINITY;
-    let right = Number.NEGATIVE_INFINITY;
-    let bottom = Number.NEGATIVE_INFINITY;
-
-    for (const output of outputs) {
-        const resolution = output.resolution!;
-        const outputLeft = output.position.x;
-        const outputTop = output.position.y;
-        const outputRight = outputLeft + resolution.width / output.scale;
-        const outputBottom = outputTop + resolution.height / output.scale;
-        left = Math.min(left, outputLeft);
-        top = Math.min(top, outputTop);
-        right = Math.max(right, outputRight);
-        bottom = Math.max(bottom, outputBottom);
-    }
-
-    return { left, top, right, bottom };
-}
-
-function clamp(value: number, min: number, max: number) {
-    return Math.max(min, Math.min(max, value));
-}
-
-function clampVelocity(value: number) {
-    return clamp(value, -HOCKEY_MAX_SPEED, HOCKEY_MAX_SPEED);
-}
-
-const hockeyTintEffectFor = (window: WaylandWindow) => compileWindowEffect({
-    input: windowSource({ include: "full" }),
-    invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 4 },
-    pipeline: [
-        shaderStage(loadShader("./src/hockey-tint.frag"), {
-            uniforms: {
-                tint_phase: window.state[WINDOW_STATE_HOCKEY_TINT],
-            },
-        }),
-    ],
-});
-
-WINDOW_MANAGER.effect.window = (window) => ({
-    replace: hockeyTintEffectFor(window),
-});
 
 WINDOW_MANAGER.event.onOpen((window) => {
     windowStack.add(window);
     window.state[WINDOW_STATE_RECT].set(window.rect ?? DEFAULT_WINDOW_RECT);
-    window.state[WINDOW_STATE_HOCKEY_TINT].set(0);
     window.setCloseAnimationDuration(OPEN_CLOSE_ANIMATION_DURATION);
     window.animation.start(openAnimation, {
         duration: OPEN_CLOSE_ANIMATION_DURATION,
@@ -333,8 +169,6 @@ WINDOW_MANAGER.event.onStartClose((window) => {
 
 WINDOW_MANAGER.event.onClose((window) => {
     windowStack.remove(window);
-    hockeyBodies.delete(window.id);
-    hockeyDragSamples.delete(window.id);
 });
 
 WINDOW_MANAGER.event.onFocus((window, focused) => {
@@ -356,68 +190,7 @@ WINDOW_MANAGER.event.onWindowResize((event) => {
 WINDOW_MANAGER.pointer.bindWindowMoveModifier("Super");
 
 WINDOW_MANAGER.event.onWindowMove((event) => {
-    const rectSignal = event.window.state[WINDOW_STATE_RECT];
-    rectSignal.set(event.currentRect);
-
-    if (event.phase === "start") {
-        hockeyBodies.delete(event.window.id);
-        hockeyDragSamples.set(event.window.id, {
-            x: event.currentRect.x,
-            y: event.currentRect.y,
-            timeMs: event.timestamp,
-            vx: 0,
-            vy: 0,
-        });
-        return;
-    }
-
-    const previous = hockeyDragSamples.get(event.window.id);
-    if (event.phase === "update") {
-        if (!previous) {
-            hockeyDragSamples.set(event.window.id, {
-                x: event.currentRect.x,
-                y: event.currentRect.y,
-                timeMs: event.timestamp,
-                vx: 0,
-                vy: 0,
-            });
-            return;
-        }
-
-        const dt = Math.max(1 / 240, (event.timestamp - previous.timeMs) / 1000);
-        const vx = clampVelocity((event.currentRect.x - previous.x) / dt);
-        const vy = clampVelocity((event.currentRect.y - previous.y) / dt);
-        hockeyDragSamples.set(event.window.id, {
-            x: event.currentRect.x,
-            y: event.currentRect.y,
-            timeMs: event.timestamp,
-            vx: previous.vx * 0.35 + vx * 0.65,
-            vy: previous.vy * 0.35 + vy * 0.65,
-        });
-        return;
-    }
-
-    if (event.phase === "end") {
-        const sample = hockeyDragSamples.get(event.window.id);
-        hockeyDragSamples.delete(event.window.id);
-        if (!sample || Math.hypot(sample.vx, sample.vy) < HOCKEY_STOP_SPEED) {
-            return;
-        }
-
-        hockeyBodies.set(event.window.id, {
-            window: event.window,
-            vx: sample.vx,
-            vy: sample.vy,
-            lastMs: event.timestamp,
-        });
-        startHockeyPoll();
-        return;
-    }
-
-    if (event.phase === "cancel") {
-        hockeyBodies.delete(event.window.id);
-        hockeyDragSamples.delete(event.window.id);
-    }
+    event.window.state[WINDOW_STATE_RECT].set(event.currentRect);
 });
 
 WINDOW_MANAGER.decoration = (window: WaylandWindow) => {
