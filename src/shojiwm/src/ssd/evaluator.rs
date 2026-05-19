@@ -4,14 +4,17 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{debug, error, info, warn};
 
 use super::window_model::{
-    ManagedWindowState, WaylandLayerSnapshot, WaylandOutputSnapshot, WaylandWindowAction,
-    WaylandWindowSnapshot, WindowMoveEventSnapshot, WindowResizeEventSnapshot,
+    ManagedWindowState, PointerMoveEventSnapshot, WaylandLayerSnapshot, WaylandOutputSnapshot,
+    WaylandWindowAction, WaylandWindowSnapshot, WindowMoveEventSnapshot, WindowResizeEventSnapshot,
 };
 use super::{
     BackgroundEffectConfig, DecorationBridgeError, DecorationLayoutError, DecorationNode,
@@ -24,6 +27,7 @@ use crate::{
     runtime_pointer::RuntimePointerConfigUpdate,
     runtime_process::{RuntimeProcessAction, RuntimeProcessConfigUpdate},
 };
+use smithay::reexports::calloop::channel::Sender as CalloopSender;
 
 fn managed_rect_debug_enabled() -> bool {
     std::env::var_os("SHOJI_MANAGED_RECT_DEBUG")
@@ -114,6 +118,8 @@ pub trait DecorationEvaluator {
         Ok(DecorationWindowMoveInvocation::default())
     }
 
+    fn pointer_move_async(&self, _event: PointerMoveEventSnapshot, _now_ms: u64) {}
+
     fn evaluate_layer_effects(
         &self,
         _output_name: &str,
@@ -135,6 +141,7 @@ pub struct DecorationEvaluationResult {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
 }
@@ -150,6 +157,7 @@ pub struct DecorationSchedulerTick {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
 }
@@ -168,6 +176,7 @@ pub struct DecorationHandlerInvocation {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
 }
@@ -184,6 +193,7 @@ pub struct DecorationKeyBindingInvocation {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
 }
@@ -200,6 +210,7 @@ pub struct DecorationWindowResizeInvocation {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
 }
@@ -216,8 +227,32 @@ pub struct DecorationWindowMoveInvocation {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DecorationPointerMoveAsyncInvocation {
+    pub invoked: bool,
+    pub dirty: bool,
+    pub dirty_window_ids: Vec<String>,
+    pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
+    pub dirty_layer_node_ids: std::collections::HashMap<String, Vec<String>>,
+    pub actions: Vec<RuntimeWindowAction>,
+    pub next_poll_in_ms: Option<u64>,
+    pub display_config: Option<RuntimeDisplayConfigUpdate>,
+    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
+    pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub event_config: Option<RuntimeEventConfigUpdate>,
+    pub process_config: Option<RuntimeProcessConfigUpdate>,
+    pub process_actions: Vec<RuntimeProcessAction>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeEventConfigUpdate {
+    pub pointer_move_async: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -227,6 +262,7 @@ pub struct LayerEffectEvaluationResult {
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
 }
@@ -337,6 +373,7 @@ impl DecorationEvaluator for StaticDecorationEvaluator {
             display_config: None,
             key_binding_config: None,
             pointer_config: None,
+            event_config: None,
             process_config: None,
             process_actions: Vec::new(),
         })
@@ -382,6 +419,21 @@ pub struct NodeDecorationEvaluator {
     transport: RuntimeTransportKind,
     runtime: Arc<Mutex<Option<NodeDecorationRuntime>>>,
     display_state: Arc<Mutex<std::collections::BTreeMap<String, WaylandOutputSnapshot>>>,
+    pointer_move_async: Arc<PointerMoveAsyncDispatcher>,
+    async_event_sender: Arc<Mutex<Option<CalloopSender<DecorationPointerMoveAsyncInvocation>>>>,
+}
+
+#[derive(Debug)]
+struct PointerMoveAsyncWork {
+    event: PointerMoveEventSnapshot,
+    now_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct PointerMoveAsyncDispatcher {
+    pending: Mutex<Option<PointerMoveAsyncWork>>,
+    pending_changed: Condvar,
+    worker_started: AtomicBool,
 }
 
 struct NodeDecorationRuntime {
@@ -490,6 +542,15 @@ enum RuntimeRequest<'a> {
         #[serde(rename = "displayState")]
         display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
     },
+    PointerMoveAsync {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        event: &'a PointerMoveEventSnapshot,
+        #[serde(rename = "nowMs")]
+        now_ms: u64,
+        #[serde(rename = "displayState")]
+        display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+    },
     StartClose {
         #[serde(rename = "requestId")]
         request_id: u64,
@@ -551,6 +612,8 @@ struct RuntimeEvaluateResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "eventConfig")]
+    event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
     process_config: Option<RuntimeProcessConfigUpdate>,
     #[serde(rename = "processActions")]
@@ -580,6 +643,8 @@ struct RuntimeSchedulerResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "eventConfig")]
+    event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
     process_config: Option<RuntimeProcessConfigUpdate>,
     #[serde(rename = "processActions")]
@@ -599,6 +664,8 @@ struct RuntimeClosedResponse {
     _key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     _pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "eventConfig")]
+    _event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
     _process_config: Option<RuntimeProcessConfigUpdate>,
     #[serde(rename = "processActions")]
@@ -632,6 +699,8 @@ struct RuntimeInvokeHandlerResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "eventConfig")]
+    event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
     process_config: Option<RuntimeProcessConfigUpdate>,
     #[serde(rename = "processActions")]
@@ -665,6 +734,8 @@ struct RuntimeStartCloseResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "eventConfig")]
+    event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
     process_config: Option<RuntimeProcessConfigUpdate>,
     #[serde(rename = "processActions")]
@@ -715,6 +786,8 @@ struct RuntimeLayerEffectsResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "eventConfig")]
+    event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
     process_config: Option<RuntimeProcessConfigUpdate>,
     #[serde(rename = "processActions")]
@@ -745,6 +818,8 @@ struct RuntimeInvokeKeyBindingResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "eventConfig")]
+    event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
     process_config: Option<RuntimeProcessConfigUpdate>,
     #[serde(rename = "processActions")]
@@ -775,6 +850,8 @@ struct RuntimeWindowResizeResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "eventConfig")]
+    event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
     process_config: Option<RuntimeProcessConfigUpdate>,
     #[serde(rename = "processActions")]
@@ -805,6 +882,40 @@ struct RuntimeWindowMoveResponse {
     key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     #[serde(rename = "pointerConfig")]
     pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "eventConfig")]
+    event_config: Option<RuntimeEventConfigUpdate>,
+    #[serde(rename = "processConfig")]
+    process_config: Option<RuntimeProcessConfigUpdate>,
+    #[serde(rename = "processActions")]
+    process_actions: Option<Vec<RuntimeProcessAction>>,
+    error: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimePointerMoveAsyncResponse {
+    #[serde(rename = "requestId")]
+    request_id: u64,
+    kind: String,
+    ok: bool,
+    invoked: Option<bool>,
+    dirty: Option<bool>,
+    #[serde(rename = "dirtyWindowIds")]
+    dirty_window_ids: Option<Vec<String>>,
+    #[serde(rename = "dirtyWindowNodeIds")]
+    dirty_window_node_ids: Option<std::collections::HashMap<String, Vec<String>>>,
+    #[serde(rename = "dirtyLayerNodeIds")]
+    dirty_layer_node_ids: Option<std::collections::HashMap<String, Vec<String>>>,
+    actions: Option<Vec<RuntimeWindowAction>>,
+    #[serde(rename = "nextPollInMs")]
+    next_poll_in_ms: Option<u64>,
+    #[serde(rename = "displayConfig")]
+    display_config: Option<RuntimeDisplayConfigUpdate>,
+    #[serde(rename = "keyBindingConfig")]
+    key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
+    #[serde(rename = "pointerConfig")]
+    pointer_config: Option<RuntimePointerConfigUpdate>,
+    #[serde(rename = "eventConfig")]
+    event_config: Option<RuntimeEventConfigUpdate>,
     #[serde(rename = "processConfig")]
     process_config: Option<RuntimeProcessConfigUpdate>,
     #[serde(rename = "processActions")]
@@ -843,6 +954,8 @@ impl NodeDecorationEvaluator {
             transport: RuntimeTransportKind::Uds,
             runtime: Arc::new(Mutex::new(None)),
             display_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
+            async_event_sender: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -866,6 +979,17 @@ impl NodeDecorationEvaluator {
             transport: RuntimeTransportKind::Stdio,
             runtime: Arc::new(Mutex::new(None)),
             display_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
+            async_event_sender: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn set_async_event_sender(
+        &self,
+        sender: CalloopSender<DecorationPointerMoveAsyncInvocation>,
+    ) {
+        if let Ok(mut guard) = self.async_event_sender.lock() {
+            *guard = Some(sender);
         }
     }
 
@@ -1070,6 +1194,156 @@ impl NodeDecorationEvaluator {
             .transpose()
             .map_err(DecorationEvaluationError::Bridge)
     }
+
+    fn enqueue_pointer_move_async(&self, event: PointerMoveEventSnapshot, now_ms: u64) {
+        self.ensure_pointer_move_async_worker();
+        if let Ok(mut pending) = self.pointer_move_async.pending.lock() {
+            *pending = Some(PointerMoveAsyncWork { event, now_ms });
+            self.pointer_move_async.pending_changed.notify_one();
+        }
+    }
+
+    fn ensure_pointer_move_async_worker(&self) {
+        if self
+            .pointer_move_async
+            .worker_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let evaluator = self.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name("shojiwm-pointer-move-async".into())
+            .spawn(move || evaluator.run_pointer_move_async_worker());
+        if let Err(error) = spawn_result {
+            self.pointer_move_async
+                .worker_started
+                .store(false, Ordering::Release);
+            warn!(?error, "failed to spawn pointer move async worker");
+        }
+    }
+
+    fn run_pointer_move_async_worker(self) {
+        loop {
+            let work = {
+                let mut pending = match self.pointer_move_async.pending.lock() {
+                    Ok(pending) => pending,
+                    Err(_) => return,
+                };
+                while pending.is_none() {
+                    pending = match self.pointer_move_async.pending_changed.wait(pending) {
+                        Ok(pending) => pending,
+                        Err(_) => return,
+                    };
+                }
+                pending.take()
+            };
+            let Some(work) = work else {
+                continue;
+            };
+
+            match self.dispatch_pointer_move_async(&work.event, work.now_ms) {
+                Ok(Some(invocation)) => {
+                    if let Ok(sender_guard) = self.async_event_sender.lock()
+                        && let Some(sender) = sender_guard.as_ref()
+                    {
+                        let _ = sender.send(invocation);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    debug!(?error, "failed to dispatch async pointer move event");
+                }
+            }
+        }
+    }
+
+    fn dispatch_pointer_move_async(
+        &self,
+        event: &PointerMoveEventSnapshot,
+        now_ms: u64,
+    ) -> Result<Option<DecorationPointerMoveAsyncInvocation>, DecorationEvaluationError> {
+        let Ok(mut runtime_guard) = self.runtime.try_lock() else {
+            // Pointer motion is lossy by design. If the runtime is handling a synchronous
+            // request, dropping this sample is better than blocking input delivery.
+            return Ok(None);
+        };
+        let runtime = self.ensure_runtime(&mut runtime_guard)?;
+        let request_id = runtime.next_request_id;
+        runtime.next_request_id += 1;
+        let display_state = self
+            .display_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+
+        let request = serde_json::to_string(&RuntimeRequest::PointerMoveAsync {
+            request_id,
+            event,
+            now_ms,
+            display_state: &display_state,
+        })
+        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
+        runtime.write_request(&request)?;
+
+        let response: RuntimePointerMoveAsyncResponse =
+            if let Some(response) = runtime.read_response()? {
+                response
+            } else {
+                let status = runtime
+                    .child
+                    .try_wait()?
+                    .and_then(|status| status.code())
+                    .unwrap_or(-1);
+                let stderr = runtime
+                    .stderr_log
+                    .lock()
+                    .map(|stderr| stderr.clone())
+                    .unwrap_or_default();
+                *runtime_guard = None;
+                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
+            };
+        if response.request_id != request_id {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response id: expected {request_id}, got {}",
+                response.request_id
+            )));
+        }
+        if response.kind != "pointerMoveAsync" {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response kind for pointerMoveAsync: {}",
+                response.kind
+            )));
+        }
+        if !response.ok {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(
+                response
+                    .error
+                    .unwrap_or_else(|| "runtime returned failure".into()),
+            ));
+        }
+
+        Ok(Some(DecorationPointerMoveAsyncInvocation {
+            invoked: response.invoked.unwrap_or(false),
+            dirty: response.dirty.unwrap_or(false),
+            dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
+            dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
+            actions: response.actions.unwrap_or_default(),
+            next_poll_in_ms: response.next_poll_in_ms,
+            display_config: response.display_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+        }))
+    }
 }
 
 impl Clone for NodeDecorationEvaluator {
@@ -1083,6 +1357,8 @@ impl Clone for NodeDecorationEvaluator {
             transport: self.transport,
             runtime: Arc::clone(&self.runtime),
             display_state: Arc::clone(&self.display_state),
+            pointer_move_async: Arc::clone(&self.pointer_move_async),
+            async_event_sender: Arc::clone(&self.async_event_sender),
         }
     }
 }
@@ -1321,6 +1597,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
         })
@@ -1413,6 +1690,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
         })
@@ -1505,6 +1783,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
         })
@@ -1599,6 +1878,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
         })
@@ -1770,6 +2050,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
         })
@@ -1857,6 +2138,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
         })
@@ -1946,6 +2228,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
         })
@@ -2034,9 +2317,14 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
         })
+    }
+
+    fn pointer_move_async(&self, event: PointerMoveEventSnapshot, now_ms: u64) {
+        self.enqueue_pointer_move_async(event, now_ms);
     }
 
     fn start_close(
@@ -2134,6 +2422,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
         })
@@ -2224,6 +2513,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
+            event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
         })

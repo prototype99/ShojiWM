@@ -79,6 +79,33 @@ export type WindowMoveListener = (event: WindowMoveEvent) => void;
 
 export type RuntimeWindowMoveEvent = Omit<WindowMoveEvent, "window">;
 
+export interface PointerMovePoint {
+  x: number;
+  y: number;
+}
+
+export interface PointerModifierState {
+  super: boolean;
+  alt: boolean;
+  ctrl: boolean;
+  shift: boolean;
+}
+
+export interface PointerMoveEvent {
+  position: PointerMovePoint;
+  delta: PointerMovePoint;
+  outputName?: string;
+  modifiers: PointerModifierState;
+  timestamp: number;
+}
+
+export type PointerMoveAsyncListener =
+  (event: PointerMoveEvent) => void | Promise<void>;
+
+export interface RuntimeEventConfig {
+  pointerMoveAsync: boolean;
+}
+
 export interface WindowManagerEventController {
   onOpen(listener: WindowOpenListener): () => void;
   onClose(listener: WindowCloseListener): () => void;
@@ -86,6 +113,7 @@ export interface WindowManagerEventController {
   onStartClose(listener: WindowStartCloseListener): () => void;
   onWindowResize(listener: WindowResizeListener): () => void;
   onWindowMove(listener: WindowMoveListener): () => void;
+  onPointerMoveAsync(listener: PointerMoveAsyncListener): () => void;
   onCreateLayer(listener: LayerCreateListener): () => void;
   onDestroyLayer(listener: LayerDestroyListener): () => void;
   emitOpen(window: WaylandWindow): void;
@@ -94,8 +122,10 @@ export interface WindowManagerEventController {
   emitStartClose(window: WaylandWindow): void;
   emitWindowResize(window: WaylandWindow, event: RuntimeWindowResizeEvent): boolean;
   emitWindowMove(window: WaylandWindow, event: RuntimeWindowMoveEvent): boolean;
+  emitPointerMoveAsync(event: PointerMoveEvent): Promise<boolean>;
   emitCreateLayer(layer: WaylandLayer): void;
   emitDestroyLayer(layer: WaylandLayer): void;
+  takePendingEventConfig(): RuntimeEventConfig | undefined;
 }
 
 export function createWindowManagerEventController(): WindowManagerEventController {
@@ -105,8 +135,14 @@ export function createWindowManagerEventController(): WindowManagerEventControll
   const startCloseListeners = new Set<WindowStartCloseListener>();
   const resizeListeners = new Set<WindowResizeListener>();
   const moveListeners = new Set<WindowMoveListener>();
+  const pointerMoveAsyncListeners = new Set<PointerMoveAsyncListener>();
   const createLayerListeners = new Set<LayerCreateListener>();
   const destroyLayerListeners = new Set<LayerDestroyListener>();
+  let pendingEventConfig = false;
+
+  function markEventConfigDirty(): void {
+    pendingEventConfig = true;
+  }
 
   return {
     onOpen(listener) {
@@ -132,6 +168,14 @@ export function createWindowManagerEventController(): WindowManagerEventControll
     onWindowMove(listener) {
       moveListeners.add(listener);
       return () => moveListeners.delete(listener);
+    },
+    onPointerMoveAsync(listener) {
+      pointerMoveAsyncListeners.add(listener);
+      markEventConfigDirty();
+      return () => {
+        pointerMoveAsyncListeners.delete(listener);
+        markEventConfigDirty();
+      };
     },
     onCreateLayer(listener) {
       createLayerListeners.add(listener);
@@ -179,6 +223,15 @@ export function createWindowManagerEventController(): WindowManagerEventControll
       }
       return true;
     },
+    async emitPointerMoveAsync(event) {
+      if (pointerMoveAsyncListeners.size === 0) {
+        return false;
+      }
+      for (const listener of pointerMoveAsyncListeners) {
+        await listener(event);
+      }
+      return true;
+    },
     emitCreateLayer(layer) {
       for (const listener of createLayerListeners) {
         listener(layer);
@@ -188,6 +241,15 @@ export function createWindowManagerEventController(): WindowManagerEventControll
       for (const listener of destroyLayerListeners) {
         listener(layer);
       }
+    },
+    takePendingEventConfig() {
+      if (!pendingEventConfig) {
+        return undefined;
+      }
+      pendingEventConfig = false;
+      return {
+        pointerMoveAsync: pointerMoveAsyncListeners.size > 0,
+      };
     },
   };
 }

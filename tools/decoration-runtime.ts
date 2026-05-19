@@ -61,6 +61,8 @@ import {
   type PollHandle,
   type RuntimeWindowResizeEvent,
   type RuntimeWindowMoveEvent,
+  type PointerMoveEvent,
+  type RuntimeEventConfig,
   updateOutputState,
   type WaylandLayerSnapshot,
   type WaylandLayer,
@@ -152,6 +154,14 @@ interface WindowMoveRequest {
   displayState: Record<string, OutputStateSnapshot>;
 }
 
+interface PointerMoveAsyncRequest {
+  requestId: number;
+  kind: "pointerMoveAsync";
+  event: PointerMoveEvent;
+  nowMs: number;
+  displayState: Record<string, OutputStateSnapshot>;
+}
+
 interface GetEffectConfigRequest {
   requestId: number;
   kind: "getEffectConfig";
@@ -178,6 +188,7 @@ type RuntimeRequest =
   | InvokeKeyBindingRequest
   | WindowResizeRequest
   | WindowMoveRequest
+  | PointerMoveAsyncRequest
   | GetEffectConfigRequest
   | EvaluateLayerEffectsRequest;
 
@@ -196,6 +207,7 @@ interface EvaluateSuccess {
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
+  eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
 }
@@ -213,6 +225,7 @@ interface SchedulerTickSuccess {
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
+  eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
 }
@@ -224,6 +237,7 @@ interface WindowClosedSuccess {
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
+  eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
 }
@@ -249,6 +263,7 @@ interface InvokeHandlerSuccess {
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
+  eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
 }
@@ -267,6 +282,7 @@ interface InvokeKeyBindingSuccess {
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
+  eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
 }
@@ -285,6 +301,7 @@ interface WindowResizeSuccess {
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
+  eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
 }
@@ -303,6 +320,7 @@ interface WindowMoveSuccess {
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
+  eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
 }
@@ -323,6 +341,26 @@ interface StartCloseSuccess {
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
+  eventConfig?: RuntimeEventConfig;
+  processConfig?: { entries: RuntimeProcessConfigEntry[] };
+  processActions?: RuntimeProcessSpawnAction[];
+}
+
+interface PointerMoveAsyncSuccess {
+  requestId: number;
+  ok: true;
+  kind: "pointerMoveAsync";
+  invoked: boolean;
+  dirty: boolean;
+  dirtyWindowIds: string[];
+  dirtyWindowNodeIds?: Record<string, string[]>;
+  dirtyLayerNodeIds?: Record<string, string[]>;
+  actions: RuntimeWindowAction[];
+  nextPollInMs?: number;
+  displayConfig?: { outputs: DisplayConfigDraft };
+  keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
+  pointerConfig?: RuntimePointerConfig;
+  eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
 }
@@ -346,6 +384,7 @@ interface EvaluateLayerEffectsSuccess {
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
+  eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
 }
@@ -428,6 +467,12 @@ function pendingKeyBindingConfigPayload():
 
 function pendingPointerConfigPayload(): RuntimePointerConfig | undefined {
   return takePendingPointerConfig() as RuntimePointerConfig | undefined;
+}
+
+function pendingEventConfigPayload(
+  events: WindowManagerEventController,
+): RuntimeEventConfig | undefined {
+  return events.takePendingEventConfig();
 }
 
 const cacheByWindowId = new Map<string, RuntimeCacheEntry>();
@@ -583,6 +628,7 @@ async function main() {
           : evaluatePreconfigure(decoration, events, effectConfig, request.snapshot);
         const keyBindingConfig = pendingKeyBindingConfigPayload();
         const pointerConfig = pendingPointerConfigPayload();
+        const eventConfig = pendingEventConfigPayload(events);
         const processConfig = pendingProcessConfigPayload();
         const processActions = pendingProcessActionsPayload();
         const cached = request.kind === "evaluate"
@@ -605,6 +651,7 @@ async function main() {
           displayConfig: pendingDisplayConfigPayload(),
           keyBindingConfig,
           pointerConfig,
+          eventConfig,
           processConfig,
           processActions,
         });
@@ -613,6 +660,7 @@ async function main() {
           const tick = processSchedulerTick(request.nowMs);
           const keyBindingConfig = pendingKeyBindingConfigPayload();
           const pointerConfig = pendingPointerConfigPayload();
+          const eventConfig = pendingEventConfigPayload(events);
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
           await writeResponse(output, {
@@ -628,6 +676,7 @@ async function main() {
             displayConfig: pendingDisplayConfigPayload(),
             keyBindingConfig,
             pointerConfig,
+            eventConfig,
             processConfig,
             processActions,
           });
@@ -750,6 +799,7 @@ async function main() {
           const result = invokeWindowMove(events, request.windowId, request.event);
           const keyBindingConfig = pendingKeyBindingConfigPayload();
           const pointerConfig = pendingPointerConfigPayload();
+          const eventConfig = pendingEventConfigPayload(events);
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
           await writeResponse(output, {
@@ -760,6 +810,26 @@ async function main() {
             displayConfig: pendingDisplayConfigPayload(),
             keyBindingConfig,
             pointerConfig,
+            eventConfig,
+            processConfig,
+            processActions,
+          });
+        } else if (request.kind === "pointerMoveAsync") {
+          const result = await invokePointerMoveAsync(events, request.event);
+          const keyBindingConfig = pendingKeyBindingConfigPayload();
+          const pointerConfig = pendingPointerConfigPayload();
+          const eventConfig = pendingEventConfigPayload(events);
+          const processConfig = pendingProcessConfigPayload();
+          const processActions = pendingProcessActionsPayload();
+          await writeResponse(output, {
+            requestId: request.requestId,
+            ok: true,
+            kind: "pointerMoveAsync",
+            ...result,
+            displayConfig: pendingDisplayConfigPayload(),
+            keyBindingConfig,
+            pointerConfig,
+            eventConfig,
             processConfig,
             processActions,
           });
@@ -1358,6 +1428,33 @@ function invokeWindowMove(
   };
 }
 
+async function invokePointerMoveAsync(
+  events: WindowManagerEventController,
+  event: PointerMoveEvent,
+): Promise<Omit<PointerMoveAsyncSuccess, "requestId" | "ok" | "kind">> {
+  const invoked = await events.emitPointerMoveAsync(event);
+  if (!invoked) {
+    return {
+      invoked: false,
+      dirty: false,
+      dirtyWindowIds: [],
+      actions: [],
+      nextPollInMs: hasActiveAnimations() ? 0 : peekNextPollDelay(),
+    };
+  }
+
+  const result = collectRuntimeMutationState();
+  return {
+    invoked: true,
+    dirty: result.dirty,
+    dirtyWindowIds: result.dirtyWindowIds,
+    dirtyWindowNodeIds: result.dirtyWindowNodeIds,
+    dirtyLayerNodeIds: result.dirtyLayerNodeIds,
+    actions: result.actions,
+    nextPollInMs: hasActiveAnimations() ? 0 : result.nextPollInMs,
+  };
+}
+
 function closeWindow(events: WindowManagerEventController, windowId: string): void {
   const existing = cacheByWindowId.get(windowId);
   if (!existing) {
@@ -1615,6 +1712,7 @@ function writeResponse(
     | InvokeKeyBindingSuccess
     | WindowResizeSuccess
     | WindowMoveSuccess
+    | PointerMoveAsyncSuccess
     | GetEffectConfigSuccess
     | EvaluateLayerEffectsSuccess
     | RuntimeFailure,

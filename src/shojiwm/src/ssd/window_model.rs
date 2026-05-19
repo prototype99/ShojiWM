@@ -16,7 +16,7 @@ use super::DecorationInteractionSnapshot;
 use crate::state::ShojiWM;
 
 /// Rust-side snapshot that mirrors the TypeScript `WaylandWindow` view.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WaylandWindowSnapshot {
     pub id: String,
@@ -50,7 +50,7 @@ pub struct WindowSizeConstraintsSnapshot {
     pub max: Option<WindowSizeSnapshot>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowIconSnapshot {
     pub name: Option<String>,
@@ -71,6 +71,33 @@ pub struct WindowPositionSnapshot {
 pub struct WindowResizePointSnapshot {
     pub x: i32,
     pub y: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PointerModifierStateSnapshot {
+    #[serde(rename = "super")]
+    pub logo: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+    pub shift: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PointerMovePointSnapshot {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PointerMoveEventSnapshot {
+    pub position: PointerMovePointSnapshot,
+    pub delta: PointerMovePointSnapshot,
+    pub output_name: Option<String>,
+    pub modifiers: PointerModifierStateSnapshot,
+    pub timestamp: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

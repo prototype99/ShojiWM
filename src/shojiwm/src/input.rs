@@ -21,8 +21,9 @@ use crate::{
         resize_grab::{ResizeEdge, ResizeSurfaceGrab},
     },
     ssd::{
-        DecorationEvaluator, DecorationHitTestResult, LogicalPoint, ResizeEdges,
-        RuntimeWindowAction, WindowAction, WindowMoveSourceSnapshot, WindowResizeSourceSnapshot,
+        DecorationEvaluator, DecorationHitTestResult, LogicalPoint, PointerModifierStateSnapshot,
+        PointerMoveEventSnapshot, PointerMovePointSnapshot, ResizeEdges, RuntimeWindowAction,
+        WindowAction, WindowMoveSourceSnapshot, WindowResizeSourceSnapshot,
     },
     state::{ShojiWM, TrackedDecorationInteractionTarget},
 };
@@ -52,6 +53,37 @@ fn stack_hit_debug_enabled() -> bool {
 }
 
 impl ShojiWM {
+    fn dispatch_pointer_move_async_event(
+        &mut self,
+        previous_pos: smithay::utils::Point<f64, smithay::utils::Logical>,
+        pos: smithay::utils::Point<f64, smithay::utils::Logical>,
+        time_msec: u32,
+    ) {
+        if !self.runtime_pointer_move_async_enabled {
+            return;
+        }
+
+        let output_name = self.output_at_point(pos).map(|output| output.name());
+        let delta = pos - previous_pos;
+        let event = PointerMoveEventSnapshot {
+            position: PointerMovePointSnapshot { x: pos.x, y: pos.y },
+            delta: PointerMovePointSnapshot {
+                x: delta.x,
+                y: delta.y,
+            },
+            output_name,
+            modifiers: PointerModifierStateSnapshot {
+                logo: self.current_keyboard_modifiers.logo,
+                alt: self.current_keyboard_modifiers.alt,
+                ctrl: self.current_keyboard_modifiers.ctrl,
+                shift: self.current_keyboard_modifiers.shift,
+            },
+            timestamp: u64::from(time_msec),
+        };
+        let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
+        self.decoration_evaluator.pointer_move_async(event, now_ms);
+    }
+
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event, .. } => {
@@ -136,6 +168,7 @@ impl ShojiWM {
                                     invocation.key_binding_config,
                                 );
                                 self.consume_runtime_pointer_config(invocation.pointer_config);
+                                self.consume_runtime_event_config(invocation.event_config);
                                 self.consume_runtime_process_config(invocation.process_config);
                                 if !invocation.process_actions.is_empty() {
                                     self.apply_runtime_process_actions(invocation.process_actions);
@@ -180,7 +213,8 @@ impl ShojiWM {
                 };
 
                 let pointer = self.seat.get_pointer().unwrap();
-                let mut pos = pointer.current_location() + event.delta();
+                let previous_pos = pointer.current_location();
+                let mut pos = previous_pos + event.delta();
 
                 pos.x = pos.x.clamp(
                     output_bounds.loc.x as f64,
@@ -206,6 +240,7 @@ impl ShojiWM {
                 );
                 pointer.frame(self);
 
+                self.dispatch_pointer_move_async_event(previous_pos, pos, event.time_msec());
                 self.update_decoration_hover_target(pos);
                 if !pointer.is_grabbed() {
                     self.update_decoration_cursor_icon(pos);
@@ -223,6 +258,7 @@ impl ShojiWM {
                 let serial = SERIAL_COUNTER.next_serial();
 
                 let pointer = self.seat.get_pointer().unwrap();
+                let previous_pos = pointer.current_location();
 
                 self.pointer_contents = self.pointer_contents_at(pos);
                 let under = self.pointer_contents.surface.clone();
@@ -237,6 +273,7 @@ impl ShojiWM {
                     },
                 );
                 pointer.frame(self);
+                self.dispatch_pointer_move_async_event(previous_pos, pos, event.time_msec());
                 self.update_decoration_hover_target(pos);
                 if !pointer.is_grabbed() {
                     self.update_decoration_cursor_icon(pos);
@@ -514,6 +551,9 @@ impl ShojiWM {
                                     );
                                     self.consume_runtime_pointer_config(
                                         invocation.pointer_config.clone(),
+                                    );
+                                    self.consume_runtime_event_config(
+                                        invocation.event_config.clone(),
                                     );
                                     self.consume_runtime_process_config(
                                         invocation.process_config.clone(),
@@ -1319,6 +1359,7 @@ impl ShojiWM {
         self.consume_runtime_display_config(invocation.display_config.clone());
         self.consume_runtime_key_binding_config(invocation.key_binding_config.clone());
         self.consume_runtime_pointer_config(invocation.pointer_config.clone());
+        self.consume_runtime_event_config(invocation.event_config.clone());
         self.consume_runtime_process_config(invocation.process_config.clone());
         if !invocation.process_actions.is_empty() {
             self.apply_runtime_process_actions(invocation.process_actions.clone());

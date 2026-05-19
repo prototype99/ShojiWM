@@ -323,6 +323,12 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         }
     }
 
+    fn pointer_move_async(&self, event: super::PointerMoveEventSnapshot, now_ms: u64) {
+        if let Self::Node(evaluator) = self {
+            evaluator.pointer_move_async(event, now_ms);
+        }
+    }
+
     fn start_close(
         &self,
         window_id: &str,
@@ -354,6 +360,17 @@ impl DecorationRuntimeEvaluator {
     ) {
         if let Self::Node(evaluator) = self {
             evaluator.set_display_state(display_state);
+        }
+    }
+
+    pub fn set_async_event_sender(
+        &self,
+        sender: smithay::reexports::calloop::channel::Sender<
+            super::DecorationPointerMoveAsyncInvocation,
+        >,
+    ) {
+        if let Self::Node(evaluator) = self {
+            evaluator.set_async_event_sender(sender);
         }
     }
 }
@@ -513,6 +530,7 @@ impl ShojiWM {
         self.consume_runtime_display_config(invocation.display_config);
         self.consume_runtime_key_binding_config(invocation.key_binding_config);
         self.consume_runtime_pointer_config(invocation.pointer_config);
+        self.consume_runtime_event_config(invocation.event_config);
         self.consume_runtime_process_config(invocation.process_config);
         if !invocation.process_actions.is_empty() {
             self.apply_runtime_process_actions(invocation.process_actions);
@@ -560,6 +578,7 @@ impl ShojiWM {
         self.consume_runtime_display_config(invocation.display_config);
         self.consume_runtime_key_binding_config(invocation.key_binding_config);
         self.consume_runtime_pointer_config(invocation.pointer_config);
+        self.consume_runtime_event_config(invocation.event_config);
         self.consume_runtime_process_config(invocation.process_config);
         if !invocation.process_actions.is_empty() {
             self.apply_runtime_process_actions(invocation.process_actions);
@@ -629,6 +648,7 @@ impl ShojiWM {
         self.consume_runtime_display_config(invocation.display_config.clone());
         self.consume_runtime_key_binding_config(invocation.key_binding_config.clone());
         self.consume_runtime_pointer_config(invocation.pointer_config.clone());
+        self.consume_runtime_event_config(invocation.event_config.clone());
         self.consume_runtime_process_config(invocation.process_config.clone());
         if !invocation.process_actions.is_empty() {
             self.apply_runtime_process_actions(invocation.process_actions.clone());
@@ -756,6 +776,7 @@ impl ShojiWM {
         self.consume_runtime_display_config(evaluation.display_config.clone());
         self.consume_runtime_key_binding_config(evaluation.key_binding_config.clone());
         self.consume_runtime_pointer_config(evaluation.pointer_config.clone());
+        self.consume_runtime_event_config(evaluation.event_config.clone());
         self.consume_runtime_process_config(evaluation.process_config.clone());
         if !evaluation.process_actions.is_empty() {
             self.apply_runtime_process_actions(evaluation.process_actions.clone());
@@ -852,6 +873,7 @@ impl ShojiWM {
         self.consume_runtime_display_config(evaluation.display_config.clone());
         self.consume_runtime_key_binding_config(evaluation.key_binding_config.clone());
         self.consume_runtime_pointer_config(evaluation.pointer_config.clone());
+        self.consume_runtime_event_config(evaluation.event_config.clone());
         self.consume_runtime_process_config(evaluation.process_config.clone());
         if !evaluation.process_actions.is_empty() {
             self.apply_runtime_process_actions(evaluation.process_actions.clone());
@@ -916,6 +938,7 @@ impl ShojiWM {
         let mut pending_display_config_updates = Vec::new();
         let mut pending_key_binding_config_updates = Vec::new();
         let mut pending_pointer_config_updates = Vec::new();
+        let mut pending_event_config_updates = Vec::new();
         let mut pending_process_config_updates = Vec::new();
         let mut pending_process_actions = Vec::new();
         self.sync_runtime_display_state();
@@ -1042,6 +1065,7 @@ impl ShojiWM {
                 pending_display_config_updates.push(evaluation.display_config.clone());
                 pending_key_binding_config_updates.push(evaluation.key_binding_config.clone());
                 pending_pointer_config_updates.push(evaluation.pointer_config.clone());
+                pending_event_config_updates.push(evaluation.event_config.clone());
                 pending_process_config_updates.push(evaluation.process_config.clone());
                 pending_process_actions.extend(evaluation.process_actions.clone());
                 let tree = DecorationTree::new(evaluation.node);
@@ -1195,6 +1219,7 @@ impl ShojiWM {
                     pending_display_config_updates.push(evaluation.display_config.clone());
                     pending_key_binding_config_updates.push(evaluation.key_binding_config.clone());
                     pending_pointer_config_updates.push(evaluation.pointer_config.clone());
+                    pending_event_config_updates.push(evaluation.event_config.clone());
                     pending_process_config_updates.push(evaluation.process_config.clone());
                     pending_process_actions.extend(evaluation.process_actions.clone());
                     cached.tree = DecorationTree::new(evaluation.node);
@@ -1351,6 +1376,7 @@ impl ShojiWM {
                     pending_display_config_updates.push(evaluation.display_config.clone());
                     pending_key_binding_config_updates.push(evaluation.key_binding_config.clone());
                     pending_pointer_config_updates.push(evaluation.pointer_config.clone());
+                    pending_event_config_updates.push(evaluation.event_config.clone());
                     pending_process_config_updates.push(evaluation.process_config.clone());
                     pending_process_actions.extend(evaluation.process_actions.clone());
                     let rebuild_started_at = Instant::now();
@@ -1985,6 +2011,9 @@ impl ShojiWM {
         }
         for update in pending_pointer_config_updates {
             self.consume_runtime_pointer_config(update);
+        }
+        for update in pending_event_config_updates {
+            self.consume_runtime_event_config(update);
         }
         for update in pending_process_config_updates {
             self.consume_runtime_process_config(update);

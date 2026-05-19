@@ -92,9 +92,10 @@ use crate::runtime_process::{
 };
 use crate::ssd::{
     BackgroundEffectConfig, DecorationEvaluator, DecorationInteractionSnapshot,
-    DecorationInteractionTarget, DecorationRuntimeEvaluator, LogicalPoint, LogicalRect,
-    NodeDecorationEvaluator, OutputModeSnapshot, OutputPositionSnapshot, WaylandOutputSnapshot,
-    WaylandWindowSnapshot, WindowDecorationState, WindowPositionSnapshot,
+    DecorationInteractionTarget, DecorationPointerMoveAsyncInvocation, DecorationRuntimeEvaluator,
+    LogicalPoint, LogicalRect, NodeDecorationEvaluator, OutputModeSnapshot, OutputPositionSnapshot,
+    RuntimeEventConfigUpdate, WaylandOutputSnapshot, WaylandWindowSnapshot, WindowDecorationState,
+    WindowPositionSnapshot,
 };
 use crate::xwayland_satellite::{SatelliteInstance, satellite_requested, spawn_satellite};
 use crate::{
@@ -266,6 +267,7 @@ pub struct ShojiWM {
     pub runtime_key_binding_entries: BTreeMap<String, RuntimeKeyBindingEntry>,
     pub runtime_key_bindings: Vec<CompiledRuntimeKeyBinding>,
     pub runtime_window_move_modifier: Option<RuntimePointerModifier>,
+    pub runtime_pointer_move_async_enabled: bool,
     pub current_keyboard_modifiers: ModifiersState,
     pub suggested_window_offset: Option<(i32, i32)>,
     pub async_asset_dirty: bool,
@@ -581,6 +583,17 @@ impl ShojiWM {
             } else {
                 (DecorationRuntimeEvaluator::Static(Default::default()), None)
             };
+        let (runtime_async_event_tx, runtime_async_event_rx) = channel();
+        decoration_evaluator.set_async_event_sender(runtime_async_event_tx);
+        event_loop
+            .handle()
+            .insert_source(runtime_async_event_rx, |event, _, state| match event {
+                ChannelEvent::Msg(invocation) => {
+                    state.handle_runtime_pointer_move_async_invocation(invocation);
+                }
+                ChannelEvent::Closed => {}
+            })
+            .expect("Failed to init runtime async event source.");
 
         let damage_blink_enabled = std::env::args().any(|arg| arg == "--damage-blink")
             || std::env::var_os("SHOJI_DAMAGE_BLINK")
@@ -724,6 +737,7 @@ impl ShojiWM {
             runtime_key_binding_entries: Default::default(),
             runtime_key_bindings: Vec::new(),
             runtime_window_move_modifier: None,
+            runtime_pointer_move_async_enabled: false,
             current_keyboard_modifiers: ModifiersState::default(),
             suggested_window_offset: None,
             async_asset_dirty: false,
@@ -1151,6 +1165,7 @@ impl ShojiWM {
                 state.consume_runtime_display_config(tick.display_config);
                 state.consume_runtime_key_binding_config(tick.key_binding_config);
                 state.consume_runtime_pointer_config(tick.pointer_config);
+                state.consume_runtime_event_config(tick.event_config);
                 state.consume_runtime_process_config(tick.process_config);
                 if !tick.process_actions.is_empty() {
                     state.apply_runtime_process_actions(tick.process_actions);
@@ -1200,6 +1215,7 @@ impl ShojiWM {
                 self.consume_runtime_display_config(result.display_config);
                 self.consume_runtime_key_binding_config(result.key_binding_config);
                 self.consume_runtime_pointer_config(result.pointer_config);
+                self.consume_runtime_event_config(result.event_config);
                 self.consume_runtime_process_config(result.process_config);
                 if !result.process_actions.is_empty() {
                     self.apply_runtime_process_actions(result.process_actions);
@@ -1455,6 +1471,48 @@ impl ShojiWM {
     pub fn consume_runtime_pointer_config(&mut self, update: Option<RuntimePointerConfigUpdate>) {
         if let Some(update) = update {
             self.apply_runtime_pointer_config_update(update);
+        }
+    }
+
+    pub fn apply_runtime_event_config_update(&mut self, update: RuntimeEventConfigUpdate) {
+        self.runtime_pointer_move_async_enabled = update.pointer_move_async;
+    }
+
+    pub fn consume_runtime_event_config(&mut self, update: Option<RuntimeEventConfigUpdate>) {
+        if let Some(update) = update {
+            self.apply_runtime_event_config_update(update);
+        }
+    }
+
+    pub fn handle_runtime_pointer_move_async_invocation(
+        &mut self,
+        invocation: DecorationPointerMoveAsyncInvocation,
+    ) {
+        if invocation.dirty {
+            self.runtime_poll_dirty = true;
+            self.runtime_dirty_window_ids
+                .extend(invocation.dirty_window_ids.into_iter());
+            self.request_tty_maintenance("runtime-pointer-move-async-dirty");
+            self.schedule_redraw();
+        }
+
+        self.consume_runtime_display_config(invocation.display_config);
+        self.consume_runtime_key_binding_config(invocation.key_binding_config);
+        self.consume_runtime_pointer_config(invocation.pointer_config);
+        self.consume_runtime_event_config(invocation.event_config);
+        self.consume_runtime_process_config(invocation.process_config);
+        if !invocation.process_actions.is_empty() {
+            self.apply_runtime_process_actions(invocation.process_actions);
+        }
+
+        if !invocation.actions.is_empty() {
+            self.request_tty_maintenance("runtime-pointer-move-async-actions");
+            self.apply_runtime_window_actions(invocation.actions);
+            self.schedule_redraw();
+        }
+
+        if invocation.next_poll_in_ms.is_some() {
+            self.runtime_scheduler_enabled = true;
         }
     }
 

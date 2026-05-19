@@ -25,9 +25,10 @@ pub use bridge::{
 };
 pub use evaluator::{
     DecorationEvaluationError, DecorationEvaluationResult, DecorationEvaluator,
-    DecorationHandlerInvocation, DecorationKeyBindingInvocation, DecorationSchedulerTick,
-    DecorationWindowMoveInvocation, DecorationWindowResizeInvocation, LayerEffectEvaluationResult,
-    NodeDecorationEvaluator, RuntimeLayerEffectAssignment, RuntimeWindowAction,
+    DecorationHandlerInvocation, DecorationKeyBindingInvocation,
+    DecorationPointerMoveAsyncInvocation, DecorationSchedulerTick, DecorationWindowMoveInvocation,
+    DecorationWindowResizeInvocation, LayerEffectEvaluationResult, NodeDecorationEvaluator,
+    RuntimeEventConfigUpdate, RuntimeLayerEffectAssignment, RuntimeWindowAction,
     StaticDecorationEvaluator, evaluate_dynamic_decoration,
 };
 pub use integration::{
@@ -36,7 +37,8 @@ pub use integration::{
 pub use interaction::DecorationInteractionSnapshot;
 pub use window_model::{
     LayerKindSnapshot, LayerPositionSnapshot, ManagedWindowState, OutputModeSnapshot,
-    OutputPositionSnapshot, TransformOrigin, WaylandLayerSnapshot, WaylandOutputSnapshot,
+    OutputPositionSnapshot, PointerModifierStateSnapshot, PointerMoveEventSnapshot,
+    PointerMovePointSnapshot, TransformOrigin, WaylandLayerSnapshot, WaylandOutputSnapshot,
     WaylandWindowAction, WaylandWindowSnapshot, WindowIconSnapshot, WindowMoveEventSnapshot,
     WindowMovePhaseSnapshot, WindowMoveSourceSnapshot, WindowPositionSnapshot,
     WindowResizeEdgesSnapshot, WindowResizeEventSnapshot, WindowResizePhaseSnapshot,
