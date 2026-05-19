@@ -720,7 +720,7 @@ pub fn clipped_popup_elements(
                 output_origin,
                 clip,
                 None,
-                Some("popup clipped by ManagedWindow.clipToRect".to_owned()),
+                Some("popup clipped by ManagedWindow.forceRectSize".to_owned()),
             )
         })
         .collect()

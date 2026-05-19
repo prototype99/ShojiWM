@@ -1967,7 +1967,7 @@ fn render_surface(
                 .and_then(|decoration| decoration.content_clip);
             let clip_all_client_surfaces = window_decorations
                 .get(window)
-                .is_some_and(|decoration| decoration.managed_window.clip_to_rect);
+                .is_some_and(|decoration| decoration.managed_window.force_rect_size);
 
             let client_phase_started_at = Instant::now();
             let client_elements = if use_full_window_snapshot {
@@ -7794,7 +7794,7 @@ fn window_scene_elements_for_capture(
                 scale,
                 visual_state.opacity,
                 Some(content_clip),
-                decoration.managed_window.clip_to_rect,
+                decoration.managed_window.force_rect_size,
             )
             .unwrap_or_default();
             let mut clipped_elements = Vec::new();

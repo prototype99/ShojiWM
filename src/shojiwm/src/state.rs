@@ -1185,6 +1185,10 @@ impl ShojiWM {
             is_maximized: false,
             is_fullscreen: false,
             is_xwayland: false,
+            size_constraints: Default::default(),
+            is_resizable: true,
+            is_transient: false,
+            parent_id: None,
             icon: None,
             interaction: DecorationInteractionSnapshot::default(),
         };
@@ -2021,7 +2025,7 @@ impl ShojiWM {
                 return None;
             }
             if let Some(decoration) = self.window_decorations.get(window)
-                && decoration.managed_window.clip_to_rect
+                && decoration.managed_window.force_rect_size
             {
                 let transformed_root =
                     transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);

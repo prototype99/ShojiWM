@@ -25,6 +25,10 @@ const DEFAULT_SNAPSHOT: WaylandWindowSnapshot = {
   isMaximized: false,
   isFullscreen: false,
   isXwayland: false,
+  sizeConstraints: {},
+  isResizable: true,
+  isTransient: false,
+  parentId: undefined,
   icon: undefined,
   interaction: {
     hoveredIds: [],

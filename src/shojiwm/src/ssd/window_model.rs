@@ -1,10 +1,14 @@
 use serde::Serialize;
 use smithay::{
     desktop::{LayerSurface, Window, layer_map_for_output},
-    reexports::{wayland_protocols::xdg::shell::server::xdg_toplevel, wayland_server::Resource},
+    reexports::{
+        wayland_protocols::xdg::shell::server::xdg_toplevel,
+        wayland_server::{Resource, protocol::wl_surface::WlSurface},
+    },
     wayland::{
-        compositor::with_states, shell::wlr_layer::Layer as WlrLayer,
-        shell::xdg::XdgToplevelSurfaceData,
+        compositor::with_states,
+        shell::wlr_layer::Layer as WlrLayer,
+        shell::xdg::{SurfaceCachedState, XdgToplevelSurfaceData},
     },
 };
 
@@ -24,8 +28,26 @@ pub struct WaylandWindowSnapshot {
     pub is_maximized: bool,
     pub is_fullscreen: bool,
     pub is_xwayland: bool,
+    pub size_constraints: WindowSizeConstraintsSnapshot,
+    pub is_resizable: bool,
+    pub is_transient: bool,
+    pub parent_id: Option<String>,
     pub icon: Option<WindowIconSnapshot>,
     pub interaction: DecorationInteractionSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowSizeSnapshot {
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowSizeConstraintsSnapshot {
+    pub min: Option<WindowSizeSnapshot>,
+    pub max: Option<WindowSizeSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -230,7 +252,7 @@ pub struct ManagedWindowState {
     #[serde(default = "default_true")]
     pub interactive: bool,
     #[serde(default)]
-    pub clip_to_rect: bool,
+    pub force_rect_size: bool,
     #[serde(default)]
     pub z_index: Option<i32>,
     #[serde(default)]
@@ -246,7 +268,7 @@ impl Default for ManagedWindowState {
             visible: true,
             idle: false,
             interactive: true,
-            clip_to_rect: false,
+            force_rect_size: false,
             z_index: None,
             transform: WindowTransform::default(),
         }
@@ -283,6 +305,18 @@ impl ShojiWM {
 
             (role.title.clone().unwrap_or_default(), role.app_id.clone())
         });
+        let (min_size, max_size) = with_states(toplevel.wl_surface(), |states| {
+            let mut guard = states.cached_state.get::<SurfaceCachedState>();
+            let data = guard.current();
+            (data.min_size, data.max_size)
+        });
+        let size_constraints = window_size_constraints(min_size, max_size);
+        let is_resizable = window_constraints_are_resizable(min_size, max_size);
+        let parent_surface = toplevel.parent();
+        let parent_id = parent_surface
+            .as_ref()
+            .and_then(|surface| self.runtime_id_for_toplevel_surface(surface));
+        let is_transient = parent_surface.is_some();
 
         let focused_surface = self
             .seat
@@ -330,6 +364,10 @@ impl ShojiWM {
             is_maximized,
             is_fullscreen,
             is_xwayland: false,
+            size_constraints,
+            is_resizable,
+            is_transient,
+            parent_id,
             icon: app_id.as_ref().map(|name| WindowIconSnapshot {
                 name: Some(name.clone()),
                 bytes: None,
@@ -350,6 +388,10 @@ impl ShojiWM {
                 is_maximized: false,
                 is_fullscreen: false,
                 is_xwayland: false,
+                size_constraints: WindowSizeConstraintsSnapshot::default(),
+                is_resizable: true,
+                is_transient: false,
+                parent_id: None,
                 icon: None,
                 interaction: DecorationInteractionSnapshot::default(),
             };
@@ -358,6 +400,13 @@ impl ShojiWM {
         let title = x11.title();
         let class = x11.class();
         let app_id = (!class.is_empty()).then_some(class);
+        let min_size = x11.min_size().unwrap_or_default();
+        let max_size = x11.max_size().unwrap_or_default();
+        let size_constraints = window_size_constraints(min_size, max_size);
+        let is_resizable = window_constraints_are_resizable(min_size, max_size);
+        let transient_for = x11.is_transient_for();
+        let parent_id = transient_for.map(|parent| format!("x11:{parent}"));
+        let is_transient = parent_id.is_some() || x11.is_popup();
 
         let focused_surface = self
             .seat
@@ -398,6 +447,10 @@ impl ShojiWM {
             is_maximized: false,
             is_fullscreen: false,
             is_xwayland: true,
+            size_constraints,
+            is_resizable,
+            is_transient,
+            parent_id,
             icon: app_id.as_ref().map(|name| WindowIconSnapshot {
                 name: Some(name.clone()),
                 bytes: None,
@@ -411,6 +464,18 @@ impl ShojiWM {
             .elements()
             .map(|window| self.snapshot_window(window))
             .collect()
+    }
+
+    fn runtime_id_for_toplevel_surface(&self, surface: &WlSurface) -> Option<String> {
+        self.space.elements().find_map(|window| {
+            let toplevel = window.toplevel()?;
+            (toplevel.wl_surface() == surface).then(|| {
+                self.window_decorations
+                    .get(window)
+                    .map(|decoration| decoration.snapshot.id.clone())
+                    .unwrap_or_else(|| runtime_id_for_window(window, surface.id().protocol_id()))
+            })
+        })
     }
 
     pub fn snapshot_layer_surface(
@@ -451,6 +516,34 @@ impl ShojiWM {
         }
         layers
     }
+}
+
+fn window_size_constraints(
+    min_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+    max_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+) -> WindowSizeConstraintsSnapshot {
+    WindowSizeConstraintsSnapshot {
+        min: size_constraint_snapshot(min_size),
+        max: size_constraint_snapshot(max_size),
+    }
+}
+
+fn size_constraint_snapshot(
+    size: smithay::utils::Size<i32, smithay::utils::Logical>,
+) -> Option<WindowSizeSnapshot> {
+    (size.w > 0 || size.h > 0).then_some(WindowSizeSnapshot {
+        width: size.w.max(0),
+        height: size.h.max(0),
+    })
+}
+
+fn window_constraints_are_resizable(
+    min_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+    max_size: smithay::utils::Size<i32, smithay::utils::Logical>,
+) -> bool {
+    let width_fixed = min_size.w > 0 && max_size.w > 0 && min_size.w == max_size.w;
+    let height_fixed = min_size.h > 0 && max_size.h > 0 && min_size.h == max_size.h;
+    !(width_fixed || height_fixed)
 }
 
 fn runtime_id_for_window(window: &Window, protocol_id: u32) -> String {

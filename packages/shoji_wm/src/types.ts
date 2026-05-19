@@ -8,6 +8,10 @@ export interface WaylandWindowSnapshot {
   readonly isMaximized: boolean;
   readonly isFullscreen: boolean;
   readonly isXwayland: boolean;
+  readonly sizeConstraints: WindowSizeConstraints;
+  readonly isResizable: boolean;
+  readonly isTransient: boolean;
+  readonly parentId?: string;
   readonly icon?: WindowIcon;
   readonly interaction: DecorationInteractionSnapshot;
 }
@@ -41,6 +45,10 @@ export interface WaylandWindow {
   readonly isFloating: import("./signals").ReadonlySignal<boolean>;
   readonly isMaximized: import("./signals").ReadonlySignal<boolean>;
   readonly isFullscreen: import("./signals").ReadonlySignal<boolean>;
+  readonly sizeConstraints: import("./signals").ReadonlySignal<WindowSizeConstraints>;
+  readonly isResizable: import("./signals").ReadonlySignal<boolean>;
+  readonly isTransient: import("./signals").ReadonlySignal<boolean>;
+  readonly parentId: import("./signals").ReadonlySignal<string | undefined>;
   readonly icon: import("./signals").ReadonlySignal<WindowIcon | undefined>;
   readonly interaction: import("./signals").ReadonlySignal<DecorationInteractionSnapshot>;
   close(): void;
@@ -65,6 +73,16 @@ export interface WindowPosition {
   y: number;
   width: number;
   height: number;
+}
+
+export interface WindowSize {
+  width: number;
+  height: number;
+}
+
+export interface WindowSizeConstraints {
+  min?: WindowSize;
+  max?: WindowSize;
 }
 
 export interface LayerPosition {
@@ -111,7 +129,7 @@ export interface ManagedWindowState {
   visible: boolean;
   idle: boolean;
   interactive: boolean;
-  clipToRect: boolean;
+  forceRectSize: boolean;
   zIndex?: number;
   transform: WindowTransform;
 }
@@ -568,7 +586,7 @@ export interface ManagedWindowProps extends ComponentProps {
   visible?: MaybeSignal<boolean>;
   idle?: MaybeSignal<boolean>;
   interactive?: MaybeSignal<boolean>;
-  clipToRect?: MaybeSignal<boolean>;
+  forceRectSize?: MaybeSignal<boolean>;
   zIndex?: MaybeSignal<number>;
   opacity?: MaybeSignal<number>;
   transform?: MaybeSignal<ManagedWindowTransform>;
@@ -635,6 +653,10 @@ export interface ReactiveWaylandWindowSignals {
   isFloating: import("./signals").ReadonlySignal<boolean>;
   isMaximized: import("./signals").ReadonlySignal<boolean>;
   isFullscreen: import("./signals").ReadonlySignal<boolean>;
+  sizeConstraints: import("./signals").ReadonlySignal<WindowSizeConstraints>;
+  isResizable: import("./signals").ReadonlySignal<boolean>;
+  isTransient: import("./signals").ReadonlySignal<boolean>;
+  parentId: import("./signals").ReadonlySignal<string | undefined>;
   icon: import("./signals").ReadonlySignal<WindowIcon | undefined>;
   interaction: import("./signals").ReadonlySignal<DecorationInteractionSnapshot>;
   transformOriginX: import("./signals").Signal<number>;

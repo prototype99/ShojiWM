@@ -2254,6 +2254,10 @@ mod tests {
             is_maximized: false,
             is_fullscreen: false,
             is_xwayland: false,
+            size_constraints: Default::default(),
+            is_resizable: true,
+            is_transient: false,
+            parent_id: None,
             icon: None,
             interaction: crate::ssd::DecorationInteractionSnapshot::default(),
         }

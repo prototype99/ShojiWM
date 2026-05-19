@@ -207,6 +207,7 @@ WINDOW_MANAGER.decoration = (window: WaylandWindow) => {
             height: base.height,
         };
     });
+    const forceRectSize = computed(() => window.isResizable() && !window.isTransient());
 
     const borderColor = window.isFocused(focused => focused ? "#d7ba7d" : "#4f5666");
     const titlebarBackground = window.isFocused(focused => focused ? "#1f243080" : "#2a2f3a80");
@@ -301,7 +302,7 @@ WINDOW_MANAGER.decoration = (window: WaylandWindow) => {
         <ManagedWindow
             rect={rect}
             zIndex={windowStack.zIndex(window)}
-            clipToRect
+            forceRectSize={forceRectSize}
             opacity={opacity}
         >
             <WindowBorder

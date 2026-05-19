@@ -12,6 +12,7 @@ import type {
   ManagedWindowState,
   WindowIcon,
   WindowPosition,
+  WindowSizeConstraints,
 } from "./types";
 
 interface MutableWindowSignals {
@@ -27,6 +28,10 @@ interface MutableWindowSignals {
   isMaximized: Signal<boolean>;
   isFullscreen: Signal<boolean>;
   isXwayland: Signal<boolean>;
+  sizeConstraints: Signal<WindowSizeConstraints>;
+  isResizable: Signal<boolean>;
+  isTransient: Signal<boolean>;
+  parentId: Signal<string | undefined>;
   icon: Signal<WindowIcon | undefined>;
   interaction: Signal<DecorationInteractionSnapshot>;
   transformOriginX: Signal<number>;
@@ -56,6 +61,10 @@ export function createReactiveWindow(
     isMaximized: signal(snapshot.isMaximized),
     isFullscreen: signal(snapshot.isFullscreen),
     isXwayland: signal(snapshot.isXwayland),
+    sizeConstraints: signal(snapshot.sizeConstraints),
+    isResizable: signal(snapshot.isResizable),
+    isTransient: signal(snapshot.isTransient),
+    parentId: signal(snapshot.parentId),
     icon: signal(snapshot.icon),
     interaction: signal(snapshot.interaction),
     transformOriginX: signal(0.5),
@@ -149,6 +158,10 @@ export function createReactiveWindow(
     isFloating: signals.isFloating,
     isMaximized: signals.isMaximized,
     isFullscreen: signals.isFullscreen,
+    sizeConstraints: signals.sizeConstraints,
+    isResizable: signals.isResizable,
+    isTransient: signals.isTransient,
+    parentId: signals.parentId,
     icon: signals.icon,
     interaction: signals.interaction,
     get transform() {
@@ -181,6 +194,10 @@ export function createReactiveWindow(
       signals.isMaximized.value = nextSnapshot.isMaximized;
       signals.isFullscreen.value = nextSnapshot.isFullscreen;
       signals.isXwayland.value = nextSnapshot.isXwayland;
+      signals.sizeConstraints.value = nextSnapshot.sizeConstraints;
+      signals.isResizable.value = nextSnapshot.isResizable;
+      signals.isTransient.value = nextSnapshot.isTransient;
+      signals.parentId.value = nextSnapshot.parentId;
       signals.icon.value = nextSnapshot.icon;
       signals.interaction.value = nextSnapshot.interaction;
     },

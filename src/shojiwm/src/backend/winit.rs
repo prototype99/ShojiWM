@@ -555,7 +555,7 @@ pub fn init_winit(
                             let clip_all_client_surfaces = state
                                 .window_decorations
                                 .get(window)
-                                .is_some_and(|decoration| decoration.managed_window.clip_to_rect);
+                                .is_some_and(|decoration| decoration.managed_window.force_rect_size);
 
                             let client_elements = if let Some(content_clip) = content_clip {
                                 if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
@@ -3595,7 +3595,7 @@ fn window_scene_elements_for_capture(
                 scale,
                 visual_state.opacity,
                 Some(content_clip),
-                decoration.managed_window.clip_to_rect,
+                decoration.managed_window.force_rect_size,
             )
             .unwrap_or_default();
             let mut clipped_elements = Vec::new();

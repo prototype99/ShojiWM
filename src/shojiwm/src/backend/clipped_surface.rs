@@ -351,7 +351,7 @@ impl ClippedSurfaceElement {
         // slots we derive the clip from the physical destination rectangle
         // above, so a 1 px mismatch is a real crop/extend request rather than
         // rounding noise. Expanding it back to the surface is what made
-        // clipToRect leak or leave a moving 1 px seam near client min-size.
+        // forceRectSize leak or leave a moving 1 px seam near client min-size.
         let allowed_clip_delta_px = 0.01;
         if clip_size_delta_px.0 <= allowed_clip_delta_px
             && clip_size_delta_px.1 <= allowed_clip_delta_px

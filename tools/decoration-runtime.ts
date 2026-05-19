@@ -1133,7 +1133,7 @@ function identityManagedWindow(): ManagedWindowState {
     visible: true,
     idle: false,
     interactive: true,
-    clipToRect: false,
+    forceRectSize: false,
     zIndex: 0,
     transform: identityTransform(),
   };

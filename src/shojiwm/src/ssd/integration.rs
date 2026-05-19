@@ -2157,7 +2157,7 @@ impl ShojiWM {
                 );
                 managed.managed.then_some((
                     window.clone(),
-                    managed.clip_to_rect,
+                    managed.force_rect_size,
                     desired_root,
                     decoration.tree.clone(),
                     decoration.layout.root.rect,
@@ -2170,7 +2170,7 @@ impl ShojiWM {
 
         for (
             window,
-            clip_to_rect,
+            force_rect_size,
             desired_root,
             tree,
             current_root,
@@ -2250,7 +2250,9 @@ impl ShojiWM {
                     }
                 }
                 let raster_scale = self.decoration_raster_scale_for_rect(desired_root);
-                if clip_to_rect && let Some(decoration) = self.window_decorations.get_mut(&window) {
+                if force_rect_size
+                    && let Some(decoration) = self.window_decorations.get_mut(&window)
+                {
                     let previous_shader_buffers = decoration.shader_buffers.clone();
                     let previous_text_buffers = decoration.text_buffers.clone();
                     let layout = decoration
@@ -2335,7 +2337,7 @@ fn managed_client_rect_for_state(
     fallback_client_rect: LogicalRect,
     scale: f64,
 ) -> Result<LogicalRect, DecorationEvaluationError> {
-    if !(managed.managed && managed.clip_to_rect) {
+    if !(managed.managed && managed.force_rect_size) {
         return Ok(fallback_client_rect);
     }
 
