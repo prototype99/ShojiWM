@@ -7,7 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicI32, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use smithay::{
@@ -44,7 +44,8 @@ use smithay::{
         background_effect::BackgroundEffectState,
         commit_timing::CommitTimingManagerState,
         compositor::{
-            CompositorClientState, CompositorState, Damage, SurfaceAttributes, with_states,
+            BufferAssignment, CompositorClientState, CompositorState, Damage, SurfaceAttributes,
+            with_states,
         },
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufGlobal, DmabufState},
@@ -284,6 +285,8 @@ pub struct ShojiWM {
     pub debug_previous_scene_signatures: HashMap<String, Vec<String>>,
     pub tty_maintenance_pending: bool,
     pub tty_maintenance_reasons: BTreeSet<&'static str>,
+    pub redraw_reason_counts: HashMap<String, u64>,
+    pub last_redraw_stats_log_at: Instant,
     pub event_source_wake_counts: BTreeMap<&'static str, u64>,
     pub wayland_display_dispatched_request_count: u64,
     pub popup_latency_debug: Option<PopupLatencyDebugState>,
@@ -754,6 +757,8 @@ impl ShojiWM {
             debug_previous_scene_signatures: HashMap::new(),
             tty_maintenance_pending: true,
             tty_maintenance_reasons: BTreeSet::new(),
+            redraw_reason_counts: HashMap::new(),
+            last_redraw_stats_log_at: start_time,
             event_source_wake_counts: BTreeMap::new(),
             wayland_display_dispatched_request_count: 0,
             popup_latency_debug: None,
@@ -2230,11 +2235,41 @@ impl ShojiWM {
 
     #[track_caller]
     pub fn schedule_redraw(&mut self) {
+        let caller = std::panic::Location::caller();
+        if std::env::var_os("SHOJI_REDRAW_STATS")
+            .is_some_and(|value| value != "0" && !value.is_empty())
+        {
+            let key = format!("{}:{}", caller.file(), caller.line());
+            *self.redraw_reason_counts.entry(key).or_default() += 1;
+
+            if self.last_redraw_stats_log_at.elapsed() >= Duration::from_secs(1) {
+                let mut counts = std::mem::take(&mut self.redraw_reason_counts)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                counts.sort_by(|(_, left), (_, right)| right.cmp(left));
+                counts.truncate(12);
+
+                info!(
+                    top_callers = ?counts,
+                    tty_maintenance_pending = self.tty_maintenance_pending,
+                    pending_decoration_damage_count = self.pending_decoration_damage.len(),
+                    window_source_damage_count = self.window_source_damage.len(),
+                    lower_layer_source_damage_count = self.lower_layer_source_damage.len(),
+                    upper_layer_source_damage_count = self.upper_layer_source_damage.len(),
+                    runtime_poll_dirty = self.runtime_poll_dirty,
+                    runtime_dirty_window_ids_count = self.runtime_dirty_window_ids.len(),
+                    transform_snapshot_window_ids_count = self.transform_snapshot_window_ids.len(),
+                    closing_window_snapshots_count = self.closing_window_snapshots.len(),
+                    "redraw stats"
+                );
+                self.last_redraw_stats_log_at = Instant::now();
+            }
+        }
+
         if !self.needs_redraw
             && std::env::var_os("SHOJI_REDRAW_REASON_DEBUG")
                 .is_some_and(|value| value != "0" && !value.is_empty())
         {
-            let caller = std::panic::Location::caller();
             info!(
                 caller_file = caller.file(),
                 caller_line = caller.line(),
@@ -2245,6 +2280,7 @@ impl ShojiWM {
                 lower_layer_source_damage_count = self.lower_layer_source_damage.len(),
                 upper_layer_source_damage_count = self.upper_layer_source_damage.len(),
                 runtime_poll_dirty = self.runtime_poll_dirty,
+                runtime_dirty_window_ids_count = self.runtime_dirty_window_ids.len(),
                 transform_snapshot_window_ids_count = self.transform_snapshot_window_ids.len(),
                 closing_window_snapshots_count = self.closing_window_snapshots.len(),
                 "schedule_redraw requested"
@@ -2516,11 +2552,15 @@ impl ShojiWM {
                 .collect();
         }
 
-        let damage_rects = with_states(surface, |states| {
+        let (damage_rects, buffer_changed) = with_states(surface, |states| {
             let mut cached = states.cached_state.get::<SurfaceAttributes>();
             let attrs = cached.current();
             let buffer_scale = attrs.buffer_scale.max(1);
-            attrs
+            let buffer_changed = matches!(
+                attrs.buffer,
+                Some(BufferAssignment::NewBuffer(_) | BufferAssignment::Removed)
+            );
+            let damage_rects = attrs
                 .damage
                 .iter()
                 .map(|damage| match damage {
@@ -2540,10 +2580,14 @@ impl ShojiWM {
                             .div_euclid(buffer_scale),
                     ),
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (damage_rects, buffer_changed)
         });
 
         if damage_rects.is_empty() {
+            if !buffer_changed {
+                return Vec::new();
+            }
             return self
                 .logical_damage_rect_for_window(window)
                 .into_iter()

@@ -943,6 +943,10 @@ impl ShojiWM {
         let mut pending_process_actions = Vec::new();
         self.sync_runtime_display_state();
         let windows: Vec<Window> = self.space.elements().cloned().collect();
+        let live_window_ids = windows
+            .iter()
+            .map(|window| self.snapshot_window(window).id)
+            .collect::<std::collections::HashSet<_>>();
         let window_count = windows.len();
         let mut rebuilt = 0usize;
         let mut relayout = 0usize;
@@ -2099,6 +2103,10 @@ impl ShojiWM {
         for window_id in processed_runtime_dirty_window_ids {
             self.runtime_dirty_window_ids.remove(&window_id);
         }
+        self.runtime_dirty_window_ids.retain(|window_id| {
+            live_window_ids.contains(window_id)
+                || self.closing_window_snapshots.contains_key(window_id)
+        });
         self.runtime_poll_dirty = !self.runtime_dirty_window_ids.is_empty();
         self.async_asset_dirty = false;
 

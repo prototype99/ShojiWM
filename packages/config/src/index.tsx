@@ -69,9 +69,9 @@ WINDOW_MANAGER.key.bind("screenshot-freeze", "Super+Ctrl+P", () => {
 });
 
 let POINTER_POSITION = { x: 0, y: 0 };
-const ALL_WINDOWS = new Set<WaylandWindow>();
+const ALL_WINDOWS = new Map<string, WaylandWindow>();
 WINDOW_MANAGER.key.bind("test", "Super+S", () => {
-    for (let window of ALL_WINDOWS) {
+    for (let window of ALL_WINDOWS.values()) {
         playRectAnimation(
             window,
             WINDOW_STATE_RECT,
@@ -85,7 +85,7 @@ WINDOW_MANAGER.event.onPointerMoveAsync((event) => {
     POINTER_POSITION = event.position;
 });
 WINDOW_MANAGER.event.onOpen((window) => {
-    ALL_WINDOWS.add(window);
+    ALL_WINDOWS.set(window.id, window);
 })
 
 WINDOW_MANAGER.output.applyDisplayConfig((display) => {
@@ -190,6 +190,7 @@ WINDOW_MANAGER.event.onStartClose((window) => {
 
 WINDOW_MANAGER.event.onClose((window) => {
     windowStack.remove(window);
+    ALL_WINDOWS.delete(window.id);
 });
 
 WINDOW_MANAGER.event.onFocus((window, focused) => {

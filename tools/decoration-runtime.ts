@@ -561,6 +561,37 @@ function beginRuntimeTurn(nowMs: number): void {
   advanceAnimationFrame(nowMs);
 }
 
+// --- Diagnostic counters (SHOJI_RUNTIME_STATS=1) -----------------------------
+const statsEnabled = process.env.SHOJI_RUNTIME_STATS === "1";
+const stats = {
+  evaluate: 0,
+  schedulerTick: 0,
+  schedulerTickDirty: 0,
+  invokeHandler: 0,
+  invokeKeyBinding: 0,
+  windowResize: 0,
+  windowMove: 0,
+  pointerMoveAsync: 0,
+  getEffectConfig: 0,
+  evaluateLayerEffects: 0,
+  evaluateLayerEffectsAnim: 0,
+  markWindowDirty: 0,
+  markRuntimeDirty: 0,
+  markLayerDirty: 0,
+};
+function startStatsLogger(): void {
+  if (!statsEnabled) return;
+  setInterval(() => {
+    const total = Object.values(stats).reduce((a, b) => a + b, 0);
+    if (total === 0) return;
+    const snapshot = { ...stats };
+    for (const key of Object.keys(stats) as (keyof typeof stats)[]) {
+      stats[key] = 0;
+    }
+    console.error("[stats/1s]", JSON.stringify(snapshot));
+  }, 1000).unref();
+}
+
 async function main() {
   const configPath = process.argv[2];
   const socketPath = process.argv[3];
@@ -568,6 +599,7 @@ async function main() {
     throw new Error("usage: tsx tools/composition-runtime.ts <config-path> [socket-path]");
   }
   installRuntimeConsoleBridge();
+  startStatsLogger();
 
   installSchedulerBridge({
     registerPoll(intervalMs, callback, dirtyMode) {
@@ -576,12 +608,15 @@ async function main() {
   });
   installRuntimeHooks({
     markRuntimeDirty() {
+      if (statsEnabled) stats.markRuntimeDirty++;
       runtimeDirty = true;
     },
     markWindowDirty(windowId) {
+      if (statsEnabled) stats.markWindowDirty++;
       dirtyWindowIds.add(windowId);
     },
     markLayerDirty(layerId) {
+      if (statsEnabled) stats.markLayerDirty++;
       dirtyLayerIds.add(layerId);
     },
   });
@@ -623,6 +658,39 @@ async function main() {
       if (hasRuntimeTimestamp(request)) {
         beginRuntimeTurn(request.nowMs);
       }
+      if (statsEnabled) {
+        switch (request.kind) {
+          case "evaluate":
+          case "evaluatePreview":
+            stats.evaluate++;
+            break;
+          case "schedulerTick":
+            stats.schedulerTick++;
+            break;
+          case "invokeHandler":
+            stats.invokeHandler++;
+            break;
+          case "invokeKeyBinding":
+            stats.invokeKeyBinding++;
+            break;
+          case "windowResize":
+            stats.windowResize++;
+            break;
+          case "windowMove":
+            stats.windowMove++;
+            break;
+          case "pointerMoveAsync":
+            stats.pointerMoveAsync++;
+            break;
+          case "getEffectConfig":
+            stats.getEffectConfig++;
+            break;
+          case "evaluateLayerEffects":
+            stats.evaluateLayerEffects++;
+            if (hasActiveAnimations()) stats.evaluateLayerEffectsAnim++;
+            break;
+        }
+      }
       if (request.kind === "evaluate" || request.kind === "evaluatePreview") {
         const result = request.kind === "evaluate"
           ? evaluateSnapshot(composition, events, effectConfig, request.snapshot, request.nowMs)
@@ -659,6 +727,7 @@ async function main() {
       } else {
         if (request.kind === "schedulerTick") {
           const tick = processSchedulerTick(request.nowMs);
+          if (statsEnabled && tick.dirty) stats.schedulerTickDirty++;
           const keyBindingConfig = pendingKeyBindingConfigPayload();
           const pointerConfig = pendingPointerConfigPayload();
           const eventConfig = pendingEventConfigPayload(events);

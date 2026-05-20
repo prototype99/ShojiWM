@@ -598,9 +598,7 @@ impl ShojiWM {
                 right: state.anchor.contains(WlrAnchor::RIGHT),
             },
             exclusive_zone: match state.exclusive_zone {
-                WlrExclusiveZone::Exclusive(size) => {
-                    LayerExclusiveZoneSnapshot::Exclusive { size }
-                }
+                WlrExclusiveZone::Exclusive(size) => LayerExclusiveZoneSnapshot::Exclusive { size },
                 WlrExclusiveZone::Neutral => LayerExclusiveZoneSnapshot::Neutral,
                 WlrExclusiveZone::DontCare => LayerExclusiveZoneSnapshot::DontCare,
             },
