@@ -279,6 +279,32 @@ pub fn snapped_precise_logical_rect_in_area_space(
     }
 }
 
+pub fn snapped_precise_logical_rect_in_root_frame_area_space(
+    rect: PreciseLogicalRect,
+    element_rect: PreciseLogicalRect,
+    area_width: i32,
+    area_height: i32,
+    root_rect: LogicalRect,
+    output_geo: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+) -> SnappedLogicalRect {
+    let element_physical =
+        relative_physical_rect_from_root_precise(element_rect, root_rect, output_geo, scale);
+    let clip_physical =
+        relative_physical_rect_from_root_precise(rect, root_rect, output_geo, scale);
+    let element_width_px = element_physical.size.w.max(1) as f32;
+    let element_height_px = element_physical.size.h.max(1) as f32;
+    let area_width = area_width.max(1) as f32;
+    let area_height = area_height.max(1) as f32;
+
+    SnappedLogicalRect {
+        x: (clip_physical.loc.x - element_physical.loc.x) as f32 * area_width / element_width_px,
+        y: (clip_physical.loc.y - element_physical.loc.y) as f32 * area_height / element_height_px,
+        width: clip_physical.size.w.max(0) as f32 * area_width / element_width_px,
+        height: clip_physical.size.h.max(0) as f32 * area_height / element_height_px,
+    }
+}
+
 pub fn logical_rect_to_physical_buffer_rect(
     rect: LogicalRect,
     origin: Point<i32, Logical>,
@@ -584,6 +610,54 @@ pub fn root_physical_origin(
     .to_physical_precise_round(output_scale)
 }
 
+fn root_physical_size_from_edges(
+    rect: LogicalRect,
+    output_geo: Rectangle<i32, Logical>,
+    output_scale: Scale<f64>,
+) -> smithay::utils::Size<i32, Physical> {
+    let scale_x = output_scale.x.abs().max(0.0001);
+    let scale_y = output_scale.y.abs().max(0.0001);
+    let left = (((rect.x - output_geo.loc.x) as f64) * scale_x).round() as i32;
+    let top = (((rect.y - output_geo.loc.y) as f64) * scale_y).round() as i32;
+    let right = ((((rect.x + rect.width) - output_geo.loc.x) as f64) * scale_x).round() as i32;
+    let bottom = ((((rect.y + rect.height) - output_geo.loc.y) as f64) * scale_y).round() as i32;
+    ((right - left).max(0), (bottom - top).max(0)).into()
+}
+
+fn relative_physical_rect_in_root_frame(
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    root_rect: LogicalRect,
+    output_geo: Rectangle<i32, Logical>,
+    output_scale: Scale<f64>,
+) -> Rectangle<i32, Physical> {
+    let root_width = (root_rect.width.max(1)) as f32;
+    let root_height = (root_rect.height.max(1)) as f32;
+    let root_size = root_physical_size_from_edges(root_rect, output_geo, output_scale);
+    let root_x = root_rect.x as f32;
+    let root_y = root_rect.y as f32;
+
+    // The whole SSD tree is measured in one physical frame owned by the root
+    // decoration rect. The root frame itself is snapped from output-global
+    // left/right/top/bottom edges so its far edges stay fixed during fractional
+    // scale resizes. Descendants are then rounded in this root-local frame,
+    // preventing each element from choosing a different output-global phase.
+    let to_px_x = |x: f32| (((x - root_x) / root_width) * root_size.w.max(0) as f32).round() as i32;
+    let to_px_y =
+        |y: f32| (((y - root_y) / root_height) * root_size.h.max(0) as f32).round() as i32;
+
+    let left_px = to_px_x(left);
+    let top_px = to_px_y(top);
+    let right_px = to_px_x(right);
+    let bottom_px = to_px_y(bottom);
+    Rectangle::new(
+        Point::from((left_px, top_px)),
+        ((right_px - left_px).max(0), (bottom_px - top_px).max(0)).into(),
+    )
+}
+
 pub fn relative_physical_rect_from_root(
     rect: LogicalRect,
     root_rect: LogicalRect,
@@ -591,27 +665,16 @@ pub fn relative_physical_rect_from_root(
     output_scale: Scale<f64>,
     shared_rect: Option<LogicalRect>,
 ) -> Rectangle<i32, Physical> {
-    let _ = output_geo;
-    let scale_x = output_scale.x.abs().max(0.0001);
-    let scale_y = output_scale.y.abs().max(0.0001);
-    let anchored_left = shared_rect.is_some_and(|shared| rect.x == shared.x);
-    let anchored_top = shared_rect.is_some_and(|shared| rect.y == shared.y);
-
-    let left_px = if anchored_left {
-        (((rect.x - root_rect.x) as f64) * scale_x).round() as i32
-    } else {
-        (((rect.x - root_rect.x) as f64) * scale_x).round() as i32
-    };
-    let top_px = if anchored_top {
-        (((rect.y - root_rect.y) as f64) * scale_y).round() as i32
-    } else {
-        (((rect.y - root_rect.y) as f64) * scale_y).round() as i32
-    };
-
-    let width_px = ((rect.width as f64) * scale_x).round().max(0.0) as i32;
-    let height_px = ((rect.height as f64) * scale_y).round().max(0.0) as i32;
-
-    Rectangle::new(Point::from((left_px, top_px)), (width_px, height_px).into())
+    let _ = shared_rect;
+    relative_physical_rect_in_root_frame(
+        rect.x as f32,
+        rect.y as f32,
+        (rect.x + rect.width) as f32,
+        (rect.y + rect.height) as f32,
+        root_rect,
+        output_geo,
+        output_scale,
+    )
 }
 
 pub fn relative_physical_rect_from_root_snapped_edges(
@@ -653,18 +716,14 @@ pub fn relative_physical_rect_from_root_precise(
     output_geo: Rectangle<i32, Logical>,
     output_scale: Scale<f64>,
 ) -> Rectangle<i32, Physical> {
-    let _ = output_geo;
-    let scale_x = output_scale.x.abs().max(0.0001) as f32;
-    let scale_y = output_scale.y.abs().max(0.0001) as f32;
-    let root_x = root_rect.x as f32;
-    let root_y = root_rect.y as f32;
-    let left_px = (((rect.x - root_x) * scale_x).round()) as i32;
-    let top_px = (((rect.y - root_y) * scale_y).round()) as i32;
-    let right_px = ((((rect.x + rect.width) - root_x) * scale_x).round()) as i32;
-    let bottom_px = ((((rect.y + rect.height) - root_y) * scale_y).round()) as i32;
-    Rectangle::new(
-        Point::from((left_px, top_px)),
-        ((right_px - left_px).max(0), (bottom_px - top_px).max(0)).into(),
+    relative_physical_rect_in_root_frame(
+        rect.x,
+        rect.y,
+        rect.x + rect.width,
+        rect.y + rect.height,
+        root_rect,
+        output_geo,
+        output_scale,
     )
 }
 
@@ -736,6 +795,7 @@ mod tests {
         PreciseLogicalRect, relative_physical_rect_from_root,
         relative_physical_rect_from_root_snapped_edges, snapped_precise_logical_rect_in_area_space,
         snapped_precise_logical_rect_in_element_space,
+        snapped_precise_logical_rect_in_root_frame_area_space,
     };
     use crate::ssd::LogicalRect;
     use smithay::utils::{Logical, Point, Rectangle, Scale};
@@ -758,7 +818,21 @@ mod tests {
         let local_b = relative_physical_rect_from_root(child_b, root_b, output_geo, scale, None);
 
         assert_eq!(snapped_a, snapped_b);
-        assert_ne!(local_a, local_b);
+        assert_eq!(local_a, local_b);
+    }
+
+    #[test]
+    fn root_frame_uses_output_snapped_far_edges() {
+        let output_geo = Rectangle::<i32, Logical>::new((0, 0).into(), (4000, 2000).into());
+        let scale = Scale::from((1.25, 1.25));
+        let root = LogicalRect::new(1, 0, 10, 10);
+
+        let full = relative_physical_rect_from_root_snapped_edges(root, root, output_geo, scale);
+
+        assert_eq!(full.loc.x, 0);
+        assert_eq!(full.loc.y, 0);
+        assert_eq!(full.size.w, 13);
+        assert_eq!(full.size.h, 13);
     }
 
     #[test]
@@ -818,6 +892,28 @@ mod tests {
         assert_eq!(clip.y, 0.0);
         assert_eq!(clip.width, 900.0);
         assert_eq!(clip.height, 30.0);
+    }
+
+    #[test]
+    fn root_frame_area_clip_matches_root_frame_geometry() {
+        let output_geo = Rectangle::<i32, Logical>::new((0, 0).into(), (4000, 2000).into());
+        let scale = Scale::from((1.25, 1.25));
+        let root = LogicalRect::new(1, 0, 10, 10);
+        let element = PreciseLogicalRect {
+            x: 1.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+        };
+
+        let clip = snapped_precise_logical_rect_in_root_frame_area_space(
+            element, element, 10, 10, root, output_geo, scale,
+        );
+
+        assert_eq!(clip.x, 0.0);
+        assert_eq!(clip.y, 0.0);
+        assert_eq!(clip.width, 10.0);
+        assert_eq!(clip.height, 10.0);
     }
 }
 

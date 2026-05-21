@@ -1660,12 +1660,13 @@ fn backdrop_shader_elements_for_window(
                                 }
                             }))
                             .map(|(rect, clip)| {
-                                crate::backend::visual::snapped_precise_logical_rect_in_area_space(
+                                crate::backend::visual::snapped_precise_logical_rect_in_root_frame_area_space(
                                     clip,
                                     rect,
                                     display_rect.width,
                                     display_rect.height,
-                                    smithay::utils::Point::from((root_rect.x, root_rect.y)),
+                                    root_rect,
+                                    output_geo,
                                     scale,
                                 )
                             });
@@ -1683,14 +1684,15 @@ fn backdrop_shader_elements_for_window(
                                 let rect = display_rect_precise.unwrap_or_else(|| {
                                     crate::backend::visual::precise_rect_from_logical(display_rect)
                                 });
-                                crate::backend::visual::snapped_precise_logical_rect_in_area_space(
+                                crate::backend::visual::snapped_precise_logical_rect_in_root_frame_area_space(
                                     crate::backend::visual::precise_rect_from_logical(
                                         transformed_clip,
                                     ),
                                     rect,
                                     display_rect.width,
                                     display_rect.height,
-                                    smithay::utils::Point::from((root_rect.x, root_rect.y)),
+                                    root_rect,
+                                    output_geo,
                                     scale,
                                 )
                             })
@@ -1926,12 +1928,13 @@ fn backdrop_shader_elements_for_window(
                         }
                     }))
                     .map(|(rect, clip)| {
-                        crate::backend::visual::snapped_precise_logical_rect_in_area_space(
+                        crate::backend::visual::snapped_precise_logical_rect_in_root_frame_area_space(
                             clip,
                             rect,
                             display_rect.width,
                             display_rect.height,
-                            smithay::utils::Point::from((root_rect.x, root_rect.y)),
+                            root_rect,
+                            output_geo,
                             scale,
                         )
                     });
@@ -1949,12 +1952,13 @@ fn backdrop_shader_elements_for_window(
                         let rect = display_rect_precise.unwrap_or_else(|| {
                             crate::backend::visual::precise_rect_from_logical(display_rect)
                         });
-                        crate::backend::visual::snapped_precise_logical_rect_in_area_space(
+                        crate::backend::visual::snapped_precise_logical_rect_in_root_frame_area_space(
                             crate::backend::visual::precise_rect_from_logical(transformed_clip),
                             rect,
                             display_rect.width,
                             display_rect.height,
-                            smithay::utils::Point::from((root_rect.x, root_rect.y)),
+                            root_rect,
+                            output_geo,
                             scale,
                         )
                     })

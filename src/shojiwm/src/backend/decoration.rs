@@ -16,7 +16,8 @@ use crate::{
         RectSnapMode, relative_physical_rect_from_root, relative_physical_rect_from_root_precise,
         relative_physical_rect_from_root_snapped_edges, snapped_logical_radius,
         snapped_logical_rect_for_element, snapped_logical_rect_from_relative_physical,
-        snapped_precise_logical_rect_in_area_space, snapped_precise_logical_rect_in_element_space,
+        snapped_precise_logical_rect_in_element_space,
+        snapped_precise_logical_rect_in_root_frame_area_space,
     },
     ssd::{ComputedDecorationNode, LogicalRect, StylePosition, WindowDecorationState},
 };
@@ -1051,12 +1052,13 @@ fn rounded_rect_element(
         cached
             .clip_rect_precise
             .map(|clip_rect| RoundedClip {
-                rect: snapped_precise_logical_rect_in_area_space(
+                rect: snapped_precise_logical_rect_in_root_frame_area_space(
                     clip_rect,
                     outer_rect_precise,
                     local_rect.size.w,
                     local_rect.size.h,
-                    Point::from((decoration.layout.root.rect.x, decoration.layout.root.rect.y)),
+                    decoration.layout.root.rect,
+                    output_geo,
                     scale,
                 ),
                 radius: snapped_radius_f32(
@@ -1067,12 +1069,13 @@ fn rounded_rect_element(
             })
             .or_else(|| {
                 cached.clip_rect.map(|clip_rect| RoundedClip {
-                    rect: snapped_precise_logical_rect_in_area_space(
+                    rect: snapped_precise_logical_rect_in_root_frame_area_space(
                         crate::backend::visual::precise_rect_from_logical(clip_rect),
                         outer_rect_precise,
                         local_rect.size.w,
                         local_rect.size.h,
-                        Point::from((decoration.layout.root.rect.x, decoration.layout.root.rect.y)),
+                        decoration.layout.root.rect,
+                        output_geo,
                         scale,
                     ),
                     radius: snapped_logical_radius(cached.clip_radius, scale),
@@ -1812,12 +1815,13 @@ fn shader_effect_element(
                         .map(crate::backend::visual::precise_rect_from_logical)
                 }))
                 .map(|(rect_precise, clip_rect)| {
-                    snapped_precise_logical_rect_in_area_space(
+                    snapped_precise_logical_rect_in_root_frame_area_space(
                         clip_rect,
                         rect_precise,
                         local_rect.size.w,
                         local_rect.size.h,
-                        Point::from((decoration.layout.root.rect.x, decoration.layout.root.rect.y)),
+                        decoration.layout.root.rect,
+                        output_geo,
                         scale,
                     )
                 })
