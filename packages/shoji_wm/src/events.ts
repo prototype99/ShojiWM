@@ -1,6 +1,8 @@
 import type { WaylandLayer, WaylandWindow } from "./types";
 
 export type WindowOpenListener = (window: WaylandWindow) => void;
+export type WindowInitialConfigureListener = (window: WaylandWindow) => void;
+export type WindowFirstCommitListener = (window: WaylandWindow) => void;
 export type WindowCloseListener = (window: WaylandWindow) => void;
 export type WindowFocusListener = (window: WaylandWindow, focused: boolean) => void;
 export type WindowStartCloseListener = (window: WaylandWindow) => void;
@@ -108,6 +110,8 @@ export interface RuntimeEventConfig {
 
 export interface WindowManagerEventController {
   onOpen(listener: WindowOpenListener): () => void;
+  onInitialConfigure(listener: WindowInitialConfigureListener): () => void;
+  onFirstCommit(listener: WindowFirstCommitListener): () => void;
   onClose(listener: WindowCloseListener): () => void;
   onFocus(listener: WindowFocusListener): () => void;
   onStartClose(listener: WindowStartCloseListener): () => void;
@@ -117,6 +121,8 @@ export interface WindowManagerEventController {
   onCreateLayer(listener: LayerCreateListener): () => void;
   onDestroyLayer(listener: LayerDestroyListener): () => void;
   emitOpen(window: WaylandWindow): void;
+  emitInitialConfigure(window: WaylandWindow): void;
+  emitFirstCommit(window: WaylandWindow): void;
   emitClose(window: WaylandWindow): void;
   emitFocus(window: WaylandWindow, focused: boolean): void;
   emitStartClose(window: WaylandWindow): void;
@@ -130,6 +136,8 @@ export interface WindowManagerEventController {
 
 export function createWindowManagerEventController(): WindowManagerEventController {
   const openListeners = new Set<WindowOpenListener>();
+  const initialConfigureListeners = new Set<WindowInitialConfigureListener>();
+  const firstCommitListeners = new Set<WindowFirstCommitListener>();
   const closeListeners = new Set<WindowCloseListener>();
   const focusListeners = new Set<WindowFocusListener>();
   const startCloseListeners = new Set<WindowStartCloseListener>();
@@ -148,6 +156,14 @@ export function createWindowManagerEventController(): WindowManagerEventControll
     onOpen(listener) {
       openListeners.add(listener);
       return () => openListeners.delete(listener);
+    },
+    onInitialConfigure(listener) {
+      initialConfigureListeners.add(listener);
+      return () => initialConfigureListeners.delete(listener);
+    },
+    onFirstCommit(listener) {
+      firstCommitListeners.add(listener);
+      return () => firstCommitListeners.delete(listener);
     },
     onClose(listener) {
       closeListeners.add(listener);
@@ -187,6 +203,16 @@ export function createWindowManagerEventController(): WindowManagerEventControll
     },
     emitOpen(window) {
       for (const listener of openListeners) {
+        listener(window);
+      }
+    },
+    emitInitialConfigure(window) {
+      for (const listener of initialConfigureListeners) {
+        listener(window);
+      }
+    },
+    emitFirstCommit(window) {
+      for (const listener of firstCommitListeners) {
         listener(window);
       }
     },

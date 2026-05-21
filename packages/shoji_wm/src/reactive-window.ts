@@ -83,6 +83,7 @@ export function createReactiveWindow(
   let transformScaleX: MaybeSignal<number> = 1;
   let transformScaleY: MaybeSignal<number> = 1;
   let transformOpacity: MaybeSignal<number> = 1;
+  let snapshotRect: WindowPosition = snapshot.rect ?? snapshot.position;
   let managedRect: WindowPosition | undefined;
   let window: ReactiveWaylandWindow;
 
@@ -152,7 +153,7 @@ export function createReactiveWindow(
       return position;
     },
     get rect() {
-      return managedRect;
+      return managedRect ?? snapshotRect;
     },
     state,
     isFocused: signals.isFocused,
@@ -193,6 +194,7 @@ export function createReactiveWindow(
       signals.positionY.value = nextSnapshot.position.y;
       signals.positionWidth.value = nextSnapshot.position.width;
       signals.positionHeight.value = nextSnapshot.position.height;
+      snapshotRect = nextSnapshot.rect ?? nextSnapshot.position;
       signals.isFocused.value = nextSnapshot.isFocused;
       signals.isFloating.value = nextSnapshot.isFloating;
       signals.isMaximized.value = nextSnapshot.isMaximized;

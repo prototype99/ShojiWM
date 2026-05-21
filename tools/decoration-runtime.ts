@@ -478,6 +478,8 @@ function pendingEventConfigPayload(
 
 const cacheByWindowId = new Map<string, RuntimeCacheEntry>();
 const openedWindowIds = new Set<string>();
+const initialConfiguredWindowIds = new Set<string>();
+const firstCommittedWindowIds = new Set<string>();
 const animationEntriesByWindowId = new Map<string, Map<symbol, unknown>>();
 const cacheByLayerId = new Map<string, RuntimeLayerEntry>();
 const openedLayerIds = new Set<string>();
@@ -982,6 +984,10 @@ function evaluateSnapshot(
       events.emitOpen(entry.cache.window);
     }
     events.emitFocus(entry.cache.window, snapshot.isFocused);
+    if (!firstCommittedWindowIds.has(snapshot.id)) {
+      firstCommittedWindowIds.add(snapshot.id);
+      events.emitFirstCommit(entry.cache.window);
+    }
     dirtyWindowIds.delete(snapshot.id);
     return {
       serialized: entry.cache.reevaluate(takeDirtyWindowNodeIds(snapshot.id)).serialized,
@@ -1002,6 +1008,11 @@ function evaluateSnapshot(
   const updated = existing.cache.update(snapshot);
   if (focusChanged) {
     events.emitFocus(existing.cache.window, snapshot.isFocused);
+  }
+  if (!firstCommittedWindowIds.has(snapshot.id)) {
+    firstCommittedWindowIds.add(snapshot.id);
+    events.emitFirstCommit(existing.cache.window);
+    dirtyWindowIds.add(snapshot.id);
   }
 
   const wasDirty = dirtyWindowIds.delete(snapshot.id);
@@ -1043,7 +1054,12 @@ function evaluatePreconfigure(
       openedWindowIds.add(snapshot.id);
       events.emitOpen(entry.cache.window);
     }
+    if (!initialConfiguredWindowIds.has(snapshot.id)) {
+      initialConfiguredWindowIds.add(snapshot.id);
+      events.emitInitialConfigure(entry.cache.window);
+    }
     events.emitFocus(entry.cache.window, snapshot.isFocused);
+    entry.cache.reevaluate(takeDirtyWindowNodeIds(snapshot.id));
   } else {
     entry.cache.setContext(PRECONFIGURE_COMPOSITION_CONTEXT);
     const focusChanged = entry.latestSnapshot.isFocused !== snapshot.isFocused;
@@ -1051,6 +1067,10 @@ function evaluatePreconfigure(
     entry.cache.update(snapshot);
     if (focusChanged) {
       events.emitFocus(entry.cache.window, snapshot.isFocused);
+    }
+    if (!initialConfiguredWindowIds.has(snapshot.id)) {
+      initialConfiguredWindowIds.add(snapshot.id);
+      events.emitInitialConfigure(entry.cache.window);
     }
     entry.cache.reevaluate(takeDirtyWindowNodeIds(snapshot.id));
   }
@@ -1539,6 +1559,8 @@ function closeWindow(events: WindowManagerEventController, windowId: string): vo
   events.emitClose(existing.cache.window);
   cacheByWindowId.delete(windowId);
   openedWindowIds.delete(windowId);
+  initialConfiguredWindowIds.delete(windowId);
+  firstCommittedWindowIds.delete(windowId);
   animationEntriesByWindowId.delete(windowId);
   dirtyWindowIds.delete(windowId);
   dropWindowDependencies(windowId);

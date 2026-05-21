@@ -2539,6 +2539,12 @@ mod tests {
                 width: 800,
                 height: 600,
             },
+            rect: WindowPositionSnapshot {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
             is_focused,
             is_floating: true,
             is_maximized: false,

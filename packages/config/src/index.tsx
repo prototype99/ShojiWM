@@ -10,37 +10,20 @@ import {
     WindowBorder,
     backdropSource,
     compileEffect,
-    compileWindowEffect,
     dualKawaseBlur,
     type SSDStyle,
     type WaylandWindow,
-    animationVariable,
-    seconds,
-    cubicBezier,
     computed,
     useState,
     shaderStage,
     loadShader,
-    windowSource,
     ManagedWindow,
-    createWindowState,
-    createWindowStack,
 } from "shoji_wm";
-import { playRectAnimation } from "./window-manager";
-import type { CompositionRenderable, ManagedWindowRect, WindowPosition } from "shoji_wm/types";
+import type { CompositionRenderable, ManagedWindowRect } from "shoji_wm/types";
+import { HybridWindowManager, OPEN_ANIMATION, WINDOW_STATE_RECT } from "./window-manager";
 
 const NOCTALIA_SHELL_PATH = "/home/bea4dev/Documents/development/noctalia-shell-shojiwm";
-
-/*
-WINDOW_MANAGER.output.applyDisplayConfig((display) => {
-    for (let displayName of WINDOW_MANAGER.output.list) {
-        display[displayName] = {
-            resolution: "best",
-            position: "auto",
-            scale: 2,
-        };
-    }
-});*/
+const HYBRID_WINDOW_MANAGER = new HybridWindowManager(naturalRootRect);
 
 WINDOW_MANAGER.process.once("fcitx5", {
     command: ["fcitx5", "-d"],
@@ -68,26 +51,6 @@ WINDOW_MANAGER.key.bind("screenshot-freeze", "Super+Ctrl+P", () => {
     WINDOW_MANAGER.process.spawn({ command: "hyprshot -m region --freeze --raw | swappy -f -" });
 });
 
-let POINTER_POSITION = { x: 0, y: 0 };
-const ALL_WINDOWS = new Map<string, WaylandWindow>();
-WINDOW_MANAGER.key.bind("test", "Super+S", () => {
-    for (let window of ALL_WINDOWS.values()) {
-        playRectAnimation(
-            window,
-            WINDOW_STATE_RECT,
-            { x: POINTER_POSITION.x, y: POINTER_POSITION.y, width: 700, height: 500 },
-            cubicBezier(0.1, 0.93, 0.1, 0.93),
-            seconds(0.7),
-        );
-    }
-});
-WINDOW_MANAGER.event.onPointerMoveAsync((event) => {
-    POINTER_POSITION = event.position;
-});
-WINDOW_MANAGER.event.onOpen((window) => {
-    ALL_WINDOWS.set(window.id, window);
-})
-
 WINDOW_MANAGER.output.applyDisplayConfig((display) => {
     display["eDP-1"] = {
         resolution: "best",
@@ -106,8 +69,6 @@ WINDOW_MANAGER.output.applyDisplayConfig((display) => {
     };
 });
 
-const openAnimation = animationVariable("window.open");
-
 WINDOW_MANAGER.effect.background_effect = compileEffect({
     input: backdropSource(),
     invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
@@ -115,108 +76,56 @@ WINDOW_MANAGER.effect.background_effect = compileEffect({
         dualKawaseBlur({ radius: 4, passes: 2 }),
     ]
 });
-/*
-const windowShadowEffect = compileWindowEffect({
-    input: windowSource({ include: "full" }),
-    outsets: { left: 72, right: 72, top: 56, bottom: 96 },
-    invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
-    pipeline: [
-        shaderStage(loadShader("./src/window-shadow.frag"), {
-            uniforms: {
-                shadow_color: [0.45, 0.45, 0.45],
-                shadow_opacity: 0.5,
-                shadow_offset_px: [24.0, 24.0],
-            },
-        }),
-    ],
-});
-
-const windowFrontEffect = compileWindowEffect({
-    input: windowSource({ include: "full" }),
-    outsets: { left: 72, right: 72, top: 56, bottom: 96 },
-    invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
-    pipeline: [
-        shaderStage(loadShader("./src/window-shadow.frag"), {
-            uniforms: {
-                shadow_color: [0.45, 0.45, 0.45],
-                shadow_opacity: 0.5,
-                shadow_offset_px: [-24.0, -24.0],
-            },
-        }),
-    ],
-});
-
-const windowReplaceEffect = compileWindowEffect({
-    input: windowSource({ include: "full" }),
-    invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 4 },
-    pipeline: [
-        shaderStage(loadShader("./src/window-grayscale.frag")),
-    ],
-});
-
-WINDOW_MANAGER.effect.window = (window) => ({
-    behindRootSurface: windowShadowEffect,
-    inFront: windowFrontEffect,
-    replace: windowReplaceEffect,
-});*/
-
-const OPEN_CLOSE_ANIMATION_DURATION = seconds(1.0)
-
-const DEFAULT_WINDOW_RECT: WindowPosition = { x: 100, y: 200, width: 1000, height: 700 };
-const WINDOW_STATE_RECT = createWindowState<ManagedWindowRect>("rect", {
-    default: (window) => window.rect ?? DEFAULT_WINDOW_RECT,
-});
-const windowStack = createWindowStack();
 
 WINDOW_MANAGER.event.onOpen((window) => {
-    window.focus();
-    windowStack.add(window);
-    window.state[WINDOW_STATE_RECT].set(window.rect ?? DEFAULT_WINDOW_RECT);
-    window.setCloseAnimationDuration(OPEN_CLOSE_ANIMATION_DURATION);
-    window.animation.start(openAnimation, {
-        duration: OPEN_CLOSE_ANIMATION_DURATION,
-        to: 1,
-        easing: cubicBezier(0.1, 0.93, 0.1, 0.93)
-    });
+    HYBRID_WINDOW_MANAGER.onOpen(window);
+});
+
+WINDOW_MANAGER.event.onFirstCommit((window) => {
+    HYBRID_WINDOW_MANAGER.onFirstCommit(window);
 });
 
 WINDOW_MANAGER.event.onStartClose((window) => {
-    window.animation.start(openAnimation, {
-        duration: OPEN_CLOSE_ANIMATION_DURATION,
-        to: 0,
-        easing: cubicBezier(0.1, 0.93, 0.1, 0.93)
-    });
+    HYBRID_WINDOW_MANAGER.onStartClose(window);
 });
 
 WINDOW_MANAGER.event.onClose((window) => {
-    windowStack.remove(window);
-    ALL_WINDOWS.delete(window.id);
+    HYBRID_WINDOW_MANAGER.onClose(window);
 });
 
 WINDOW_MANAGER.event.onFocus((window, focused) => {
-    if (focused) {
-        windowStack.raise(window);
-    }
-    /*
-    window.animation.start(focusAnimation, {
-        duration: seconds(0.5),
-        to: focused ? 1 : 0.9,
-        easing: cubicBezier(0.1, 0.93, 0.1, 0.93)
-    });*/
+    HYBRID_WINDOW_MANAGER.onFocus(window, focused);
+});
+
+WINDOW_MANAGER.event.onPointerMoveAsync((event) => {
+    HYBRID_WINDOW_MANAGER.onPointerMove(event);
 });
 
 WINDOW_MANAGER.event.onWindowResize((event) => {
-    event.window.state[WINDOW_STATE_RECT].set(event.currentRect);
+    HYBRID_WINDOW_MANAGER.onWindowResize(event);
 });
 
 WINDOW_MANAGER.pointer.bindWindowMoveModifier("Super");
 
 WINDOW_MANAGER.event.onWindowMove((event) => {
-    event.window.state[WINDOW_STATE_RECT].set(event.currentRect);
+    HYBRID_WINDOW_MANAGER.onWindowMove(event);
 });
 
+const WINDOW_BORDER_PX = 2;
+const TITLEBAR_HEIGHT = 30;
+
+function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
+    const client = window.position;
+    return {
+        x: client.x - WINDOW_BORDER_PX,
+        y: client.y - TITLEBAR_HEIGHT - WINDOW_BORDER_PX,
+        width: client.width + WINDOW_BORDER_PX * 2,
+        height: client.height + TITLEBAR_HEIGHT + WINDOW_BORDER_PX * 2,
+    };
+}
+
 WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
-    const openVariable = window.animation.signal(openAnimation);
+    const openVariable = window.animation.signal(OPEN_ANIMATION);
     const opacity = openVariable;
     const translateY = openVariable(variable => (1 - variable) * 200);
     const rect = computed(() => {
@@ -236,7 +145,7 @@ WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
     const titleColor = window.isFocused(focused => focused ? "#f5f7fa" : "#c9d1d9");
 
     const titlebarStyle: SSDStyle = {
-        height: 30,
+        height: TITLEBAR_HEIGHT,
         paddingX: 8,
         gap: 8,
         alignItems: "center",
@@ -323,13 +232,13 @@ WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
     return (
         <ManagedWindow
             rect={rect}
-            zIndex={windowStack.zIndex(window)}
+            zIndex={HYBRID_WINDOW_MANAGER.getWindowZIndex(window)}
             forceRectSize={forceRectSize}
             opacity={opacity}
         >
             <WindowBorder
                 style={{
-                    border: { px: 2, color: borderColor },
+                    border: { px: WINDOW_BORDER_PX, color: borderColor },
                     borderRadius: 10,
                     background: "#10131900",
                     padding: 0,

@@ -20,6 +20,12 @@ const DEFAULT_SNAPSHOT: WaylandWindowSnapshot = {
     width: 900,
     height: 600,
   },
+  rect: {
+    x: 100,
+    y: 80,
+    width: 900,
+    height: 600,
+  },
   isFocused: true,
   isFloating: true,
   isMaximized: false,

@@ -107,6 +107,11 @@ fn window_effect_debug_enabled() -> bool {
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
+fn managed_rect_debug_enabled() -> bool {
+    std::env::var_os("SHOJI_MANAGED_RECT_DEBUG")
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
 fn animation_timing_debug_enabled() -> bool {
     std::env::var_os("SHOJI_ANIMATION_TIMING_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
@@ -1968,6 +1973,16 @@ fn render_surface(
             let clip_all_client_surfaces = window_decorations
                 .get(window)
                 .is_some_and(|decoration| decoration.managed_window.force_rect_size);
+            if let Some(decoration) = window_decorations.get(window) {
+                log_managed_rect_physical_debug(
+                    &window_id,
+                    &output.name(),
+                    decoration.layout.root.rect,
+                    content_clip,
+                    output_geo,
+                    scale,
+                );
+            }
 
             let client_phase_started_at = Instant::now();
             let client_elements = if use_full_window_snapshot {
@@ -4743,6 +4758,89 @@ fn transform_physical_rect_for_visual(
         smithay::utils::Point::from((x, y)),
         smithay::utils::Size::from((width, height)),
     )
+}
+
+fn log_managed_rect_physical_debug(
+    window_id: &str,
+    output_name: &str,
+    root_rect: crate::ssd::LogicalRect,
+    content_clip: Option<crate::ssd::ContentClip>,
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+) {
+    if !managed_rect_debug_enabled() {
+        return;
+    }
+
+    let scale_x = scale.x.abs().max(0.0001);
+    let scale_y = scale.y.abs().max(0.0001);
+    let root_origin = root_physical_origin(root_rect, output_geo, scale);
+    let root_size_independent = smithay::utils::Size::<i32, smithay::utils::Physical>::from((
+        ((root_rect.width as f64) * scale_x).round().max(0.0) as i32,
+        ((root_rect.height as f64) * scale_y).round().max(0.0) as i32,
+    ));
+    let root_global_edges =
+        crate::backend::visual::logical_rect_to_physical_rect(root_rect, output_geo.loc, scale);
+
+    let client = content_clip.map(|clip| {
+        let local = crate::backend::visual::relative_physical_rect_from_root_precise(
+            clip.rect_precise,
+            root_rect,
+            output_geo,
+            scale,
+        );
+        let independent = smithay::utils::Rectangle::new(
+            smithay::utils::Point::from((root_origin.x + local.loc.x, root_origin.y + local.loc.y)),
+            local.size,
+        );
+        let global = crate::backend::visual::relative_physical_rect_from_root_global_edges_precise(
+            clip.rect_precise,
+            root_rect,
+            output_geo,
+            scale,
+        );
+        (
+            independent.loc.x,
+            independent.loc.y,
+            independent.size.w,
+            independent.size.h,
+            independent.loc.x + independent.size.w,
+            independent.loc.y + independent.size.h,
+            global.loc.x,
+            global.loc.y,
+            global.size.w,
+            global.size.h,
+            global.loc.x + global.size.w,
+            global.loc.y + global.size.h,
+        )
+    });
+
+    tracing::info!(
+        output = %output_name,
+        window_id = %window_id,
+        scale_x,
+        scale_y,
+        logical_root_x = root_rect.x,
+        logical_root_y = root_rect.y,
+        logical_root_width = root_rect.width,
+        logical_root_height = root_rect.height,
+        logical_root_right = root_rect.x + root_rect.width,
+        logical_root_bottom = root_rect.y + root_rect.height,
+        root_origin_x = root_origin.x,
+        root_origin_y = root_origin.y,
+        root_size_independent_width = root_size_independent.w,
+        root_size_independent_height = root_size_independent.h,
+        root_independent_right = root_origin.x + root_size_independent.w,
+        root_independent_bottom = root_origin.y + root_size_independent.h,
+        root_global_x = root_global_edges.loc.x,
+        root_global_y = root_global_edges.loc.y,
+        root_global_width = root_global_edges.size.w,
+        root_global_height = root_global_edges.size.h,
+        root_global_right = root_global_edges.loc.x + root_global_edges.size.w,
+        root_global_bottom = root_global_edges.loc.y + root_global_edges.size.h,
+        client_physical = ?client,
+        "managed rect debug: physical geometry"
+    );
 }
 
 fn log_gap_final_composite_readback(

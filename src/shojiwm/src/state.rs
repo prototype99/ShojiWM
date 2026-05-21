@@ -1199,6 +1199,7 @@ impl ShojiWM {
             title: "warmup".into(),
             app_id: Some("shoji_wm.warmup".into()),
             position: WindowPositionSnapshot::default(),
+            rect: WindowPositionSnapshot::default(),
             is_focused: false,
             is_floating: true,
             is_maximized: false,

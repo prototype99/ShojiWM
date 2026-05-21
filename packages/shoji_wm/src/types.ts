@@ -3,6 +3,7 @@ export interface WaylandWindowSnapshot {
   readonly title: string;
   readonly appId?: string;
   readonly position: WindowPosition;
+  readonly rect: WindowPosition;
   readonly isFocused: boolean;
   readonly isFloating: boolean;
   readonly isMaximized: boolean;
@@ -94,7 +95,7 @@ export interface WaylandWindow {
   readonly title: import("./signals").ReadonlySignal<string>;
   readonly appId: import("./signals").ReadonlySignal<string | undefined>;
   readonly position: WindowPosition;
-  readonly rect: WindowPosition | undefined;
+  readonly rect: WindowPosition;
   readonly state: import("./window-state").WindowStateStore;
   readonly transform: WindowTransform;
   readonly animation: import("./animation").AnimationController;

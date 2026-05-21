@@ -1,108 +1,229 @@
-import {
-    type AnimationVariable,
-    type WaylandWindow,
-    type WindowStateKey,
-    animationVariable,
-    effect,
-    read,
-} from "shoji_wm";
-import type { ManagedWindowRect } from "shoji_wm/types";
+import { animationVariable, createWindowStack, createWindowState, cubicBezier, read, seconds, WINDOW_MANAGER, type PointerMoveEvent, type ReadonlySignal, type WaylandWindow, type WindowMoveEvent, type WindowResizeEvent, type WindowResizeRect } from "shoji_wm";
+import type { ManagedWindowRect, WindowSizeConstraints } from "shoji_wm/types";
 
-// One animation variable per rect-state key. Sharing across windows is fine
-// because window.animation is per-window — same id, isolated progress.
-// Different state keys get different vars so concurrent animations don't
-// trample each other's progress.
-const rectAnimationVariableByStateKey = new Map<symbol, AnimationVariable>();
+export const WINDOW_STATE_RECT = createWindowState<ManagedWindowRect>("rect", {
+    default: (window) => window.rect,
+});
 
-// Per-(window, state-key) teardown for the currently-running rect animation.
-// WeakMap on the window so entries vanish when the window does.
-const activeRectAnimations = new WeakMap<WaylandWindow, Map<symbol, () => void>>();
+const OPEN_CLOSE_ANIMATION_DURATION = seconds(1.0);
+export const OPEN_ANIMATION = animationVariable("window.open");
 
-function getRectAnimationVariable(stateKey: symbol): AnimationVariable {
-    let variable = rectAnimationVariableByStateKey.get(stateKey);
-    if (!variable) {
-        variable = animationVariable(`rect-anim:${stateKey.description ?? "anon"}`);
-        rectAnimationVariableByStateKey.set(stateKey, variable);
+export class HybridWindowManager {
+    private readonly workspaces = new Map<number, Workspace>();
+    private readonly windowStack = createWindowStack();
+    private readonly naturalRootRect: (rect: WaylandWindow) => ManagedWindowRect;
+    private currentMonitor: string;
+
+    public constructor(naturalRootRect: (rect: WaylandWindow) => ManagedWindowRect) {
+        this.currentMonitor = "";
+        this.syncWorkspaces();
+        this.naturalRootRect = naturalRootRect;
     }
-    return variable;
+
+    public onPointerMove(event: PointerMoveEvent) {
+        this.syncWorkspaces();
+        this.currentMonitor = event.outputName ?? this.currentMonitor;
+    }
+
+    public onOpen(window: WaylandWindow) {
+        window.focus();
+        this.windowStack.add(window);
+
+        window.setCloseAnimationDuration(OPEN_CLOSE_ANIMATION_DURATION);
+        window.animation.start(OPEN_ANIMATION, {
+            duration: OPEN_CLOSE_ANIMATION_DURATION,
+            to: 1,
+            easing: cubicBezier(0.1, 0.93, 0.1, 0.93)
+        });
+    }
+
+    public onFirstCommit(window: WaylandWindow) {
+        const workspace = this.getCurrentWorkspace();
+        if (workspace) {
+            workspace.addWindow(window);
+        } else {
+            window.state[WINDOW_STATE_RECT].set(this.naturalRootRect(window));
+        }
+    }
+
+    public onStartClose(window: WaylandWindow) {
+        window.animation.start(OPEN_ANIMATION, {
+            duration: OPEN_CLOSE_ANIMATION_DURATION,
+            to: 0,
+            easing: cubicBezier(0.1, 0.93, 0.1, 0.93)
+        });
+    }
+
+    public onClose(window: WaylandWindow) {
+        this.windowStack.remove(window);
+        for (const workspace of this.workspaces.values()) {
+            workspace.removeWindow(window);
+        }
+    }
+
+    public onFocus(window: WaylandWindow, focused: boolean) {
+        if (focused) {
+            this.windowStack.raise(window);
+        }
+    }
+
+    public onWindowResize(event: WindowResizeEvent) {
+        event.window.state[WINDOW_STATE_RECT].set(this.constrainResizeRect(event));
+    }
+
+    public onWindowMove(event: WindowMoveEvent) {
+        event.window.state[WINDOW_STATE_RECT].set(event.currentRect);
+    }
+
+    public getCurrentWorkspace(): Workspace | undefined {
+        this.syncWorkspaces();
+        var currentWorkspace = undefined;
+        for (const workspace of this.workspaces.values()) {
+            if (this.currentMonitor === workspace.monitor) {
+                currentWorkspace = workspace;
+                break;
+            }
+        }
+        return currentWorkspace ?? this.workspaces.values().next().value;
+    }
+
+    public getWindowZIndex(window: WaylandWindow): ReadonlySignal<number> {
+        return this.windowStack.zIndex(window);
+    }
+
+    private syncWorkspaces() {
+        let index = this.workspaces.size + 1;
+        for (const monitor of WINDOW_MANAGER.output.list) {
+            const exists = Array.from(this.workspaces.values()).some((workspace) => workspace.monitor === monitor);
+            if (exists) {
+                continue;
+            }
+            this.workspaces.set(index, new Workspace(index, monitor, this.naturalRootRect));
+            index++;
+        }
+
+        if (!this.currentMonitor || !WINDOW_MANAGER.output.list.includes(this.currentMonitor)) {
+            this.currentMonitor = WINDOW_MANAGER.output.list.at(0) ?? "";
+        }
+    }
+
+    private constrainResizeRect(event: WindowResizeEvent): ManagedWindowRect {
+        const constraints = event.window.sizeConstraints();
+        const extra = this.clientToRootSizeExtra(event.window);
+        const minWidth = Math.max(1, constraints.min?.width ?? 1) + extra.width;
+        const minHeight = Math.max(1, constraints.min?.height ?? 1) + extra.height;
+        const maxWidth = constrainedMax(constraints, "width", extra.width);
+        const maxHeight = constrainedMax(constraints, "height", extra.height);
+
+        const width = clamp(event.currentRect.width, minWidth, Math.max(minWidth, maxWidth));
+        const height = clamp(event.currentRect.height, minHeight, Math.max(minHeight, maxHeight));
+
+        return {
+            x: resizeOriginForAxis(event.startRect, event.currentRect, width, event.edges.left, "x"),
+            y: resizeOriginForAxis(event.startRect, event.currentRect, height, event.edges.top, "y"),
+            width,
+            height,
+        };
+    }
+
+    private clientToRootSizeExtra(window: WaylandWindow): { width: number; height: number } {
+        const natural = this.naturalRootRect(window);
+        return {
+            width: Math.max(0, read(natural.width) - window.position.width),
+            height: Math.max(0, read(natural.height) - window.position.height),
+        };
+    }
 }
 
-/**
- * Drive `window.state[windowRectState]` from its current rect to `to` over
- * `duration` ms, applying `easing` to the progress. The state is written
- * each frame, so anything bound to it (the ManagedWindow rect, computed
- * signals, etc.) animates smoothly.
- *
- * Calling again while an animation is in flight cancels the previous one
- * and retargets from the rect's current (possibly mid-lerp) value — so
- * `playRectAnimation(window, KEY, A, ...)` followed immediately by
- * `playRectAnimation(window, KEY, B, ...)` slides smoothly toward B
- * without snapping.
- *
- * Both `to` and the current state may use `MaybeSignal<number>` fields;
- * they are resolved to plain numbers at the moment the animation starts.
- */
-export function playRectAnimation(
-    window: WaylandWindow,
-    windowRectState: WindowStateKey<ManagedWindowRect>,
-    to: ManagedWindowRect,
-    easing: (progress: number) => number,
-    duration: number,
-): void {
-    const variable = getRectAnimationVariable(windowRectState);
+export class Workspace {
+    private readonly index: number;
+    private readonly windows: WaylandWindow[] = [];
+    private readonly naturalRootRect: (window: WaylandWindow) => ManagedWindowRect;
+    monitor: string | null;
+    isTiled = false;
 
-    let perWindow = activeRectAnimations.get(window);
-    if (!perWindow) {
-        perWindow = new Map();
-        activeRectAnimations.set(window, perWindow);
+    public constructor(
+        index: number,
+        monitor: string,
+        naturalRootRect: (window: WaylandWindow) => ManagedWindowRect
+    ) {
+        this.index = index;
+        this.monitor = monitor;
+        this.naturalRootRect = naturalRootRect;
     }
-    perWindow.get(windowRectState)?.();
 
-    const currentRect = window.state[windowRectState]();
-    const from = {
-        x: read(currentRect.x),
-        y: read(currentRect.y),
-        width: read(currentRect.width),
-        height: read(currentRect.height),
-    };
-    const target = {
-        x: read(to.x),
-        y: read(to.y),
-        width: read(to.width),
-        height: read(to.height),
-    };
-
-    // Snap the variable to 0 *before* subscribing so the first effect tick
-    // writes the from-rect verbatim. Without this, a prior animation that
-    // ended at 1 would cause a one-frame jump to the target.
-    window.animation.set(variable, 0);
-
-    const progress = window.animation.signal(variable);
-    const dispose = effect(() => {
-        const t = progress();
-        window.state[windowRectState].set({
-            x: from.x + (target.x - from.x) * t,
-            y: from.y + (target.y - from.y) * t,
-            width: from.width + (target.width - from.width) * t,
-            height: from.height + (target.height - from.height) * t,
-        });
-    });
-
-    const teardown = () => {
-        clearTimeout(timer);
-        dispose();
-        if (perWindow!.get(windowRectState) === teardown) {
-            perWindow!.delete(windowRectState);
+    public addWindow(window: WaylandWindow) {
+        if (this.windows.map(window => window.id).includes(window.id)) {
+            return;
         }
-    };
-    // Small slack to let the final frame land before we unsubscribe.
-    const timer = setTimeout(teardown, duration + 32);
-    perWindow.set(windowRectState, teardown);
+        this.windows.push(window);
 
-    window.animation.start(variable, {
-        duration,
-        from: 0,
-        to: 1,
-        easing,
-    });
+        const monitorName = this.monitor;
+        if (monitorName == null || !WINDOW_MANAGER.output.list.includes(monitorName)) {
+            return;
+        }
+
+        if (this.isTiled) {
+            // TODO
+        } else {
+            const sizeRect = this.naturalRootRect(window);
+            const monitor = WINDOW_MANAGER.output.current[monitorName];
+            if (!monitor?.resolution) {
+                window.state[WINDOW_STATE_RECT].set(sizeRect);
+                return;
+            }
+            const usableRect = WINDOW_MANAGER.layer.usableArea(monitorName);
+
+            const logicalWidth = usableRect?.width ?? monitor.resolution.width / monitor.scale;
+            const logicalHeight = usableRect?.height ?? monitor.resolution.height / monitor.scale;
+            const logicalX = usableRect?.x ?? monitor.position.x;
+            const logicalY = usableRect?.y ?? monitor.position.y;
+            const initRect = {
+                x: logicalX + (logicalWidth - read(sizeRect.width)) / 2,
+                y: logicalY + (logicalHeight - read(sizeRect.height)) / 2,
+                width: read(sizeRect.width),
+                height: read(sizeRect.height),
+            };
+            window.state[WINDOW_STATE_RECT].set(initRect);
+        }
+    }
+
+    public removeWindow(window: WaylandWindow) {
+        const index = this.windows.findIndex((current) => current.id === window.id);
+        if (index >= 0) {
+            this.windows.splice(index, 1);
+        }
+    }
+
+    public getWindows(): WaylandWindow[] {
+        return Array.from(this.windows);
+    }
+}
+
+function constrainedMax(
+    constraints: WindowSizeConstraints,
+    axis: "width" | "height",
+    extra: number,
+): number {
+    const max = constraints.max?.[axis];
+    return max && max > 0 ? max + extra : Number.POSITIVE_INFINITY;
+}
+
+function resizeOriginForAxis(
+    start: WindowResizeRect,
+    current: WindowResizeRect,
+    constrainedSize: number,
+    negativeEdge: boolean,
+    axis: "x" | "y",
+): number {
+    if (!negativeEdge) {
+        return current[axis];
+    }
+
+    const startSize = axis === "x" ? start.width : start.height;
+    return start[axis] + startSize - constrainedSize;
+}
+
+function clamp(value: number, min: number, max: number): number {
+    return Math.min(Math.max(value, min), max);
 }

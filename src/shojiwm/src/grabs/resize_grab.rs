@@ -24,6 +24,12 @@ use smithay::{
     wayland::{compositor, shell::xdg::SurfaceCachedState},
 };
 use std::cell::RefCell;
+use tracing::info;
+
+fn managed_rect_debug_enabled() -> bool {
+    std::env::var_os("SHOJI_MANAGED_RECT_DEBUG")
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -121,6 +127,7 @@ impl ResizeSurfaceGrab {
         phase: WindowResizePhaseSnapshot,
         current_pointer: Point<f64, Logical>,
     ) -> WindowResizeEventSnapshot {
+        let window_id = data.snapshot_window(&self.window).id;
         let start_pointer = self.start_data.location;
         let delta = current_pointer - start_pointer;
         let current_rect = resize_rect_for_delta(self.initial_event_rect, self.edges, delta);
@@ -133,6 +140,33 @@ impl ResizeSurfaceGrab {
                     .is_some_and(|geometry| geometry.contains(current_pointer.to_i32_round()))
             })
             .map(|output| output.name());
+
+        if managed_rect_debug_enabled() {
+            info!(
+                window_id,
+                ?phase,
+                ?self.source,
+                start_pointer_x = start_pointer.x,
+                start_pointer_y = start_pointer.y,
+                current_pointer_x = current_pointer.x,
+                current_pointer_y = current_pointer.y,
+                delta_x = delta.x,
+                delta_y = delta.y,
+                start_rect_x = self.initial_event_rect.loc.x,
+                start_rect_y = self.initial_event_rect.loc.y,
+                start_rect_width = self.initial_event_rect.size.w,
+                start_rect_height = self.initial_event_rect.size.h,
+                start_rect_right = self.initial_event_rect.loc.x + self.initial_event_rect.size.w,
+                start_rect_bottom = self.initial_event_rect.loc.y + self.initial_event_rect.size.h,
+                current_rect_x = current_rect.loc.x,
+                current_rect_y = current_rect.loc.y,
+                current_rect_width = current_rect.size.w,
+                current_rect_height = current_rect.size.h,
+                current_rect_right = current_rect.loc.x + current_rect.size.w,
+                current_rect_bottom = current_rect.loc.y + current_rect.size.h,
+                "managed rect debug: resize event"
+            );
+        }
 
         WindowResizeEventSnapshot {
             source: self.source,

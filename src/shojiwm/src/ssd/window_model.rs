@@ -26,6 +26,7 @@ pub struct WaylandWindowSnapshot {
     pub title: String,
     pub app_id: Option<String>,
     pub position: WindowPositionSnapshot,
+    pub rect: WindowPositionSnapshot,
     pub is_focused: bool,
     pub is_floating: bool,
     pub is_maximized: bool,
@@ -442,12 +443,23 @@ impl ShojiWM {
         } else {
             runtime_id_for_window(window, toplevel.wl_surface().id().protocol_id())
         };
+        let rect = self
+            .window_decorations
+            .get(window)
+            .map(|decoration| WindowPositionSnapshot {
+                x: decoration.layout.root.rect.x,
+                y: decoration.layout.root.rect.y,
+                width: decoration.layout.root.rect.width,
+                height: decoration.layout.root.rect.height,
+            })
+            .unwrap_or(position);
 
         WaylandWindowSnapshot {
             id: runtime_id,
             title,
             app_id: app_id.clone(),
             position,
+            rect,
             is_focused,
             // ShojiWM is currently a floating WM; expose that policy explicitly.
             is_floating: true,
@@ -473,6 +485,7 @@ impl ShojiWM {
                 title: String::new(),
                 app_id: None,
                 position: WindowPositionSnapshot::default(),
+                rect: WindowPositionSnapshot::default(),
                 is_focused: false,
                 is_floating: true,
                 is_maximized: false,
@@ -526,12 +539,23 @@ impl ShojiWM {
         } else {
             runtime_id_for_x11_window(&x11)
         };
+        let rect = self
+            .window_decorations
+            .get(window)
+            .map(|decoration| WindowPositionSnapshot {
+                x: decoration.layout.root.rect.x,
+                y: decoration.layout.root.rect.y,
+                width: decoration.layout.root.rect.width,
+                height: decoration.layout.root.rect.height,
+            })
+            .unwrap_or(position);
 
         WaylandWindowSnapshot {
             id: runtime_id,
             title,
             app_id: app_id.clone(),
             position,
+            rect,
             is_focused,
             is_floating: true,
             is_maximized: false,

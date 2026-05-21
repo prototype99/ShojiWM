@@ -23,6 +23,7 @@ use super::{
     DecorationSchedulerTick, DecorationTree, LayerEffectEvaluationResult, LogicalPoint,
     LogicalRect, StaticDecorationEvaluator, WaylandLayerSnapshot, WaylandWindowSnapshot,
     WindowPositionSnapshot, WindowTransform, reapply_tree_preserving_layout,
+    window_model::ManagedWindowRectSnapshot,
 };
 
 fn clip_debug_enabled() -> bool {
@@ -791,12 +792,7 @@ impl ShojiWM {
         let Some(desired_root) = managed.rect else {
             return Ok(None);
         };
-        let desired_root = LogicalRect::new(
-            desired_root.x.round() as i32,
-            desired_root.y.round() as i32,
-            desired_root.width.round() as i32,
-            desired_root.height.round() as i32,
-        );
+        let desired_root = managed_rect_snapshot_to_logical_rect(desired_root);
         if desired_root.width <= 0 || desired_root.height <= 0 {
             return Ok(None);
         }
@@ -1812,12 +1808,7 @@ impl ShojiWM {
                 if closing.decoration.managed_window.managed
                     && let Some(desired_root) = closing.decoration.managed_window.rect
                 {
-                    let desired_root = LogicalRect::new(
-                        desired_root.x.round() as i32,
-                        desired_root.y.round() as i32,
-                        desired_root.width.round() as i32,
-                        desired_root.height.round() as i32,
-                    );
+                    let desired_root = managed_rect_snapshot_to_logical_rect(desired_root);
                     if desired_root.width > 0 && desired_root.height > 0 {
                         let desired_client = managed_client_rect_for_root(
                             &closing.decoration.tree,
@@ -2185,16 +2176,12 @@ impl ShojiWM {
             .iter()
             .filter_map(|(window, decoration)| {
                 let managed = &decoration.managed_window;
-                let desired_root = managed.rect?;
-                let desired_root = LogicalRect::new(
-                    desired_root.x.round() as i32,
-                    desired_root.y.round() as i32,
-                    desired_root.width.round() as i32,
-                    desired_root.height.round() as i32,
-                );
+                let desired_root_raw = managed.rect?;
+                let desired_root = managed_rect_snapshot_to_logical_rect(desired_root_raw);
                 managed.managed.then_some((
                     window.clone(),
                     managed.force_rect_size,
+                    desired_root_raw,
                     desired_root,
                     decoration.tree.clone(),
                     decoration.layout.root.rect,
@@ -2208,6 +2195,7 @@ impl ShojiWM {
         for (
             window,
             force_rect_size,
+            desired_root_raw,
             desired_root,
             tree,
             current_root,
@@ -2246,10 +2234,24 @@ impl ShojiWM {
             if managed_rect_debug_enabled() {
                 info!(
                     window_id,
+                    raw_desired_root_x = desired_root_raw.x,
+                    raw_desired_root_y = desired_root_raw.y,
+                    raw_desired_root_width = desired_root_raw.width,
+                    raw_desired_root_height = desired_root_raw.height,
+                    raw_desired_root_right = desired_root_raw.x + desired_root_raw.width,
+                    raw_desired_root_bottom = desired_root_raw.y + desired_root_raw.height,
                     desired_root = %format_rect(desired_root),
+                    desired_root_right = desired_root.x + desired_root.width,
+                    desired_root_bottom = desired_root.y + desired_root.height,
                     current_root = %format_rect(current_root),
+                    current_root_right = current_root.x + current_root.width,
+                    current_root_bottom = current_root.y + current_root.height,
                     current_client = %format_rect(current_client),
+                    current_client_right = current_client.x + current_client.width,
+                    current_client_bottom = current_client.y + current_client.height,
                     desired_client = %format_rect(desired_client),
+                    desired_client_right = desired_client.x + desired_client.width,
+                    desired_client_bottom = desired_client.y + desired_client.height,
                     dx,
                     dy,
                     position_changed,
@@ -2368,6 +2370,19 @@ fn content_clip_for_layout(
     slot_content_clip_for_node(&layout.root, None, None, shared_edges)
 }
 
+fn managed_rect_snapshot_to_logical_rect(rect: ManagedWindowRectSnapshot) -> LogicalRect {
+    // Preserve shared/opposite edges when quantizing TS-provided floating rects.
+    // Rounding x/y/width/height independently makes `round(x) + round(width)`
+    // differ from `round(x + width)`, which shows up as a 1px wobble during
+    // top/left anchored resizes and rect animations.
+    let left = rect.x.round() as i32;
+    let top = rect.y.round() as i32;
+    let right = (rect.x + rect.width).round() as i32;
+    let bottom = (rect.y + rect.height).round() as i32;
+
+    LogicalRect::new(left, top, right - left, bottom - top)
+}
+
 fn managed_client_rect_for_state(
     tree: &DecorationTree,
     managed: &super::ManagedWindowState,
@@ -2381,12 +2396,7 @@ fn managed_client_rect_for_state(
     let Some(desired_root) = managed.rect else {
         return Ok(fallback_client_rect);
     };
-    let desired_root = LogicalRect::new(
-        desired_root.x.round() as i32,
-        desired_root.y.round() as i32,
-        desired_root.width.round() as i32,
-        desired_root.height.round() as i32,
-    );
+    let desired_root = managed_rect_snapshot_to_logical_rect(desired_root);
     if desired_root.width <= 0 || desired_root.height <= 0 {
         return Ok(fallback_client_rect);
     }
@@ -4822,6 +4832,21 @@ mod tests {
         BorderStyle, BoxNode, Color, DecorationNode, DecorationNodeKind, DecorationStyle, Edges,
         LayoutDirection, Overflow, StylePosition,
     };
+
+    #[test]
+    fn managed_rect_rounding_preserves_opposite_edges() {
+        let rect = managed_rect_snapshot_to_logical_rect(ManagedWindowRectSnapshot {
+            x: 10.4,
+            y: 20.4,
+            width: 99.4,
+            height: 79.4,
+        });
+
+        assert_eq!(rect.x, 10);
+        assert_eq!(rect.y, 20);
+        assert_eq!(rect.x + rect.width, 110);
+        assert_eq!(rect.y + rect.height, 100);
+    }
 
     #[test]
     fn async_asset_refresh_processes_windows_outside_target_output() {
