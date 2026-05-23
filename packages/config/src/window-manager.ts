@@ -23,6 +23,12 @@ const WINDOW_CLOSE_EASING = cubicBezier(0.3, -0.3, 0, 1);
 export const OPEN_ANIMATION = animationVariable("window.open");
 export const WINDOW_BORDER_PX = 2;
 export const TITLEBAR_HEIGHT = 30;
+export const MAXIMIZED_WINDOW_PADDING = {
+    top: 8,
+    right: 8,
+    bottom: 8,
+    left: 8,
+};
 
 export class HybridWindowManager {
     private readonly workspaces = new Map<number, Workspace>();
@@ -257,20 +263,20 @@ export class HybridWindowManager {
         const usable = outputName ? WINDOW_MANAGER.layer.usableArea(outputName) : undefined;
 
         if (usable) {
-            return {
+            return insetRect({
                 x: usable.x,
                 y: usable.y,
                 width: usable.width,
                 height: usable.height,
-            };
+            }, MAXIMIZED_WINDOW_PADDING);
         }
         if (output?.resolution) {
-            return {
+            return insetRect({
                 x: output.position.x,
                 y: output.position.y,
                 width: output.resolution.width / output.scale,
                 height: output.resolution.height / output.scale,
-            };
+            }, MAXIMIZED_WINDOW_PADDING);
         }
         return rect;
     }
@@ -418,4 +424,18 @@ function resizeOriginForAxis(
 
 function clamp(value: number, min: number, max: number): number {
     return Math.min(Math.max(value, min), max);
+}
+
+function insetRect(
+    rect: ManagedWindowRect,
+    padding: { top: number; right: number; bottom: number; left: number },
+): ManagedWindowRect {
+    const width = Math.max(1, read(rect.width) - padding.left - padding.right);
+    const height = Math.max(1, read(rect.height) - padding.top - padding.bottom);
+    return {
+        x: read(rect.x) + padding.left,
+        y: read(rect.y) + padding.top,
+        width,
+        height,
+    };
 }
