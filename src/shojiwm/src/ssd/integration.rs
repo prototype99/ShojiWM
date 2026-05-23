@@ -1145,11 +1145,16 @@ impl ShojiWM {
         let windows_pass_started_at = Instant::now();
         for window in windows {
             let primary_output_name = self.primary_output_name_for_window(&window);
+            let snapshot = self.snapshot_window(&window);
+            let snapshot_id = snapshot.id.clone();
+            let window_was_runtime_dirty = self.runtime_dirty_window_ids.contains(&snapshot_id);
             if !should_process_window_for_refresh(
                 primary_output_name.as_deref(),
                 target_output_name,
                 force_async_asset_refresh,
                 force_output_animation_reevaluate,
+                force_runtime_reevaluate,
+                window_was_runtime_dirty,
             ) {
                 continue;
             }
@@ -1161,9 +1166,6 @@ impl ShojiWM {
                 Some(rect) => rect,
                 None => continue,
             };
-            let snapshot = self.snapshot_window(&window);
-            let snapshot_id = snapshot.id.clone();
-            let window_was_runtime_dirty = self.runtime_dirty_window_ids.contains(&snapshot_id);
             let layout_scale = self.decoration_layout_scale_for_window(&window);
             let window_raster_scale = self.decoration_raster_scale_for_window(&window);
             let cached_effective_client_rect = self
@@ -4981,8 +4983,14 @@ fn should_process_window_for_refresh(
     target_output_name: Option<&str>,
     force_async_asset_refresh: bool,
     force_output_animation_reevaluate: bool,
+    force_runtime_reevaluate: bool,
+    window_was_runtime_dirty: bool,
 ) -> bool {
-    if force_async_asset_refresh || force_output_animation_reevaluate {
+    if force_async_asset_refresh
+        || force_output_animation_reevaluate
+        || force_runtime_reevaluate
+        || window_was_runtime_dirty
+    {
         return true;
     }
 
@@ -5049,10 +5057,14 @@ mod tests {
             Some("DP-4"),
             true,
             false,
+            false,
+            false,
         ));
         assert!(!should_process_window_for_refresh(
             Some("eDP-1"),
             Some("DP-4"),
+            false,
+            false,
             false,
             false,
         ));
@@ -5061,10 +5073,30 @@ mod tests {
             Some("DP-4"),
             false,
             true,
+            false,
+            false,
+        ));
+        assert!(should_process_window_for_refresh(
+            Some("eDP-1"),
+            Some("DP-4"),
+            false,
+            false,
+            false,
+            true,
+        ));
+        assert!(should_process_window_for_refresh(
+            Some("eDP-1"),
+            Some("DP-4"),
+            false,
+            false,
+            true,
+            false,
         ));
         assert!(should_process_window_for_refresh(
             Some("DP-4"),
             Some("DP-4"),
+            false,
+            false,
             false,
             false,
         ));
