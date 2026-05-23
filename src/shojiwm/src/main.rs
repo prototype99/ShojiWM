@@ -102,6 +102,16 @@ fn apply_runtime_overrides(args: &CliArgs) {
     if let Some(glamor) = args.xwayland_satellite_glamor.as_deref() {
         unsafe { std::env::set_var("SHOJI_XWAYLAND_SATELLITE_GLAMOR", glamor) };
     }
+    if !args.decoration_runtime_node_args.is_empty() {
+        let cli_options = args.decoration_runtime_node_args.join(" ");
+        let merged = match std::env::var("SHOJI_DECORATION_RUNTIME_NODE_OPTIONS") {
+            Ok(existing) if !existing.trim().is_empty() => {
+                format!("{} {}", existing.trim(), cli_options)
+            }
+            _ => cli_options,
+        };
+        unsafe { std::env::set_var("SHOJI_DECORATION_RUNTIME_NODE_OPTIONS", merged) };
+    }
 }
 
 fn sanitize_inherited_compositor_environment() {
@@ -131,6 +141,7 @@ struct CliArgs {
     xwayland_satellite: bool,
     xwayland_satellite_path: Option<String>,
     xwayland_satellite_glamor: Option<String>,
+    decoration_runtime_node_args: Vec<String>,
 }
 
 impl CliArgs {
@@ -146,6 +157,8 @@ impl CliArgs {
         let env_xwayland_satellite_glamor = std::env::var("SHOJI_XWAYLAND_SATELLITE_GLAMOR").ok();
 
         let tty_outputs = parse_tty_outputs(&args);
+        let decoration_runtime_node_args =
+            parse_repeated_option_values(&args, "--decoration-runtime-node-arg");
         let xwayland_satellite_path =
             parse_option_value(&args, "--xwayland-satellite-path").or(env_xwayland_satellite_path);
         let xwayland_satellite_glamor = parse_option_value(&args, "--xwayland-satellite-glamor")
@@ -163,6 +176,7 @@ impl CliArgs {
             xwayland_satellite,
             xwayland_satellite_path,
             xwayland_satellite_glamor,
+            decoration_runtime_node_args,
         }
     }
 }
@@ -210,6 +224,26 @@ fn parse_option_value(args: &[String], option: &str) -> Option<String> {
         index += 1;
     }
     None
+}
+
+fn parse_repeated_option_values(args: &[String], option: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if let Some(value) = arg.strip_prefix(&format!("{option}=")) {
+            if !value.is_empty() {
+                values.push(value.to_string());
+            }
+        } else if arg == option {
+            if let Some(value) = args.get(index + 1).filter(|value| !value.is_empty()) {
+                values.push(value.clone());
+                index += 1;
+            }
+        }
+        index += 1;
+    }
+    values
 }
 
 fn init_logging(args: &CliArgs) -> Result<(), Box<dyn std::error::Error>> {

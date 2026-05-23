@@ -1104,6 +1104,7 @@ impl NodeDecorationEvaluator {
 
     fn spawn_stdio_runtime(&self) -> Result<NodeDecorationRuntime, DecorationEvaluationError> {
         let mut command = Command::new(&self.program);
+        apply_decoration_runtime_node_options(&mut command);
         command.args(&self.base_args);
         command.arg(&self.script_path);
         command.arg(&self.config_path);
@@ -1149,6 +1150,7 @@ impl NodeDecorationEvaluator {
         listener.set_nonblocking(true)?;
 
         let mut command = Command::new(&self.program);
+        apply_decoration_runtime_node_options(&mut command);
         command.args(&self.base_args);
         command.arg(&self.script_path);
         command.arg(&self.config_path);
@@ -1485,6 +1487,22 @@ impl NodeDecorationRuntime {
             ))
         })
     }
+}
+
+fn apply_decoration_runtime_node_options(command: &mut Command) {
+    let extra = std::env::var("SHOJI_DECORATION_RUNTIME_NODE_OPTIONS")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(extra) = extra else {
+        return;
+    };
+
+    let merged = match std::env::var("NODE_OPTIONS") {
+        Ok(existing) if !existing.trim().is_empty() => format!("{} {}", existing.trim(), extra),
+        _ => extra,
+    };
+    command.env("NODE_OPTIONS", merged);
 }
 
 impl Drop for NodeDecorationRuntime {
