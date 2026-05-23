@@ -27,6 +27,8 @@ import {
     TITLEBAR_HEIGHT,
     WINDOW_BORDER_PX,
     WINDOW_STATE_MINIMIZED,
+    WINDOW_STATE_WORKSPACE_OFFSET_Y,
+    WINDOW_STATE_WORKSPACE_OPACITY,
     WINDOW_STATE_RECT,
     WINDOW_STATE_WORKSPACE_VISIBLE,
 } from "./window-manager";
@@ -61,6 +63,15 @@ WINDOW_MANAGER.key.bind("screenshot-freeze", "Super+Ctrl+P", () => {
 });
 WINDOW_MANAGER.key.bind("toggle-tiling-mode", "Super+S", () => {
     HYBRID_WINDOW_MANAGER.toggleCurrentWorkspaceTiling();
+});
+WINDOW_MANAGER.key.bind("close-focused-window", "Super+Q", () => {
+    HYBRID_WINDOW_MANAGER.closeFocusedWindow();
+});
+WINDOW_MANAGER.key.bind("tile-focus-left-quick", "Super+Left", () => {
+    HYBRID_WINDOW_MANAGER.focusTile(-1);
+});
+WINDOW_MANAGER.key.bind("tile-focus-right-quick", "Super+Right", () => {
+    HYBRID_WINDOW_MANAGER.focusTile(1);
 });
 WINDOW_MANAGER.key.bind("tile-focus-left", "Super+Ctrl+Left", () => {
     HYBRID_WINDOW_MANAGER.focusTile(-1);
@@ -160,11 +171,13 @@ function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
 WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
     const openVariable = window.animation.signal(OPEN_ANIMATION);
     const workspaceVisible = window.state[WINDOW_STATE_WORKSPACE_VISIBLE];
-    const opacity = computed(() => openVariable() * (workspaceVisible() ? 1 : 0));
+    const workspaceOffsetY = window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y];
+    const workspaceOpacity = window.state[WINDOW_STATE_WORKSPACE_OPACITY];
+    const opacity = computed(() => openVariable() * workspaceOpacity());
     const translateY = openVariable(variable => (1 - variable) * 200);
     const rect = computed(() => {
         const base = window.state[WINDOW_STATE_RECT]();
-        const dy = translateY();
+        const dy = translateY() + workspaceOffsetY();
         return {
             x: base.x,
             y: base.y + dy,

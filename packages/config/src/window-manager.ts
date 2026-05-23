@@ -1,4 +1,4 @@
-import { animationVariable, createWindowStack, createWindowState, cubicBezier, read, seconds, WINDOW_MANAGER, type PointerMoveEvent, type ReadonlySignal, type WaylandWindow, type WindowActivateRequestEvent, type WindowMaximizeRequestEvent, type WindowMinimizeRequestEvent, type WindowMoveEvent, type WindowResizeEvent, type WindowResizeRect } from "shoji_wm";
+import { animationVariable, createWindowStack, createWindowState, cubicBezier, effect, read, seconds, WINDOW_MANAGER, type PointerMoveEvent, type ReadonlySignal, type WaylandWindow, type WindowActivateRequestEvent, type WindowMaximizeRequestEvent, type WindowMinimizeRequestEvent, type WindowMoveEvent, type WindowResizeEvent, type WindowResizeRect, type WindowStateKey } from "shoji_wm";
 import type { ManagedWindowRect, WindowSizeConstraints } from "shoji_wm/types";
 import { playRectAnimation, stopRectAnimation } from "./window-animation";
 
@@ -17,6 +17,12 @@ export const WINDOW_STATE_MAXIMIZED = createWindowState<boolean>("maximized", {
 export const WINDOW_STATE_WORKSPACE_VISIBLE = createWindowState<boolean>("workspaceVisible", {
     default: true,
 });
+export const WINDOW_STATE_WORKSPACE_OFFSET_Y = createWindowState<number>("workspaceOffsetY", {
+    default: 0,
+});
+export const WINDOW_STATE_WORKSPACE_OPACITY = createWindowState<number>("workspaceOpacity", {
+    default: 1,
+});
 export const WINDOW_STATE_FLOATING_RECT = createWindowState<ManagedWindowRect | null>("floatingRect", {
     default: null,
 });
@@ -27,6 +33,7 @@ const UNMAXIMIZE_GRAB_ANIMATION_DURATION = 90;
 const WINDOW_MANAGEMENT_EASING = cubicBezier(0.1, 0.9, 0.2, 1.0);//cubicBezier(0.1, 1.1, 0.1, 1.1);
 const WINDOW_CLOSE_EASING = cubicBezier(0.3, -0.3, 0, 1);
 export const TILE_ANIMATION_DURATION = seconds(0.5);
+const WORKSPACE_SWITCH_ANIMATION_DURATION = seconds(0.5);
 const TILE_GAP = 12;
 const TILE_MARGIN = 12;
 const TILE_WIDTH_RATIO = 0.5;
@@ -281,6 +288,16 @@ export class HybridWindowManager {
         workspace.focusRelative(direction);
     }
 
+    public closeFocusedWindow() {
+        for (const workspace of this.workspaces.values()) {
+            const focused = workspace.focusedWindow();
+            if (focused) {
+                focused.close();
+                return;
+            }
+        }
+    }
+
     public switchWorkspace(direction: -1 | 1) {
         this.syncWorkspaces();
         const monitor = this.currentMonitor || WINDOW_MANAGER.output.list.at(0);
@@ -289,7 +306,42 @@ export class HybridWindowManager {
         }
 
         const currentIndex = this.activeWorkspaceByMonitor.get(monitor) ?? 1;
-        this.activateWorkspace(monitor, Math.max(1, currentIndex + direction));
+        const nextIndex = Math.max(1, currentIndex + direction);
+        if (nextIndex === currentIndex) {
+            return;
+        }
+
+        const fromWorkspace = this.ensureWorkspace(monitor, currentIndex);
+        const toWorkspace = this.ensureWorkspace(monitor, nextIndex);
+        const distance = this.workspaceTransitionDistance(monitor);
+
+        this.activeWorkspaceByMonitor.set(monitor, nextIndex);
+        this.currentMonitor = monitor;
+
+        for (const workspace of this.workspaces.values()) {
+            if (workspace === fromWorkspace || workspace === toWorkspace) {
+                continue;
+            }
+            workspace.setVisible(workspace.isActive());
+        }
+
+        fromWorkspace.animateWorkspaceTransition({
+            fromOffsetY: 0,
+            toOffsetY: -direction * distance,
+            fromOpacity: 1,
+            toOpacity: 0,
+            visibleAfter: false,
+        });
+        toWorkspace.prepareWorkspaceTransition(direction * distance, 0);
+        toWorkspace.applyLayout();
+        toWorkspace.animateWorkspaceTransition({
+            fromOffsetY: direction * distance,
+            toOffsetY: 0,
+            fromOpacity: 0,
+            toOpacity: 1,
+            visibleAfter: true,
+        });
+        toWorkspace.focusActiveWindow();
     }
 
     public getCurrentWorkspace(): Workspace | undefined {
@@ -363,6 +415,20 @@ export class HybridWindowManager {
             }
         }
         return undefined;
+    }
+
+    private workspaceTransitionDistance(monitor: string): number {
+        const usable = WINDOW_MANAGER.layer.usableArea(monitor);
+        if (usable) {
+            return usable.height;
+        }
+
+        const output = WINDOW_MANAGER.output.current[monitor];
+        if (output?.resolution) {
+            return output.resolution.height / output.scale;
+        }
+
+        return 720;
     }
 
     private constrainResizeRect(event: WindowResizeEvent): ManagedWindowRect {
@@ -479,6 +545,7 @@ export class Workspace {
     private readonly activeWorkspaceIndex: () => number;
     private readonly tileWidthByWindowId = new Map<string, number>();
     private activeWindowId: string | null = null;
+    private visibilityAnimationToken = 0;
     private scrollOffset = 0;
     public readonly monitor: string;
     public isTiled = false;
@@ -503,7 +570,10 @@ export class Workspace {
         }
         this.windows.push(window);
         this.activeWindowId = window.id;
-        window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(this.isActive());
+        const visible = this.isActive();
+        window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(visible);
+        window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(0);
+        window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(visible ? 1 : 0);
 
         if (!WINDOW_MANAGER.output.list.includes(this.monitor)) {
             return;
@@ -544,9 +614,59 @@ export class Workspace {
     }
 
     public setVisible(visible: boolean) {
+        this.visibilityAnimationToken += 1;
         for (const window of this.windows) {
             window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(visible);
+            window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(0);
+            window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(visible ? 1 : 0);
         }
+    }
+
+    public prepareWorkspaceTransition(offsetY: number, opacity: number) {
+        this.visibilityAnimationToken += 1;
+        for (const window of this.windows) {
+            window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
+            window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(offsetY);
+            window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(opacity);
+        }
+    }
+
+    public animateWorkspaceTransition(options: {
+        fromOffsetY: number;
+        toOffsetY: number;
+        fromOpacity: number;
+        toOpacity: number;
+        visibleAfter: boolean;
+    }) {
+        const token = this.visibilityAnimationToken + 1;
+        this.visibilityAnimationToken = token;
+
+        for (const window of this.windows) {
+            window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
+            playNumberStateAnimation(
+                window,
+                WINDOW_STATE_WORKSPACE_OFFSET_Y,
+                options.fromOffsetY,
+                options.toOffsetY,
+                WINDOW_MANAGEMENT_EASING,
+                WORKSPACE_SWITCH_ANIMATION_DURATION,
+            );
+            playNumberStateAnimation(
+                window,
+                WINDOW_STATE_WORKSPACE_OPACITY,
+                options.fromOpacity,
+                options.toOpacity,
+                WINDOW_MANAGEMENT_EASING,
+                WORKSPACE_SWITCH_ANIMATION_DURATION,
+            );
+        }
+
+        setTimeout(() => {
+            if (this.visibilityAnimationToken !== token) {
+                return;
+            }
+            this.setVisible(options.visibleAfter);
+        }, WORKSPACE_SWITCH_ANIMATION_DURATION + 32);
     }
 
     public setTiled(tiled: boolean) {
@@ -691,7 +811,7 @@ export class Workspace {
         return this.windows.filter((window) => this.shouldTile(window) && !window.state[WINDOW_STATE_MINIMIZED]());
     }
 
-    private focusedWindow(): WaylandWindow | undefined {
+    public focusedWindow(): WaylandWindow | undefined {
         return this.windows.find((window) => read(window.isFocused));
     }
 
@@ -898,4 +1018,58 @@ function insetRect(
         width,
         height,
     };
+}
+
+const numberAnimationVariableByStateKey = new Map<symbol, ReturnType<typeof animationVariable>>();
+const activeNumberAnimations = new WeakMap<WaylandWindow, Map<symbol, () => void>>();
+
+function getNumberAnimationVariable(stateKey: symbol): ReturnType<typeof animationVariable> {
+    let variable = numberAnimationVariableByStateKey.get(stateKey);
+    if (!variable) {
+        variable = animationVariable(`number-anim:${stateKey.description ?? "anon"}`);
+        numberAnimationVariableByStateKey.set(stateKey, variable);
+    }
+    return variable;
+}
+
+function playNumberStateAnimation(
+    window: WaylandWindow,
+    stateKey: WindowStateKey<number>,
+    from: number,
+    to: number,
+    easing: (progress: number) => number,
+    duration: number,
+): void {
+    const variable = getNumberAnimationVariable(stateKey);
+    let perWindow = activeNumberAnimations.get(window);
+    if (!perWindow) {
+        perWindow = new Map();
+        activeNumberAnimations.set(window, perWindow);
+    }
+
+    perWindow.get(stateKey)?.();
+    window.state[stateKey].set(from);
+    window.animation.set(variable, 0);
+
+    const progress = window.animation.signal(variable);
+    const dispose = effect(() => {
+        window.state[stateKey].set(from + (to - from) * progress());
+    });
+
+    const teardown = () => {
+        clearTimeout(timer);
+        dispose();
+        if (perWindow!.get(stateKey) === teardown) {
+            perWindow!.delete(stateKey);
+        }
+    };
+    const timer = setTimeout(teardown, duration + 32);
+    perWindow.set(stateKey, teardown);
+
+    window.animation.start(variable, {
+        duration,
+        from: 0,
+        to: 1,
+        easing,
+    });
 }

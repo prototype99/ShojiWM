@@ -119,9 +119,16 @@ impl ShojiWM {
                                 ));
                             }
 
-                            let keysym = handle.modified_sym();
-
-                            if modifiers.logo && keysym.raw() == keysyms::KEY_q {
+                            if matches!(
+                                key_phase,
+                                crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
+                            ) && modifiers.logo
+                                && modifiers.shift
+                                && !modifiers.ctrl
+                                && !modifiers.alt
+                                && let Some(raw) = handle.raw_latin_sym_or_raw_current_sym()
+                                && raw.raw() == keysyms::KEY_q
+                            {
                                 FilterResult::Intercept(KeyboardAction::Quit)
                             } else if matches!(
                                 key_phase,
