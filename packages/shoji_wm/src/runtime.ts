@@ -6,6 +6,7 @@ import type {
   CompositionNodeType,
 } from "./types";
 import { computed, signal, type ReadonlySignal, type SignalTuple } from "./signals";
+import { withoutCompositionOwnership } from "./runtime-hooks";
 
 interface ComponentStateStore {
   instances: Map<string, ComponentInstanceState>;
@@ -193,7 +194,13 @@ export function useComputed<T>(compute: () => T): ReadonlySignal<T> {
   }
 
   const computeRef = { current: compute };
-  const signalValue = computed(() => computeRef.current());
+  // useComputed memoizes the ComputedSignal via the hook slot, so it must
+  // outlive the composition pass that first created it. Without this guard,
+  // the next pass would auto-dispose it and the hook slot would hand back a
+  // detached signal.
+  const signalValue = withoutCompositionOwnership(() =>
+    computed(() => computeRef.current()),
+  );
   hooks[hookIndex] = {
     kind: "computed",
     signal: signalValue,

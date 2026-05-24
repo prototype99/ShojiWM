@@ -1,5 +1,5 @@
 import { computed, signal, type ReadonlySignal, type Signal } from "./signals";
-import { markWindowDirty } from "./runtime-hooks";
+import { markWindowDirty, withoutCompositionOwnership } from "./runtime-hooks";
 
 /**
  * Stable token used to address a logical animation track on a per-window basis.
@@ -188,8 +188,27 @@ export function createAnimationControllerWithStore(
     return entry;
   };
 
-  const variableSignal = (variable: AnimationVariable): ReadonlySignal<number> =>
-    computed(() => ensureEntry(variable).progress());
+  // Cache the read-only computed wrapper per variable so repeated calls (e.g.
+  // `window.animation.signal(OPEN_ANIMATION)` inside window.composition) return
+  // the SAME ComputedSignal. Without this, each composition pass produced a
+  // fresh ComputedSignal that became a permanent dependent of the underlying
+  // progress signal — the progress.dependents Set then grew without bound and
+  // every animation tick had to iterate every leaked instance.
+  const variableSignalCache = new Map<symbol, ReadonlySignal<number>>();
+  const variableSignal = (variable: AnimationVariable): ReadonlySignal<number> => {
+    let cached = variableSignalCache.get(variable.id);
+    if (!cached) {
+      // Construct the cached computed outside composition ownership: it must
+      // outlive the composition pass it was first requested from (otherwise
+      // the next pass would auto-dispose it and the cache would hand back a
+      // detached, stale ComputedSignal).
+      cached = withoutCompositionOwnership(() =>
+        computed(() => ensureEntry(variable).progress()),
+      );
+      variableSignalCache.set(variable.id, cached);
+    }
+    return cached;
+  };
 
   return {
     variable: variableSignal,

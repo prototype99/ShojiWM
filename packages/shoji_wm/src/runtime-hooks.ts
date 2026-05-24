@@ -39,6 +39,85 @@ const dirtyManagedWindowIds = new Set<string>();
 const windowsWithStructuralWrite = new Set<string>();
 const layersWithStructuralWrite = new Set<string>();
 
+/**
+ * Composition-scoped ComputedSignal ownership.
+ *
+ * User composition code creates many `computed(() => ...)` per call (one per
+ * derived value). Without explicit disposal, each new ComputedSignal registers
+ * itself as a permanent dependent of every BaseSignal it reads, and the
+ * underlying signal's `dependents` Set grows without bound across composition
+ * passes. Every animation tick then has to walk that ever-growing list and
+ * cascade markDirty into each leaked node — quadratic-or-worse degradation
+ * with session lifetime and window count.
+ *
+ * Fix: track which ComputedSignals were constructed during a window's (or
+ * layer's) composition. On the NEXT enter into the same owner's scope, dispose
+ * everything from the previous pass before letting the new pass run. Disposed
+ * computeds detach themselves from their sources and become inert
+ * (markDirty/recompute are no-ops).
+ *
+ * Computeds created outside any composition scope (e.g. at module load) have
+ * no owner and live forever, which is intended.
+ */
+export interface DisposableComputed {
+  dispose(): void;
+}
+
+let activeCompositionOwner: string | null = null;
+const ownedComputedsByOwner = new Map<string, Set<DisposableComputed>>();
+
+export function registerOwnedComputed(computation: DisposableComputed): void {
+  const owner = activeCompositionOwner;
+  if (owner === null) {
+    return;
+  }
+  let owned = ownedComputedsByOwner.get(owner);
+  if (!owned) {
+    owned = new Set<DisposableComputed>();
+    ownedComputedsByOwner.set(owner, owned);
+  }
+  owned.add(computation);
+}
+
+function disposeOwnedComputeds(owner: string): void {
+  const owned = ownedComputedsByOwner.get(owner);
+  if (!owned || owned.size === 0) {
+    return;
+  }
+  // Snapshot first: dispose() removes the computed from its sources'
+  // dependents, which is unrelated to our Set, but we still avoid mutating
+  // during iteration in case future changes add reentrancy.
+  const snapshot = Array.from(owned);
+  owned.clear();
+  for (const computation of snapshot) {
+    computation.dispose();
+  }
+}
+
+function ownerKeyForWindow(windowId: string): string {
+  return `w:${windowId}`;
+}
+
+function ownerKeyForLayer(layerId: string): string {
+  return `l:${layerId}`;
+}
+
+/**
+ * Run `fn` with composition ownership suppressed so any ComputedSignal
+ * constructed inside is NOT auto-disposed at the next composition pass. Use
+ * for long-lived caches (e.g. animation variable wrappers) created lazily
+ * during composition but expected to outlive a single pass.
+ */
+export function withoutCompositionOwnership<T>(fn: () => T): T {
+  const previous = activeCompositionOwner;
+  activeCompositionOwner = null;
+  try {
+    return fn();
+  } finally {
+    activeCompositionOwner = previous;
+  }
+}
+
 interface ActiveSSDRebuildSuppression {
   id: number;
   allowManagedWindowOnly: boolean;
@@ -60,6 +139,67 @@ function debugSSD(message: string, details: Record<string, unknown> = {}): void 
     return;
   }
   console.info(`ssd-suppression ${message}`, JSON.stringify(details));
+}
+
+/**
+ * Diagnostic for the "unknown-signal" branch in trackSignalWrite() — a signal
+ * was written but has no recorded window/layer/node dependency, so the runtime
+ * conservatively falls back to markRuntimeDirty() (full re-evaluation of every
+ * window). When many of these fire per frame, fps drops scale with window
+ * count. Set SHOJI_SIGNAL_UNKNOWN_DEBUG=1 to print one warning per unique
+ * call site so the offending writer can be located.
+ */
+const UNKNOWN_SIGNAL_DEBUG_ENABLED = (() => {
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } })
+    .process?.env;
+  const value = env?.SHOJI_SIGNAL_UNKNOWN_DEBUG;
+  return value !== undefined && value !== "" && value !== "0";
+})();
+
+const UNKNOWN_SIGNAL_STACK_DEPTH = (() => {
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } })
+    .process?.env;
+  const raw = Number(env?.SHOJI_SIGNAL_UNKNOWN_DEBUG_FRAMES ?? "6");
+  return Number.isFinite(raw) && raw > 0 ? Math.min(Math.floor(raw), 32) : 6;
+})();
+
+let nextUnknownSignalId = 1;
+const unknownSignalIds = new WeakMap<object, number>();
+const reportedUnknownSignalSites = new Set<string>();
+const unknownSignalWriteCounts = new Map<number, number>();
+
+function reportUnknownSignalWrite(signal: object): void {
+  if (!UNKNOWN_SIGNAL_DEBUG_ENABLED) {
+    return;
+  }
+  let id = unknownSignalIds.get(signal);
+  if (id === undefined) {
+    id = nextUnknownSignalId++;
+    unknownSignalIds.set(signal, id);
+  }
+  unknownSignalWriteCounts.set(id, (unknownSignalWriteCounts.get(id) ?? 0) + 1);
+
+  const stack = new Error().stack ?? "";
+  // Drop "Error" header + reportUnknownSignalWrite + trackSignalWrite +
+  // notify + the setter frame so the top of what we log is the caller that
+  // actually drives the write.
+  const frames = stack
+    .split("\n")
+    .slice(1)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(4, 4 + UNKNOWN_SIGNAL_STACK_DEPTH);
+  const callsiteKey = frames[0] ?? "<no-frame>";
+  const dedupKey = `${id}|${callsiteKey}`;
+  if (reportedUnknownSignalSites.has(dedupKey)) {
+    return;
+  }
+  reportedUnknownSignalSites.add(dedupKey);
+  console.warn(
+    `[shoji_wm/unknown-signal] signal#${id} written without scoped dependency ` +
+      `(count=${unknownSignalWriteCounts.get(id)}); top frames:\n  ` +
+      frames.join("\n  "),
+  );
 }
 
 function suppressionForDebug(entry: ActiveSSDRebuildSuppression): Record<string, unknown> {
@@ -289,6 +429,9 @@ export function markLayerDirty(layerId: string): void {
 
 export function enterWindowDependencyScope(windowId: string): void {
   clearWindowDependencies(windowId);
+  const ownerKey = ownerKeyForWindow(windowId);
+  disposeOwnedComputeds(ownerKey);
+  activeCompositionOwner = ownerKey;
   activeWindowDependencyScope = windowId;
   activeWindowNodeDependencyScope = null;
   activeLayerDependencyScope = null;
@@ -296,6 +439,7 @@ export function enterWindowDependencyScope(windowId: string): void {
 }
 
 export function leaveWindowDependencyScope(): void {
+  activeCompositionOwner = null;
   activeWindowDependencyScope = null;
   activeWindowNodeDependencyScope = null;
   activeWindowManagedDependencyScope = null;
@@ -303,6 +447,9 @@ export function leaveWindowDependencyScope(): void {
 
 export function enterLayerDependencyScope(layerId: string): void {
   clearLayerDependencies(layerId);
+  const ownerKey = ownerKeyForLayer(layerId);
+  disposeOwnedComputeds(ownerKey);
+  activeCompositionOwner = ownerKey;
   activeLayerDependencyScope = layerId;
   activeLayerNodeDependencyScope = null;
   activeWindowDependencyScope = null;
@@ -310,6 +457,7 @@ export function enterLayerDependencyScope(layerId: string): void {
 }
 
 export function leaveLayerDependencyScope(): void {
+  activeCompositionOwner = null;
   activeLayerDependencyScope = null;
   activeLayerNodeDependencyScope = null;
 }
@@ -347,10 +495,16 @@ export function leaveLayerNodeDependencyScope(): void {
 
 export function dropWindowDependencies(windowId: string): void {
   clearWindowDependencies(windowId);
+  const ownerKey = ownerKeyForWindow(windowId);
+  disposeOwnedComputeds(ownerKey);
+  ownedComputedsByOwner.delete(ownerKey);
 }
 
 export function dropLayerDependencies(layerId: string): void {
   clearLayerDependencies(layerId);
+  const ownerKey = ownerKeyForLayer(layerId);
+  disposeOwnedComputeds(ownerKey);
+  ownedComputedsByOwner.delete(ownerKey);
 }
 
 export function takeDirtyWindowNodeIds(windowId: string): string[] {
@@ -565,6 +719,7 @@ export function trackSignalWrite(signal: object): void {
       hasSuppression: suppression !== undefined,
       suppression: suppression ? suppressionForDebug(suppression) : null,
     });
+    reportUnknownSignalWrite(signal);
     markRuntimeDirty();
     return;
   }

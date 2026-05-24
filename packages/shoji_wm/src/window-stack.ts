@@ -1,4 +1,5 @@
 import { computed, signal, type ReadonlySignal } from "./signals";
+import { withoutCompositionOwnership } from "./runtime-hooks";
 import type { WaylandWindow } from "./types";
 
 export type WindowStackPlacement = "front" | "back";
@@ -115,10 +116,14 @@ export function createWindowStack(options: WindowStackOptions = {}): WindowStack
       let existing = zIndexById.get(window.id);
       if (!existing) {
         const id = window.id;
-        existing = computed(() => {
-          const index = order().indexOf(id);
-          return baseZIndex + (index < 0 ? 0 : index * step);
-        });
+        // Long-lived per-window cache: must outlive the composition pass it
+        // was first requested from. See animation.ts for the same pattern.
+        existing = withoutCompositionOwnership(() =>
+          computed(() => {
+            const index = order().indexOf(id);
+            return baseZIndex + (index < 0 ? 0 : index * step);
+          }),
+        );
         zIndexById.set(id, existing);
       }
       return existing;
