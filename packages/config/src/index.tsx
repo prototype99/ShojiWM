@@ -182,10 +182,10 @@ WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
         const base = window.state[WINDOW_STATE_RECT]();
         const dy = translateY() + (tileDragging() ? 0 : workspaceOffsetY());
         return {
-            x: base.x,
-            y: base.y + dy,
-            width: base.width,
-            height: base.height,
+            x: read(base.x),
+            y: read(base.y) + dy,
+            width: read(base.width),
+            height: read(base.height),
         };
     });
     const forceRectSize = computed(() => window.isResizable() && !window.isTransient());

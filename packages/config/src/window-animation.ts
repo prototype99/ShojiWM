@@ -3,7 +3,7 @@ import {
     type WaylandWindow,
     type WindowStateKey,
     animationVariable,
-    effect,
+    computed,
     read,
 } from "shoji_wm";
 import type { ManagedWindowRect } from "shoji_wm/types";
@@ -29,9 +29,9 @@ function getRectAnimationVariable(stateKey: symbol): AnimationVariable {
 
 /**
  * Drive `window.state[windowRectState]` from its current rect to `to` over
- * `duration` ms, applying `easing` to the progress. The state is written
- * each frame, so anything bound to it (the ManagedWindow rect, computed
- * signals, etc.) animates smoothly.
+ * `duration` ms, applying `easing` to the progress. The state is replaced
+ * once with per-field computed signals, so each animation frame only updates
+ * the animation variable instead of also writing the window state signal.
  *
  * Calling again while an animation is in flight cancels the previous one
  * and retargets from the rect's current (possibly mid-lerp) value — so
@@ -78,19 +78,15 @@ export function playRectAnimation(
     window.animation.set(variable, 0);
 
     const progress = window.animation.signal(variable);
-    const dispose = effect(() => {
-        const t = progress();
-        window.state[windowRectState].set({
-            x: from.x + (target.x - from.x) * t,
-            y: from.y + (target.y - from.y) * t,
-            width: from.width + (target.width - from.width) * t,
-            height: from.height + (target.height - from.height) * t,
-        });
+    window.state[windowRectState].set({
+        x: computed(() => from.x + (target.x - from.x) * progress()),
+        y: computed(() => from.y + (target.y - from.y) * progress()),
+        width: computed(() => from.width + (target.width - from.width) * progress()),
+        height: computed(() => from.height + (target.height - from.height) * progress()),
     });
 
     const teardown = () => {
         clearTimeout(timer);
-        dispose();
         if (perWindow!.get(windowRectState) === teardown) {
             perWindow!.delete(windowRectState);
         }
