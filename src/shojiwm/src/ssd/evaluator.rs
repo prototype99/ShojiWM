@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::OsString,
     io::{BufRead, BufReader, Read, Write},
     os::unix::net::{UnixListener, UnixStream},
@@ -6,12 +7,13 @@ use std::{
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{debug, error, info, warn};
 
+use super::perf_stats::{IpcCallKind, IpcCallTimer};
 use super::window_model::{
     ManagedWindowState, PointerMoveEventSnapshot, WaylandLayerSnapshot, WaylandOutputSnapshot,
     WaylandWindowAction, WaylandWindowSnapshot, WindowActivateRequestEventSnapshot,
@@ -34,6 +36,83 @@ use smithay::reexports::calloop::channel::Sender as CalloopSender;
 fn managed_rect_debug_enabled() -> bool {
     std::env::var_os("SHOJI_MANAGED_RECT_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+fn async_scheduler_enabled() -> bool {
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var_os("SHOJI_ASYNC_SCHEDULER_DISABLE")
+            .is_some_and(|value| value != "0" && !value.is_empty())
+    })
+}
+
+fn cached_eval_prefetch_debug_enabled() -> bool {
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("SHOJI_CACHED_EVAL_PREFETCH_DEBUG")
+            .is_some_and(|value| value != "0" && !value.is_empty())
+    })
+}
+
+#[derive(Default)]
+struct CachedEvalPrefetchStats {
+    last_log: Option<Instant>,
+    queued: u64,
+    hit: u64,
+    fallback_sync: u64,
+    stale_dropped: u64,
+}
+
+enum CachedEvalPrefetchEvent {
+    Queued,
+    Hit,
+    FallbackSync,
+    StaleDropped(u64),
+}
+
+fn record_cached_eval_prefetch_event(event: CachedEvalPrefetchEvent) {
+    if !cached_eval_prefetch_debug_enabled() {
+        return;
+    }
+
+    use std::sync::OnceLock;
+
+    static STATS: OnceLock<Mutex<CachedEvalPrefetchStats>> = OnceLock::new();
+    let stats = STATS.get_or_init(|| Mutex::new(CachedEvalPrefetchStats::default()));
+    let Ok(mut stats) = stats.lock() else {
+        return;
+    };
+    match event {
+        CachedEvalPrefetchEvent::Queued => stats.queued = stats.queued.saturating_add(1),
+        CachedEvalPrefetchEvent::Hit => stats.hit = stats.hit.saturating_add(1),
+        CachedEvalPrefetchEvent::FallbackSync => {
+            stats.fallback_sync = stats.fallback_sync.saturating_add(1);
+        }
+        CachedEvalPrefetchEvent::StaleDropped(count) => {
+            stats.stale_dropped = stats.stale_dropped.saturating_add(count);
+        }
+    }
+
+    let now = Instant::now();
+    let last_log = *stats.last_log.get_or_insert(now);
+    if now.duration_since(last_log) < Duration::from_secs(1) {
+        return;
+    }
+    info!(
+        queued = stats.queued,
+        hit = stats.hit,
+        fallback_sync = stats.fallback_sync,
+        stale_dropped = stats.stale_dropped,
+        "cached eval prefetch stats"
+    );
+    *stats = CachedEvalPrefetchStats {
+        last_log: Some(now),
+        ..CachedEvalPrefetchStats::default()
+    };
 }
 
 /// Dynamic decoration evaluation boundary.
@@ -65,6 +144,24 @@ pub trait DecorationEvaluator {
         Err(DecorationEvaluationError::RuntimeProtocol(
             "cached window evaluation unsupported".into(),
         ))
+    }
+
+    fn prefetch_cached_window(
+        &self,
+        _window_id: &str,
+        _window: Option<&WaylandWindowSnapshot>,
+        _now_ms: u64,
+    ) -> Result<(), DecorationEvaluationError> {
+        Ok(())
+    }
+
+    fn evaluate_prefetched_cached_window(
+        &self,
+        window_id: &str,
+        window: Option<&WaylandWindowSnapshot>,
+        now_ms: u64,
+    ) -> Result<DecorationCachedEvaluationResult, DecorationEvaluationError> {
+        self.evaluate_cached_window(window_id, window, now_ms)
     }
 
     fn scheduler_tick(
@@ -218,6 +315,11 @@ pub struct DecorationSchedulerTick {
     pub dirty: bool,
     pub dirty_window_ids: Vec<String>,
     pub dirty_managed_window_ids: Vec<String>,
+    /// Pre-computed managed-only state updates the TS runtime is pushing alongside the
+    /// dirty notification. When an entry is present for a window id, the Rust side can
+    /// apply it directly and **skip** the per-window `evaluate_cached` IPC. This is the
+    /// foundation of the IPC-skip fast path for `suppressSSDRebuild` animations.
+    pub dirty_managed_window_states: std::collections::HashMap<String, ManagedOnlyStateUpdate>,
     pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
     pub dirty_layer_node_ids: std::collections::HashMap<String, Vec<String>>,
     pub actions: Vec<RuntimeWindowAction>,
@@ -228,6 +330,16 @@ pub struct DecorationSchedulerTick {
     pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
+}
+
+/// Per-window managed-only state delivered through the scheduler tick. Carries the same
+/// three fields the existing `evaluate_cached` managed-only branch applies, so the
+/// IPC-skip path can write them straight into the cached decoration.
+#[derive(Debug, Clone)]
+pub struct ManagedOnlyStateUpdate {
+    pub managed_window: ManagedWindowState,
+    pub transform: WindowTransform,
+    pub window_effects: Option<WindowEffectConfig>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -508,10 +620,44 @@ pub struct NodeDecorationEvaluator {
     config_path: PathBuf,
     working_dir: Option<PathBuf>,
     transport: RuntimeTransportKind,
-    runtime: Arc<Mutex<Option<NodeDecorationRuntime>>>,
+    runtime: Arc<Mutex<Option<Arc<NodeDecorationRuntime>>>>,
     display_state: Arc<Mutex<std::collections::BTreeMap<String, WaylandOutputSnapshot>>>,
+    scheduler_tick_async: Arc<SchedulerTickAsyncDispatcher>,
+    cached_eval_prefetch: Arc<CachedEvalPrefetchDispatcher>,
     pointer_move_async: Arc<PointerMoveAsyncDispatcher>,
     async_event_sender: Arc<Mutex<Option<CalloopSender<DecorationPointerMoveAsyncInvocation>>>>,
+}
+
+#[derive(Debug)]
+struct SchedulerTickAsyncWork {
+    now_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct SchedulerTickAsyncDispatcher {
+    pending: Mutex<Option<SchedulerTickAsyncWork>>,
+    pending_changed: Condvar,
+    completed: Mutex<Option<Result<DecorationSchedulerTick, DecorationEvaluationError>>>,
+    worker_started: AtomicBool,
+    in_flight: AtomicBool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CachedEvalPrefetchKey {
+    window_id: String,
+    now_ms: u64,
+}
+
+struct CachedEvalPrefetchEntry {
+    runtime: Arc<NodeDecorationRuntime>,
+    request_id: u64,
+    pending: Arc<PendingRuntimeResponse>,
+    timer: IpcCallTimer,
+}
+
+#[derive(Default)]
+struct CachedEvalPrefetchDispatcher {
+    in_flight: Mutex<HashMap<CachedEvalPrefetchKey, CachedEvalPrefetchEntry>>,
 }
 
 #[derive(Debug)]
@@ -528,22 +674,44 @@ struct PointerMoveAsyncDispatcher {
 }
 
 struct NodeDecorationRuntime {
-    child: Child,
-    connection: RuntimeConnection,
-    next_request_id: u64,
-    stderr_log: Arc<Mutex<String>>,
+    child: Mutex<Child>,
+    writer: Mutex<RuntimeConnectionWriter>,
+    pending: Arc<RuntimePendingResponses>,
+    next_request_id: AtomicU64,
+    socket_path: Option<PathBuf>,
+    shutdown: AtomicBool,
 }
 
-enum RuntimeConnection {
-    Stdio {
-        stdin: ChildStdin,
-        stdout: BufReader<ChildStdout>,
-    },
-    Uds {
-        writer: UnixStream,
-        reader: BufReader<UnixStream>,
-        socket_path: PathBuf,
-    },
+enum RuntimeConnectionWriter {
+    Stdio { stdin: ChildStdin },
+    Uds { writer: UnixStream },
+}
+
+enum RuntimeConnectionReader {
+    Stdio { stdout: BufReader<ChildStdout> },
+    Uds { reader: BufReader<UnixStream> },
+}
+
+#[derive(Default)]
+struct RuntimePendingResponses {
+    responses: Mutex<std::collections::HashMap<u64, Arc<PendingRuntimeResponse>>>,
+}
+
+struct PendingRuntimeResponse {
+    result: Mutex<Option<Result<Vec<u8>, DecorationEvaluationError>>>,
+    completed: Condvar,
+}
+
+#[derive(serde::Deserialize)]
+struct RuntimeResponseEnvelope {
+    #[serde(rename = "requestId")]
+    request_id: u64,
+}
+
+struct RuntimeRoundtrip<T> {
+    runtime: Arc<NodeDecorationRuntime>,
+    request_id: u64,
+    response: T,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -763,6 +931,9 @@ struct RuntimeSchedulerResponse {
     dirty_window_ids: Option<Vec<String>>,
     #[serde(rename = "dirtyManagedWindowIds")]
     dirty_managed_window_ids: Option<Vec<String>>,
+    #[serde(rename = "dirtyManagedWindowStates")]
+    dirty_managed_window_states:
+        Option<std::collections::HashMap<String, WireManagedOnlyStateUpdate>>,
     #[serde(rename = "dirtyWindowNodeIds")]
     dirty_window_node_ids: Option<std::collections::HashMap<String, Vec<String>>>,
     #[serde(rename = "dirtyLayerNodeIds")]
@@ -783,6 +954,59 @@ struct RuntimeSchedulerResponse {
     #[serde(rename = "processActions")]
     process_actions: Option<Vec<RuntimeProcessAction>>,
     error: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct WireManagedOnlyStateUpdate {
+    #[serde(rename = "managedWindow")]
+    managed_window: ManagedWindowState,
+    transform: WindowTransform,
+    #[serde(rename = "windowEffects")]
+    window_effects: Option<WireWindowEffectConfig>,
+}
+
+fn scheduler_response_to_tick(
+    response: RuntimeSchedulerResponse,
+) -> Result<DecorationSchedulerTick, DecorationEvaluationError> {
+    let dirty_managed_window_states = match response.dirty_managed_window_states {
+        Some(wire_map) => {
+            let mut converted = std::collections::HashMap::with_capacity(wire_map.len());
+            for (window_id, wire_state) in wire_map {
+                let window_effects = wire_state
+                    .window_effects
+                    .map(TryInto::try_into)
+                    .transpose()
+                    .map_err(DecorationEvaluationError::Bridge)?;
+                converted.insert(
+                    window_id,
+                    ManagedOnlyStateUpdate {
+                        managed_window: wire_state.managed_window,
+                        transform: wire_state.transform,
+                        window_effects,
+                    },
+                );
+            }
+            converted
+        }
+        None => std::collections::HashMap::new(),
+    };
+
+    Ok(DecorationSchedulerTick {
+        dirty: response.dirty.unwrap_or(false),
+        dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+        dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
+        dirty_managed_window_states,
+        dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
+        dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
+        actions: response.actions.unwrap_or_default(),
+        next_poll_in_ms: response.next_poll_in_ms,
+        display_config: response.display_config,
+        key_binding_config: response.key_binding_config,
+        pointer_config: response.pointer_config,
+        event_config: response.event_config,
+        process_config: response.process_config,
+        process_actions: response.process_actions.unwrap_or_default(),
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -1101,6 +1325,8 @@ impl NodeDecorationEvaluator {
             transport: RuntimeTransportKind::Uds,
             runtime: Arc::new(Mutex::new(None)),
             display_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            scheduler_tick_async: Arc::new(SchedulerTickAsyncDispatcher::default()),
+            cached_eval_prefetch: Arc::new(CachedEvalPrefetchDispatcher::default()),
             pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
             async_event_sender: Arc::new(Mutex::new(None)),
         }
@@ -1126,6 +1352,8 @@ impl NodeDecorationEvaluator {
             transport: RuntimeTransportKind::Stdio,
             runtime: Arc::new(Mutex::new(None)),
             display_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            scheduler_tick_async: Arc::new(SchedulerTickAsyncDispatcher::default()),
+            cached_eval_prefetch: Arc::new(CachedEvalPrefetchDispatcher::default()),
             pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
             async_event_sender: Arc::new(Mutex::new(None)),
         }
@@ -1149,20 +1377,457 @@ impl NodeDecorationEvaluator {
         }
     }
 
-    fn ensure_runtime<'a>(
-        &'a self,
-        runtime: &'a mut Option<NodeDecorationRuntime>,
-    ) -> Result<&'a mut NodeDecorationRuntime, DecorationEvaluationError> {
-        if runtime.is_none() {
-            *runtime = Some(match self.transport {
-                RuntimeTransportKind::Stdio => self.spawn_stdio_runtime()?,
-                RuntimeTransportKind::Uds => self.spawn_uds_runtime()?,
-            });
+    fn scheduler_tick_async(
+        &self,
+        now_ms: u64,
+    ) -> Result<DecorationSchedulerTick, DecorationEvaluationError> {
+        self.ensure_scheduler_tick_worker();
+
+        let completed = self
+            .scheduler_tick_async
+            .completed
+            .lock()
+            .map_err(|_| {
+                DecorationEvaluationError::RuntimeProtocol(
+                    "async scheduler completion mutex poisoned".into(),
+                )
+            })?
+            .take();
+
+        {
+            let mut pending = self.scheduler_tick_async.pending.lock().map_err(|_| {
+                DecorationEvaluationError::RuntimeProtocol(
+                    "async scheduler pending mutex poisoned".into(),
+                )
+            })?;
+            *pending = Some(SchedulerTickAsyncWork { now_ms });
+            self.scheduler_tick_async.pending_changed.notify_one();
         }
 
-        runtime
-            .as_mut()
-            .ok_or_else(|| DecorationEvaluationError::RuntimeProtocol("runtime unavailable".into()))
+        match completed {
+            Some(result) => result,
+            None => Ok(DecorationSchedulerTick {
+                next_poll_in_ms: Some(0),
+                ..DecorationSchedulerTick::default()
+            }),
+        }
+    }
+
+    fn ensure_scheduler_tick_worker(&self) {
+        if self
+            .scheduler_tick_async
+            .worker_started
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+
+        let evaluator = self.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name("shojiwm-runtime-scheduler".into())
+            .spawn(move || evaluator.run_scheduler_tick_worker());
+        if let Err(error) = spawn_result {
+            self.scheduler_tick_async
+                .worker_started
+                .store(false, Ordering::Release);
+            warn!(?error, "failed to spawn runtime scheduler worker");
+        }
+    }
+
+    fn run_scheduler_tick_worker(self) {
+        loop {
+            let work = {
+                let mut pending = match self.scheduler_tick_async.pending.lock() {
+                    Ok(pending) => pending,
+                    Err(_) => return,
+                };
+                while pending.is_none() {
+                    pending = match self.scheduler_tick_async.pending_changed.wait(pending) {
+                        Ok(pending) => pending,
+                        Err(_) => return,
+                    };
+                }
+                pending.take()
+            };
+            let Some(work) = work else {
+                continue;
+            };
+
+            self.scheduler_tick_async
+                .in_flight
+                .store(true, Ordering::Release);
+            let result = self.scheduler_tick_sync(work.now_ms);
+            self.scheduler_tick_async
+                .in_flight
+                .store(false, Ordering::Release);
+
+            let Ok(mut completed) = self.scheduler_tick_async.completed.lock() else {
+                return;
+            };
+            *completed = Some(result);
+        }
+    }
+
+    fn scheduler_tick_sync(
+        &self,
+        now_ms: u64,
+    ) -> Result<DecorationSchedulerTick, DecorationEvaluationError> {
+        let Some(roundtrip) = self.send_runtime_request::<RuntimeSchedulerResponse, _>(
+            false,
+            None,
+            |request_id, display_state| {
+                serde_json::to_string(&RuntimeRequest::SchedulerTick {
+                    request_id,
+                    now_ms,
+                    display_state,
+                })
+                .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))
+            },
+        )?
+        else {
+            return Ok(DecorationSchedulerTick::default());
+        };
+        let RuntimeRoundtrip {
+            runtime,
+            request_id,
+            response,
+        } = roundtrip;
+        if response.request_id != request_id {
+            self.reset_runtime_if_current(&runtime);
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response id: expected {request_id}, got {}",
+                response.request_id
+            )));
+        }
+        if response.kind != "schedulerTick" {
+            self.reset_runtime_if_current(&runtime);
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response kind for schedulerTick: {}",
+                response.kind
+            )));
+        }
+        if !response.ok {
+            self.reset_runtime_if_current(&runtime);
+            return Err(DecorationEvaluationError::RuntimeProtocol(
+                response
+                    .error
+                    .unwrap_or_else(|| "runtime returned failure".into()),
+            ));
+        }
+
+        if managed_rect_debug_enabled() {
+            info!(
+                now_ms,
+                dirty = response.dirty.unwrap_or(false),
+                dirty_window_ids = ?response.dirty_window_ids,
+                dirty_window_node_ids = ?response.dirty_window_node_ids,
+                next_poll_in_ms = ?response.next_poll_in_ms,
+                "managed rect debug: runtime scheduler tick"
+            );
+        }
+
+        scheduler_response_to_tick(response)
+    }
+
+    fn runtime_client(
+        &self,
+        spawn_if_missing: bool,
+    ) -> Result<Option<Arc<NodeDecorationRuntime>>, DecorationEvaluationError> {
+        let mut runtime = self.runtime.lock().map_err(|_| {
+            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
+        })?;
+        if runtime.is_none() && spawn_if_missing {
+            *runtime = Some(Arc::new(match self.transport {
+                RuntimeTransportKind::Stdio => self.spawn_stdio_runtime()?,
+                RuntimeTransportKind::Uds => self.spawn_uds_runtime()?,
+            }));
+        }
+        Ok(runtime.clone())
+    }
+
+    fn try_runtime_client(
+        &self,
+        spawn_if_missing: bool,
+    ) -> Result<Option<Arc<NodeDecorationRuntime>>, DecorationEvaluationError> {
+        let Ok(mut runtime) = self.runtime.try_lock() else {
+            return Ok(None);
+        };
+        if runtime.is_none() && spawn_if_missing {
+            *runtime = Some(Arc::new(match self.transport {
+                RuntimeTransportKind::Stdio => self.spawn_stdio_runtime()?,
+                RuntimeTransportKind::Uds => self.spawn_uds_runtime()?,
+            }));
+        }
+        Ok(runtime.clone())
+    }
+
+    fn reset_runtime_if_current(&self, current: &Arc<NodeDecorationRuntime>) {
+        if let Ok(mut runtime) = self.runtime.lock()
+            && runtime
+                .as_ref()
+                .is_some_and(|runtime| Arc::ptr_eq(runtime, current))
+        {
+            *runtime = None;
+        }
+    }
+
+    fn send_runtime_request<T, F>(
+        &self,
+        spawn_if_missing: bool,
+        ipc_kind: Option<IpcCallKind>,
+        build: F,
+    ) -> Result<Option<RuntimeRoundtrip<T>>, DecorationEvaluationError>
+    where
+        T: serde::de::DeserializeOwned,
+        F: FnOnce(
+            u64,
+            &std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        ) -> Result<String, DecorationEvaluationError>,
+    {
+        let Some(runtime) = self.runtime_client(spawn_if_missing)? else {
+            return Ok(None);
+        };
+        let request_id = runtime.next_request_id();
+        let display_state = self
+            .display_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let request = build(request_id, &display_state)?;
+        let mut ipc_timer = ipc_kind.map(|kind| IpcCallTimer::start(kind, request.len()));
+        let result = runtime.request_response::<T, _>(request_id, &request, || {
+            if let Some(timer) = ipc_timer.as_mut() {
+                timer.mark_written();
+            }
+        });
+        match result {
+            Ok((response, response_bytes)) => {
+                if let Some(timer) = ipc_timer.as_mut() {
+                    timer.mark_read(response_bytes);
+                }
+                if let Some(timer) = ipc_timer {
+                    timer.finish();
+                }
+                Ok(Some(RuntimeRoundtrip {
+                    runtime,
+                    request_id,
+                    response,
+                }))
+            }
+            Err(error) => {
+                if let Some(timer) = ipc_timer {
+                    timer.finish();
+                }
+                self.reset_runtime_if_current(&runtime);
+                Err(error)
+            }
+        }
+    }
+
+    fn prefetch_cached_window_impl(
+        &self,
+        window_id: &str,
+        window: Option<&WaylandWindowSnapshot>,
+        now_ms: u64,
+    ) -> Result<(), DecorationEvaluationError> {
+        let key = CachedEvalPrefetchKey {
+            window_id: window_id.to_string(),
+            now_ms,
+        };
+        {
+            let mut in_flight = self.cached_eval_prefetch.in_flight.lock().map_err(|_| {
+                DecorationEvaluationError::RuntimeProtocol(
+                    "cached eval prefetch mutex poisoned".into(),
+                )
+            })?;
+            // Prefetches are frame-specific. Drop stale handles so unconsumed
+            // results do not grow the map when a window disappears or a refresh
+            // path changes after the request was queued.
+            let before_len = in_flight.len();
+            in_flight.retain(|entry_key, _| entry_key.now_ms >= now_ms);
+            let stale_dropped = before_len.saturating_sub(in_flight.len());
+            if stale_dropped > 0 {
+                record_cached_eval_prefetch_event(CachedEvalPrefetchEvent::StaleDropped(
+                    stale_dropped as u64,
+                ));
+            }
+            if in_flight.contains_key(&key) {
+                return Ok(());
+            }
+        }
+
+        let Some(runtime) = self.runtime_client(true)? else {
+            return Ok(());
+        };
+        let request_id = runtime.next_request_id();
+        let display_state = self
+            .display_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let request = serde_json::to_string(&RuntimeRequest::EvaluateCached {
+            request_id,
+            window_id,
+            snapshot: window,
+            now_ms,
+            display_state: &display_state,
+        })
+        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
+        let mut timer = IpcCallTimer::start(IpcCallKind::EvaluateCached, request.len());
+        let pending = match runtime.send_request(request_id, &request) {
+            Ok(pending) => {
+                timer.mark_written();
+                pending
+            }
+            Err(error) => {
+                timer.finish();
+                self.reset_runtime_if_current(&runtime);
+                return Err(error);
+            }
+        };
+
+        let mut in_flight = self.cached_eval_prefetch.in_flight.lock().map_err(|_| {
+            DecorationEvaluationError::RuntimeProtocol("cached eval prefetch mutex poisoned".into())
+        })?;
+        in_flight.insert(
+            key,
+            CachedEvalPrefetchEntry {
+                runtime,
+                request_id,
+                pending,
+                timer,
+            },
+        );
+        record_cached_eval_prefetch_event(CachedEvalPrefetchEvent::Queued);
+        Ok(())
+    }
+
+    fn evaluate_prefetched_cached_window_impl(
+        &self,
+        window_id: &str,
+        window: Option<&WaylandWindowSnapshot>,
+        now_ms: u64,
+    ) -> Result<DecorationCachedEvaluationResult, DecorationEvaluationError> {
+        let key = CachedEvalPrefetchKey {
+            window_id: window_id.to_string(),
+            now_ms,
+        };
+        let entry = self
+            .cached_eval_prefetch
+            .in_flight
+            .lock()
+            .map_err(|_| {
+                DecorationEvaluationError::RuntimeProtocol(
+                    "cached eval prefetch mutex poisoned".into(),
+                )
+            })?
+            .remove(&key);
+        let Some(mut entry) = entry else {
+            record_cached_eval_prefetch_event(CachedEvalPrefetchEvent::FallbackSync);
+            return self.evaluate_cached_window(window_id, window, now_ms);
+        };
+        record_cached_eval_prefetch_event(CachedEvalPrefetchEvent::Hit);
+
+        let payload = match entry.pending.wait() {
+            Ok(payload) => payload,
+            Err(error) => {
+                entry.timer.finish();
+                self.reset_runtime_if_current(&entry.runtime);
+                return Err(error);
+            }
+        };
+        entry.timer.mark_read(payload.len());
+        entry.timer.finish();
+        let response: RuntimeEvaluateResponse =
+            serde_json::from_slice(&payload).map_err(|error| {
+                DecorationEvaluationError::InvalidResponse(format!(
+                    "{error}; payload={}",
+                    String::from_utf8_lossy(&payload)
+                ))
+            })?;
+        self.cached_response_to_result(&entry.runtime, entry.request_id, response)
+    }
+
+    fn cached_response_to_result(
+        &self,
+        runtime: &Arc<NodeDecorationRuntime>,
+        request_id: u64,
+        response: RuntimeEvaluateResponse,
+    ) -> Result<DecorationCachedEvaluationResult, DecorationEvaluationError> {
+        self.validate_runtime_response(
+            runtime,
+            request_id,
+            response.request_id,
+            &response.kind,
+            "evaluateCached",
+            response.ok,
+            response.error.clone(),
+        )?;
+
+        let managed_window_only = response.managed_window_only.unwrap_or(false);
+        let node = if managed_window_only {
+            None
+        } else {
+            let Some(serialized) = response.serialized else {
+                self.reset_runtime_if_current(runtime);
+                return Err(DecorationEvaluationError::RuntimeProtocol(
+                    "missing serialized tree".into(),
+                ));
+            };
+            let stdout = serde_json::to_string(&serialized)
+                .map_err(|err| DecorationEvaluationError::InvalidResponse(err.to_string()))?;
+            Some(decode_tree_json(stdout.trim()).map_err(DecorationEvaluationError::Bridge)?)
+        };
+        Ok(DecorationCachedEvaluationResult {
+            node,
+            transform: response.transform.unwrap_or_default(),
+            managed_window: response.managed_window.unwrap_or_default(),
+            window_effects: response
+                .window_effects
+                .map(TryInto::try_into)
+                .transpose()
+                .map_err(DecorationEvaluationError::Bridge)?,
+            dirty_node_ids: response.dirty_node_ids.unwrap_or_default(),
+            managed_window_only,
+            next_poll_in_ms: response.next_poll_in_ms,
+            display_config: response.display_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+        })
+    }
+
+    fn validate_runtime_response(
+        &self,
+        runtime: &Arc<NodeDecorationRuntime>,
+        request_id: u64,
+        response_id: u64,
+        response_kind: &str,
+        expected_kind: &str,
+        ok: bool,
+        error: Option<String>,
+    ) -> Result<(), DecorationEvaluationError> {
+        if response_id != request_id {
+            self.reset_runtime_if_current(runtime);
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response id: expected {request_id}, got {response_id}"
+            )));
+        }
+        if response_kind != expected_kind {
+            self.reset_runtime_if_current(runtime);
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response kind for {expected_kind}: {response_kind}"
+            )));
+        }
+        if !ok {
+            self.reset_runtime_if_current(runtime);
+            return Err(DecorationEvaluationError::RuntimeProtocol(
+                error.unwrap_or_else(|| "runtime returned failure".into()),
+            ));
+        }
+        Ok(())
     }
 
     fn spawn_stdio_runtime(&self) -> Result<NodeDecorationRuntime, DecorationEvaluationError> {
@@ -1187,15 +1852,15 @@ impl NodeDecorationEvaluator {
             DecorationEvaluationError::RuntimeProtocol("missing runtime stdout".into())
         })?;
 
-        Ok(NodeDecorationRuntime {
+        Ok(NodeDecorationRuntime::new(
             child,
-            connection: RuntimeConnection::Stdio {
-                stdin,
+            RuntimeConnectionWriter::Stdio { stdin },
+            RuntimeConnectionReader::Stdio {
                 stdout: BufReader::new(stdout),
             },
-            next_request_id: 1,
             stderr_log,
-        })
+            None,
+        ))
     }
 
     fn spawn_uds_runtime(&self) -> Result<NodeDecorationRuntime, DecorationEvaluationError> {
@@ -1263,73 +1928,55 @@ impl NodeDecorationEvaluator {
         };
         let writer = stream.try_clone()?;
 
-        Ok(NodeDecorationRuntime {
+        Ok(NodeDecorationRuntime::new(
             child,
-            connection: RuntimeConnection::Uds {
-                writer,
+            RuntimeConnectionWriter::Uds { writer },
+            RuntimeConnectionReader::Uds {
                 reader: BufReader::new(stream),
-                socket_path,
             },
-            next_request_id: 1,
             stderr_log,
-        })
+            Some(socket_path),
+        ))
     }
 
     pub fn background_effect_config(
         &self,
     ) -> Result<Option<BackgroundEffectConfig>, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::GetEffectConfig {
+        let Some(roundtrip) = self.send_runtime_request::<RuntimeEffectConfigResponse, _>(
+            true,
+            None,
+            |request_id, display_state| {
+                serde_json::to_string(&RuntimeRequest::GetEffectConfig {
+                    request_id,
+                    display_state,
+                })
+                .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let RuntimeRoundtrip {
+            runtime,
             request_id,
-            display_state: &display_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeEffectConfigResponse =
-            if let Some(response) = runtime.read_response()? {
-                response
-            } else {
-                let status = runtime
-                    .child
-                    .try_wait()?
-                    .and_then(|status| status.code())
-                    .unwrap_or(-1);
-                let stderr = runtime
-                    .stderr_log
-                    .lock()
-                    .map(|stderr| stderr.clone())
-                    .unwrap_or_default();
-                *runtime_guard = None;
-                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-            };
+            response,
+        } = roundtrip;
         if response.request_id != request_id {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(format!(
                 "mismatched response id: expected {request_id}, got {}",
                 response.request_id
             )));
         }
         if response.kind != "getEffectConfig" {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(format!(
                 "mismatched response kind for getEffectConfig: {}",
                 response.kind
             )));
         }
         if !response.ok {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(
                 response
                     .error
@@ -1414,14 +2061,12 @@ impl NodeDecorationEvaluator {
         event: &PointerMoveEventSnapshot,
         now_ms: u64,
     ) -> Result<Option<DecorationPointerMoveAsyncInvocation>, DecorationEvaluationError> {
-        let Ok(mut runtime_guard) = self.runtime.try_lock() else {
-            // Pointer motion is lossy by design. If the runtime is handling a synchronous
-            // request, dropping this sample is better than blocking input delivery.
+        let Some(runtime) = self.try_runtime_client(true)? else {
+            // Pointer motion is lossy by design. If the runtime lock is busy, dropping
+            // this sample is better than blocking input delivery.
             return Ok(None);
         };
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
+        let request_id = runtime.next_request_id();
         let display_state = self
             .display_state
             .lock()
@@ -1435,41 +2080,36 @@ impl NodeDecorationEvaluator {
             display_state: &display_state,
         })
         .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimePointerMoveAsyncResponse =
-            if let Some(response) = runtime.read_response()? {
-                response
-            } else {
-                let status = runtime
-                    .child
-                    .try_wait()?
-                    .and_then(|status| status.code())
-                    .unwrap_or(-1);
-                let stderr = runtime
-                    .stderr_log
-                    .lock()
-                    .map(|stderr| stderr.clone())
-                    .unwrap_or_default();
-                *runtime_guard = None;
-                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-            };
+        let mut ipc_timer = IpcCallTimer::start(IpcCallKind::PointerMoveAsync, request.len());
+        let (response, response_bytes) = match runtime
+            .request_response::<RuntimePointerMoveAsyncResponse, _>(request_id, &request, || {
+                ipc_timer.mark_written();
+            }) {
+            Ok(result) => result,
+            Err(error) => {
+                ipc_timer.finish();
+                self.reset_runtime_if_current(&runtime);
+                return Err(error);
+            }
+        };
+        ipc_timer.mark_read(response_bytes);
+        ipc_timer.finish();
         if response.request_id != request_id {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(format!(
                 "mismatched response id: expected {request_id}, got {}",
                 response.request_id
             )));
         }
         if response.kind != "pointerMoveAsync" {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(format!(
                 "mismatched response kind for pointerMoveAsync: {}",
                 response.kind
             )));
         }
         if !response.ok {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(
                 response
                     .error
@@ -1507,6 +2147,8 @@ impl Clone for NodeDecorationEvaluator {
             transport: self.transport,
             runtime: Arc::clone(&self.runtime),
             display_state: Arc::clone(&self.display_state),
+            scheduler_tick_async: Arc::clone(&self.scheduler_tick_async),
+            cached_eval_prefetch: Arc::clone(&self.cached_eval_prefetch),
             pointer_move_async: Arc::clone(&self.pointer_move_async),
             async_event_sender: Arc::clone(&self.async_event_sender),
         }
@@ -1514,18 +2156,124 @@ impl Clone for NodeDecorationEvaluator {
 }
 
 impl NodeDecorationRuntime {
-    fn write_request(&mut self, request: &str) -> Result<(), DecorationEvaluationError> {
+    fn new(
+        child: Child,
+        writer: RuntimeConnectionWriter,
+        reader: RuntimeConnectionReader,
+        _stderr_log: Arc<Mutex<String>>,
+        socket_path: Option<PathBuf>,
+    ) -> Self {
+        let pending = Arc::new(RuntimePendingResponses::default());
+        let shutdown = AtomicBool::new(false);
+        let runtime = Self {
+            child: Mutex::new(child),
+            writer: Mutex::new(writer),
+            pending: Arc::clone(&pending),
+            next_request_id: AtomicU64::new(1),
+            socket_path,
+            shutdown,
+        };
+        runtime.spawn_reader(reader);
+        runtime
+    }
+
+    fn next_request_id(&self) -> u64 {
+        self.next_request_id.fetch_add(1, Ordering::AcqRel)
+    }
+
+    fn spawn_reader(&self, mut reader: RuntimeConnectionReader) {
+        let pending = Arc::clone(&self.pending);
+        if let Err(error) = std::thread::Builder::new()
+            .name("shojiwm-runtime-reader".into())
+            .spawn(move || {
+                loop {
+                    let payload = match &mut reader {
+                        RuntimeConnectionReader::Stdio { stdout } => read_framed_message(stdout),
+                        RuntimeConnectionReader::Uds { reader } => read_framed_message(reader),
+                    };
+
+                    let payload = match payload {
+                        Ok(Some(payload)) => payload,
+                        Ok(None) => {
+                            pending.fail_all(DecorationEvaluationError::RuntimeProtocol(
+                                "decoration runtime closed response stream".into(),
+                            ));
+                            return;
+                        }
+                        Err(error) => {
+                            pending.fail_all(DecorationEvaluationError::Io(error));
+                            return;
+                        }
+                    };
+
+                    let envelope = serde_json::from_slice::<RuntimeResponseEnvelope>(&payload);
+                    let request_id = match envelope {
+                        Ok(envelope) => envelope.request_id,
+                        Err(error) => {
+                            pending.fail_all(DecorationEvaluationError::InvalidResponse(format!(
+                                "{error}; payload={}",
+                                String::from_utf8_lossy(&payload)
+                            )));
+                            return;
+                        }
+                    };
+                    pending.complete(request_id, Ok(payload));
+                }
+            })
+        {
+            warn!(?error, "failed to spawn runtime response reader");
+        }
+    }
+
+    fn send_request(
+        &self,
+        request_id: u64,
+        request: &str,
+    ) -> Result<Arc<PendingRuntimeResponse>, DecorationEvaluationError> {
+        let pending = self.pending.insert(request_id);
+        if let Err(error) = self.write_request(request) {
+            self.pending.remove(request_id);
+            return Err(error);
+        }
+        Ok(pending)
+    }
+
+    fn request_response<T: serde::de::DeserializeOwned, F: FnOnce()>(
+        &self,
+        request_id: u64,
+        request: &str,
+        after_write: F,
+    ) -> Result<(T, usize), DecorationEvaluationError> {
+        let pending = self.send_request(request_id, request)?;
+        after_write();
+
+        let payload = pending.wait()?;
+        let response_len = payload.len();
+        serde_json::from_slice(&payload)
+            .map(|response| (response, response_len))
+            .map_err(|error| {
+                DecorationEvaluationError::InvalidResponse(format!(
+                    "{error}; payload={}",
+                    String::from_utf8_lossy(&payload)
+                ))
+            })
+    }
+
+    fn write_request(&self, request: &str) -> Result<(), DecorationEvaluationError> {
         let bytes = request.as_bytes();
         let len = u32::try_from(bytes.len()).map_err(|_| {
             DecorationEvaluationError::RuntimeProtocol("runtime request too large".into())
         })?;
-        match &mut self.connection {
-            RuntimeConnection::Stdio { stdin, .. } => {
+        let mut writer = self.writer.lock().map_err(|_| {
+            DecorationEvaluationError::RuntimeProtocol("runtime writer mutex poisoned".into())
+        })?;
+        match &mut *writer {
+            RuntimeConnectionWriter::Stdio { stdin } => {
                 stdin.write_all(&len.to_le_bytes())?;
                 stdin.write_all(bytes)?;
                 stdin.flush()?;
             }
-            RuntimeConnection::Uds { writer, .. } => {
+            RuntimeConnectionWriter::Uds { writer } => {
                 writer.write_all(&len.to_le_bytes())?;
                 writer.write_all(bytes)?;
                 writer.flush()?;
@@ -1533,21 +2281,78 @@ impl NodeDecorationRuntime {
         }
         Ok(())
     }
+}
 
-    fn read_response<T: serde::de::DeserializeOwned>(
-        &mut self,
-    ) -> Result<Option<T>, DecorationEvaluationError> {
-        let payload = match &mut self.connection {
-            RuntimeConnection::Stdio { stdout, .. } => read_framed_message(stdout)?,
-            RuntimeConnection::Uds { reader, .. } => read_framed_message(reader)?,
-        };
-        let Some(payload) = payload else {
-            return Ok(None);
-        };
-        serde_json::from_slice(&payload).map(Some).map_err(|error| {
-            DecorationEvaluationError::InvalidResponse(format!(
-                "{error}; payload={}",
-                String::from_utf8_lossy(&payload)
+impl RuntimePendingResponses {
+    fn insert(&self, request_id: u64) -> Arc<PendingRuntimeResponse> {
+        let pending = Arc::new(PendingRuntimeResponse {
+            result: Mutex::new(None),
+            completed: Condvar::new(),
+        });
+        if let Ok(mut responses) = self.responses.lock() {
+            responses.insert(request_id, Arc::clone(&pending));
+        }
+        pending
+    }
+
+    fn remove(&self, request_id: u64) {
+        if let Ok(mut responses) = self.responses.lock() {
+            responses.remove(&request_id);
+        }
+    }
+
+    fn complete(&self, request_id: u64, result: Result<Vec<u8>, DecorationEvaluationError>) {
+        let pending = self
+            .responses
+            .lock()
+            .ok()
+            .and_then(|mut responses| responses.remove(&request_id));
+        if let Some(pending) = pending {
+            pending.complete(result);
+        }
+    }
+
+    fn fail_all(&self, error: DecorationEvaluationError) {
+        let pending = self
+            .responses
+            .lock()
+            .map(|mut responses| {
+                responses
+                    .drain()
+                    .map(|(_, pending)| pending)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for pending in pending {
+            pending.complete(Err(DecorationEvaluationError::RuntimeProtocol(
+                error.to_string(),
+            )));
+        }
+    }
+}
+
+impl PendingRuntimeResponse {
+    fn complete(&self, result: Result<Vec<u8>, DecorationEvaluationError>) {
+        if let Ok(mut guard) = self.result.lock() {
+            *guard = Some(result);
+            self.completed.notify_all();
+        }
+    }
+
+    fn wait(&self) -> Result<Vec<u8>, DecorationEvaluationError> {
+        let mut result = self.result.lock().map_err(|_| {
+            DecorationEvaluationError::RuntimeProtocol("runtime pending response poisoned".into())
+        })?;
+        while result.is_none() {
+            result = self.completed.wait(result).map_err(|_| {
+                DecorationEvaluationError::RuntimeProtocol(
+                    "runtime pending response wait poisoned".into(),
+                )
+            })?;
+        }
+        result.take().unwrap_or_else(|| {
+            Err(DecorationEvaluationError::RuntimeProtocol(
+                "missing runtime pending response".into(),
             ))
         })
     }
@@ -1571,9 +2376,12 @@ fn apply_decoration_runtime_node_options(command: &mut Command) {
 
 impl Drop for NodeDecorationRuntime {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let RuntimeConnection::Uds { socket_path, .. } = &self.connection {
+        self.shutdown.store(true, Ordering::Release);
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(socket_path) = &self.socket_path {
             let _ = std::fs::remove_file(socket_path);
         }
     }
@@ -1684,59 +2492,46 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         window: &WaylandWindowSnapshot,
         now_ms: u64,
     ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::Evaluate {
+        let roundtrip = self
+            .send_runtime_request::<RuntimeEvaluateResponse, _>(
+                true,
+                Some(IpcCallKind::Evaluate),
+                |request_id, display_state| {
+                    serde_json::to_string(&RuntimeRequest::Evaluate {
+                        request_id,
+                        snapshot: window,
+                        now_ms,
+                        display_state,
+                    })
+                    .map_err(|err| {
+                        DecorationEvaluationError::SnapshotSerialization(err.to_string())
+                    })
+                },
+            )?
+            .ok_or_else(|| {
+                DecorationEvaluationError::RuntimeProtocol("runtime unavailable".into())
+            })?;
+        let RuntimeRoundtrip {
+            runtime,
             request_id,
-            snapshot: window,
-            now_ms,
-            display_state: &display_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeEvaluateResponse = if let Some(response) = runtime.read_response()? {
-            response
-        } else {
-            let status = runtime
-                .child
-                .try_wait()?
-                .and_then(|status| status.code())
-                .unwrap_or(-1);
-            let stderr = runtime
-                .stderr_log
-                .lock()
-                .map(|stderr| stderr.clone())
-                .unwrap_or_default();
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-        };
+            response,
+        } = roundtrip;
         if response.request_id != request_id {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(format!(
                 "mismatched response id: expected {request_id}, got {}",
                 response.request_id
             )));
         }
         if response.kind != "evaluate" {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(format!(
                 "mismatched response kind for evaluate: {}",
                 response.kind
             )));
         }
         if !response.ok {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(
                 response
                     .error
@@ -1745,7 +2540,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         }
 
         let Some(serialized) = response.serialized else {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(
                 "missing serialized tree".into(),
             ));
@@ -1777,59 +2572,46 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         window: &WaylandWindowSnapshot,
         now_ms: u64,
     ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::EvaluatePreview {
+        let roundtrip = self
+            .send_runtime_request::<RuntimeEvaluateResponse, _>(
+                true,
+                Some(IpcCallKind::EvaluatePreview),
+                |request_id, display_state| {
+                    serde_json::to_string(&RuntimeRequest::EvaluatePreview {
+                        request_id,
+                        snapshot: window,
+                        now_ms,
+                        display_state,
+                    })
+                    .map_err(|err| {
+                        DecorationEvaluationError::SnapshotSerialization(err.to_string())
+                    })
+                },
+            )?
+            .ok_or_else(|| {
+                DecorationEvaluationError::RuntimeProtocol("runtime unavailable".into())
+            })?;
+        let RuntimeRoundtrip {
+            runtime,
             request_id,
-            snapshot: window,
-            now_ms,
-            display_state: &display_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeEvaluateResponse = if let Some(response) = runtime.read_response()? {
-            response
-        } else {
-            let status = runtime
-                .child
-                .try_wait()?
-                .and_then(|status| status.code())
-                .unwrap_or(-1);
-            let stderr = runtime
-                .stderr_log
-                .lock()
-                .map(|stderr| stderr.clone())
-                .unwrap_or_default();
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-        };
+            response,
+        } = roundtrip;
         if response.request_id != request_id {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(format!(
                 "mismatched response id: expected {request_id}, got {}",
                 response.request_id
             )));
         }
         if response.kind != "evaluatePreview" {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(format!(
                 "mismatched response kind for evaluatePreview: {}",
                 response.kind
             )));
         }
         if !response.ok {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(
                 response
                     .error
@@ -1838,7 +2620,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         }
 
         let Some(serialized) = response.serialized else {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(
                 "missing serialized tree".into(),
             ));
@@ -1871,60 +2653,47 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         window: Option<&WaylandWindowSnapshot>,
         now_ms: u64,
     ) -> Result<DecorationCachedEvaluationResult, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::EvaluateCached {
+        let roundtrip = self
+            .send_runtime_request::<RuntimeEvaluateResponse, _>(
+                true,
+                Some(IpcCallKind::EvaluateCached),
+                |request_id, display_state| {
+                    serde_json::to_string(&RuntimeRequest::EvaluateCached {
+                        request_id,
+                        window_id,
+                        snapshot: window,
+                        now_ms,
+                        display_state,
+                    })
+                    .map_err(|err| {
+                        DecorationEvaluationError::SnapshotSerialization(err.to_string())
+                    })
+                },
+            )?
+            .ok_or_else(|| {
+                DecorationEvaluationError::RuntimeProtocol("runtime unavailable".into())
+            })?;
+        let RuntimeRoundtrip {
+            runtime,
             request_id,
-            window_id,
-            snapshot: window,
-            now_ms,
-            display_state: &display_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeEvaluateResponse = if let Some(response) = runtime.read_response()? {
-            response
-        } else {
-            let status = runtime
-                .child
-                .try_wait()?
-                .and_then(|status| status.code())
-                .unwrap_or(-1);
-            let stderr = runtime
-                .stderr_log
-                .lock()
-                .map(|stderr| stderr.clone())
-                .unwrap_or_default();
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-        };
+            response,
+        } = roundtrip;
         if response.request_id != request_id {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(format!(
                 "mismatched response id: expected {request_id}, got {}",
                 response.request_id
             )));
         }
         if response.kind != "evaluateCached" {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(format!(
                 "mismatched response kind for evaluateCached: {}",
                 response.kind
             )));
         }
         if !response.ok {
-            *runtime_guard = None;
+            self.reset_runtime_if_current(&runtime);
             return Err(DecorationEvaluationError::RuntimeProtocol(
                 response
                     .error
@@ -1932,201 +2701,68 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             ));
         }
 
-        let managed_window_only = response.managed_window_only.unwrap_or(false);
-        let node = if managed_window_only {
-            None
-        } else {
-            let Some(serialized) = response.serialized else {
-                *runtime_guard = None;
-                return Err(DecorationEvaluationError::RuntimeProtocol(
-                    "missing serialized tree".into(),
-                ));
-            };
-            let stdout = serde_json::to_string(&serialized)
-                .map_err(|err| DecorationEvaluationError::InvalidResponse(err.to_string()))?;
-            Some(decode_tree_json(stdout.trim()).map_err(DecorationEvaluationError::Bridge)?)
-        };
-        Ok(DecorationCachedEvaluationResult {
-            node,
-            transform: response.transform.unwrap_or_default(),
-            managed_window: response.managed_window.unwrap_or_default(),
-            window_effects: response
-                .window_effects
-                .map(TryInto::try_into)
-                .transpose()
-                .map_err(DecorationEvaluationError::Bridge)?,
-            dirty_node_ids: response.dirty_node_ids.unwrap_or_default(),
-            managed_window_only,
-            next_poll_in_ms: response.next_poll_in_ms,
-            display_config: response.display_config,
-            key_binding_config: response.key_binding_config,
-            pointer_config: response.pointer_config,
-            event_config: response.event_config,
-            process_config: response.process_config,
-            process_actions: response.process_actions.unwrap_or_default(),
-        })
+        self.cached_response_to_result(&runtime, request_id, response)
+    }
+
+    fn prefetch_cached_window(
+        &self,
+        window_id: &str,
+        window: Option<&WaylandWindowSnapshot>,
+        now_ms: u64,
+    ) -> Result<(), DecorationEvaluationError> {
+        self.prefetch_cached_window_impl(window_id, window, now_ms)
+    }
+
+    fn evaluate_prefetched_cached_window(
+        &self,
+        window_id: &str,
+        window: Option<&WaylandWindowSnapshot>,
+        now_ms: u64,
+    ) -> Result<DecorationCachedEvaluationResult, DecorationEvaluationError> {
+        self.evaluate_prefetched_cached_window_impl(window_id, window, now_ms)
     }
 
     fn scheduler_tick(
         &self,
         now_ms: u64,
     ) -> Result<DecorationSchedulerTick, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-
-        let Some(_) = runtime_guard.as_ref() else {
-            return Ok(DecorationSchedulerTick::default());
-        };
-
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::SchedulerTick {
-            request_id,
-            now_ms,
-            display_state: &display_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeSchedulerResponse = if let Some(response) = runtime.read_response()? {
-            response
+        if async_scheduler_enabled() {
+            self.scheduler_tick_async(now_ms)
         } else {
-            let status = runtime
-                .child
-                .try_wait()?
-                .and_then(|status| status.code())
-                .unwrap_or(-1);
-            let stderr = runtime
-                .stderr_log
-                .lock()
-                .map(|stderr| stderr.clone())
-                .unwrap_or_default();
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-        };
-        if response.request_id != request_id {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response id: expected {request_id}, got {}",
-                response.request_id
-            )));
+            self.scheduler_tick_sync(now_ms)
         }
-        if response.kind != "schedulerTick" {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response kind for schedulerTick: {}",
-                response.kind
-            )));
-        }
-        if !response.ok {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(
-                response
-                    .error
-                    .unwrap_or_else(|| "runtime returned failure".into()),
-            ));
-        }
-
-        if managed_rect_debug_enabled() {
-            info!(
-                now_ms,
-                dirty = response.dirty.unwrap_or(false),
-                dirty_window_ids = ?response.dirty_window_ids,
-                dirty_window_node_ids = ?response.dirty_window_node_ids,
-                next_poll_in_ms = ?response.next_poll_in_ms,
-                "managed rect debug: runtime scheduler tick"
-            );
-        }
-
-        Ok(DecorationSchedulerTick {
-            dirty: response.dirty.unwrap_or(false),
-            dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
-            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
-            dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
-            dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
-            actions: response.actions.unwrap_or_default(),
-            next_poll_in_ms: response.next_poll_in_ms,
-            display_config: response.display_config,
-            key_binding_config: response.key_binding_config,
-            pointer_config: response.pointer_config,
-            event_config: response.event_config,
-            process_config: response.process_config,
-            process_actions: response.process_actions.unwrap_or_default(),
-        })
     }
 
     fn window_closed(&self, window_id: &str) -> Result<(), DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-
-        let Some(_) = runtime_guard.as_ref() else {
+        let Some(roundtrip) = self.send_runtime_request::<RuntimeClosedResponse, _>(
+            false,
+            None,
+            |request_id, display_state| {
+                serde_json::to_string(&RuntimeRequest::WindowClosed {
+                    request_id,
+                    window_id,
+                    display_state,
+                })
+                .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))
+            },
+        )?
+        else {
             return Ok(());
         };
-
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::WindowClosed {
+        let RuntimeRoundtrip {
+            runtime,
             request_id,
-            window_id,
-            display_state: &display_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeClosedResponse = if let Some(response) = runtime.read_response()? {
-            response
-        } else {
-            let status = runtime
-                .child
-                .try_wait()?
-                .and_then(|status| status.code())
-                .unwrap_or(-1);
-            let stderr = runtime
-                .stderr_log
-                .lock()
-                .map(|stderr| stderr.clone())
-                .unwrap_or_default();
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-        };
-        if response.request_id != request_id {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response id: expected {request_id}, got {}",
-                response.request_id
-            )));
-        }
-        if response.kind != "windowClosed" {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response kind for windowClosed: {}",
-                response.kind
-            )));
-        }
-        if !response.ok {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(
-                response
-                    .error
-                    .unwrap_or_else(|| "runtime returned failure".into()),
-            ));
-        }
+            response,
+        } = roundtrip;
+        self.validate_runtime_response(
+            &runtime,
+            request_id,
+            response.request_id,
+            &response.kind,
+            "windowClosed",
+            response.ok,
+            response.error,
+        )?;
 
         Ok(())
     }
@@ -2137,72 +2773,37 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         handler_id: &str,
         now_ms: u64,
     ) -> Result<DecorationHandlerInvocation, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-
-        let Some(_) = runtime_guard.as_ref() else {
+        let Some(roundtrip) = self.send_runtime_request::<RuntimeInvokeHandlerResponse, _>(
+            false,
+            None,
+            |request_id, display_state| {
+                serde_json::to_string(&RuntimeRequest::InvokeHandler {
+                    request_id,
+                    window_id,
+                    handler_id,
+                    now_ms,
+                    display_state,
+                })
+                .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))
+            },
+        )?
+        else {
             return Ok(DecorationHandlerInvocation::default());
         };
-
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::InvokeHandler {
+        let RuntimeRoundtrip {
+            runtime,
             request_id,
-            window_id,
-            handler_id,
-            now_ms,
-            display_state: &display_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeInvokeHandlerResponse =
-            if let Some(response) = runtime.read_response()? {
-                response
-            } else {
-                let status = runtime
-                    .child
-                    .try_wait()?
-                    .and_then(|status| status.code())
-                    .unwrap_or(-1);
-                let stderr = runtime
-                    .stderr_log
-                    .lock()
-                    .map(|stderr| stderr.clone())
-                    .unwrap_or_default();
-                *runtime_guard = None;
-                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-            };
-        if response.request_id != request_id {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response id: expected {request_id}, got {}",
-                response.request_id
-            )));
-        }
-        if response.kind != "invokeHandler" {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response kind for invokeHandler: {}",
-                response.kind
-            )));
-        }
-        if !response.ok {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(
-                response
-                    .error
-                    .unwrap_or_else(|| "runtime returned failure".into()),
-            ));
-        }
+            response,
+        } = roundtrip;
+        self.validate_runtime_response(
+            &runtime,
+            request_id,
+            response.request_id,
+            &response.kind,
+            "invokeHandler",
+            response.ok,
+            response.error.clone(),
+        )?;
 
         let node = if let Some(serialized) = response.serialized {
             let stdout = serde_json::to_string(&serialized)
@@ -2241,71 +2842,36 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         binding_id: &str,
         now_ms: u64,
     ) -> Result<DecorationKeyBindingInvocation, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-
-        let Some(_) = runtime_guard.as_ref() else {
+        let Some(roundtrip) = self.send_runtime_request::<RuntimeInvokeKeyBindingResponse, _>(
+            false,
+            None,
+            |request_id, display_state| {
+                serde_json::to_string(&RuntimeRequest::InvokeKeyBinding {
+                    request_id,
+                    binding_id,
+                    now_ms,
+                    display_state,
+                })
+                .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))
+            },
+        )?
+        else {
             return Ok(DecorationKeyBindingInvocation::default());
         };
-
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::InvokeKeyBinding {
+        let RuntimeRoundtrip {
+            runtime,
             request_id,
-            binding_id,
-            now_ms,
-            display_state: &display_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeInvokeKeyBindingResponse =
-            if let Some(response) = runtime.read_response()? {
-                response
-            } else {
-                let status = runtime
-                    .child
-                    .try_wait()?
-                    .and_then(|status| status.code())
-                    .unwrap_or(-1);
-                let stderr = runtime
-                    .stderr_log
-                    .lock()
-                    .map(|stderr| stderr.clone())
-                    .unwrap_or_default();
-                *runtime_guard = None;
-                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-            };
-        if response.request_id != request_id {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response id: expected {request_id}, got {}",
-                response.request_id
-            )));
-        }
-        if response.kind != "invokeKeyBinding" {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response kind for invokeKeyBinding: {}",
-                response.kind
-            )));
-        }
-        if !response.ok {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(
-                response
-                    .error
-                    .unwrap_or_else(|| "runtime returned failure".into()),
-            ));
-        }
+            response,
+        } = roundtrip;
+        self.validate_runtime_response(
+            &runtime,
+            request_id,
+            response.request_id,
+            &response.kind,
+            "invokeKeyBinding",
+            response.ok,
+            response.error.clone(),
+        )?;
 
         Ok(DecorationKeyBindingInvocation {
             invoked: response.invoked.unwrap_or(false),
@@ -2331,72 +2897,37 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         event: &WindowResizeEventSnapshot,
         now_ms: u64,
     ) -> Result<DecorationWindowResizeInvocation, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-
-        let Some(_) = runtime_guard.as_ref() else {
+        let Some(roundtrip) = self.send_runtime_request::<RuntimeWindowResizeResponse, _>(
+            false,
+            None,
+            |request_id, display_state| {
+                serde_json::to_string(&RuntimeRequest::WindowResize {
+                    request_id,
+                    window_id,
+                    event,
+                    now_ms,
+                    display_state,
+                })
+                .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))
+            },
+        )?
+        else {
             return Ok(DecorationWindowResizeInvocation::default());
         };
-
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::WindowResize {
+        let RuntimeRoundtrip {
+            runtime,
             request_id,
-            window_id,
-            event,
-            now_ms,
-            display_state: &display_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeWindowResizeResponse =
-            if let Some(response) = runtime.read_response()? {
-                response
-            } else {
-                let status = runtime
-                    .child
-                    .try_wait()?
-                    .and_then(|status| status.code())
-                    .unwrap_or(-1);
-                let stderr = runtime
-                    .stderr_log
-                    .lock()
-                    .map(|stderr| stderr.clone())
-                    .unwrap_or_default();
-                *runtime_guard = None;
-                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-            };
-        if response.request_id != request_id {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response id: expected {request_id}, got {}",
-                response.request_id
-            )));
-        }
-        if response.kind != "windowResize" {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response kind for windowResize: {}",
-                response.kind
-            )));
-        }
-        if !response.ok {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(
-                response
-                    .error
-                    .unwrap_or_else(|| "runtime returned failure".into()),
-            ));
-        }
+            response,
+        } = roundtrip;
+        self.validate_runtime_response(
+            &runtime,
+            request_id,
+            response.request_id,
+            &response.kind,
+            "windowResize",
+            response.ok,
+            response.error.clone(),
+        )?;
 
         Ok(DecorationWindowResizeInvocation {
             invoked: response.invoked.unwrap_or(false),
@@ -2422,71 +2953,37 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         event: &WindowMoveEventSnapshot,
         now_ms: u64,
     ) -> Result<DecorationWindowMoveInvocation, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-
-        let Some(_) = runtime_guard.as_ref() else {
+        let Some(roundtrip) = self.send_runtime_request::<RuntimeWindowMoveResponse, _>(
+            false,
+            None,
+            |request_id, display_state| {
+                serde_json::to_string(&RuntimeRequest::WindowMove {
+                    request_id,
+                    window_id,
+                    event,
+                    now_ms,
+                    display_state,
+                })
+                .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))
+            },
+        )?
+        else {
             return Ok(DecorationWindowMoveInvocation::default());
         };
-
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::WindowMove {
+        let RuntimeRoundtrip {
+            runtime,
             request_id,
-            window_id,
-            event,
-            now_ms,
-            display_state: &display_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeWindowMoveResponse = if let Some(response) = runtime.read_response()? {
-            response
-        } else {
-            let status = runtime
-                .child
-                .try_wait()?
-                .and_then(|status| status.code())
-                .unwrap_or(-1);
-            let stderr = runtime
-                .stderr_log
-                .lock()
-                .map(|stderr| stderr.clone())
-                .unwrap_or_default();
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-        };
-        if response.request_id != request_id {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response id: expected {request_id}, got {}",
-                response.request_id
-            )));
-        }
-        if response.kind != "windowMove" {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response kind for windowMove: {}",
-                response.kind
-            )));
-        }
-        if !response.ok {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(
-                response
-                    .error
-                    .unwrap_or_else(|| "runtime returned failure".into()),
-            ));
-        }
+            response,
+        } = roundtrip;
+        self.validate_runtime_response(
+            &runtime,
+            request_id,
+            response.request_id,
+            &response.kind,
+            "windowMove",
+            response.ok,
+            response.error.clone(),
+        )?;
 
         Ok(DecorationWindowMoveInvocation {
             invoked: response.invoked.unwrap_or(false),
@@ -2512,69 +3009,41 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         event: &WindowMaximizeRequestEventSnapshot,
         now_ms: u64,
     ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::WindowMaximizeRequest {
+        let roundtrip = self
+            .send_runtime_request::<RuntimeWindowStateRequestResponse, _>(
+                true,
+                None,
+                |request_id, display_state| {
+                    serde_json::to_string(&RuntimeRequest::WindowMaximizeRequest {
+                        request_id,
+                        window_id: &snapshot.id,
+                        snapshot,
+                        event,
+                        now_ms,
+                        display_state,
+                    })
+                    .map_err(|err| {
+                        DecorationEvaluationError::SnapshotSerialization(err.to_string())
+                    })
+                },
+            )?
+            .ok_or_else(|| {
+                DecorationEvaluationError::RuntimeProtocol("runtime unavailable".into())
+            })?;
+        let RuntimeRoundtrip {
+            runtime,
             request_id,
-            window_id: &snapshot.id,
-            snapshot,
-            event,
-            now_ms,
-            display_state: &display_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeWindowStateRequestResponse =
-            if let Some(response) = runtime.read_response()? {
-                response
-            } else {
-                let status = runtime
-                    .child
-                    .try_wait()?
-                    .and_then(|status| status.code())
-                    .unwrap_or(-1);
-                let stderr = runtime
-                    .stderr_log
-                    .lock()
-                    .map(|stderr| stderr.clone())
-                    .unwrap_or_default();
-                *runtime_guard = None;
-                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-            };
-        if response.request_id != request_id {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response id: expected {request_id}, got {}",
-                response.request_id
-            )));
-        }
-        if response.kind != "windowMaximizeRequest" {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response kind for windowMaximizeRequest: {}",
-                response.kind
-            )));
-        }
-        if !response.ok {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(
-                response
-                    .error
-                    .unwrap_or_else(|| "runtime returned failure".into()),
-            ));
-        }
+            response,
+        } = roundtrip;
+        self.validate_runtime_response(
+            &runtime,
+            request_id,
+            response.request_id,
+            &response.kind,
+            "windowMaximizeRequest",
+            response.ok,
+            response.error.clone(),
+        )?;
 
         Ok(DecorationWindowStateRequestInvocation {
             invoked: response.invoked.unwrap_or(false),
@@ -2600,69 +3069,41 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         event: &WindowMinimizeRequestEventSnapshot,
         now_ms: u64,
     ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::WindowMinimizeRequest {
+        let roundtrip = self
+            .send_runtime_request::<RuntimeWindowStateRequestResponse, _>(
+                true,
+                None,
+                |request_id, display_state| {
+                    serde_json::to_string(&RuntimeRequest::WindowMinimizeRequest {
+                        request_id,
+                        window_id: &snapshot.id,
+                        snapshot,
+                        event,
+                        now_ms,
+                        display_state,
+                    })
+                    .map_err(|err| {
+                        DecorationEvaluationError::SnapshotSerialization(err.to_string())
+                    })
+                },
+            )?
+            .ok_or_else(|| {
+                DecorationEvaluationError::RuntimeProtocol("runtime unavailable".into())
+            })?;
+        let RuntimeRoundtrip {
+            runtime,
             request_id,
-            window_id: &snapshot.id,
-            snapshot,
-            event,
-            now_ms,
-            display_state: &display_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeWindowStateRequestResponse =
-            if let Some(response) = runtime.read_response()? {
-                response
-            } else {
-                let status = runtime
-                    .child
-                    .try_wait()?
-                    .and_then(|status| status.code())
-                    .unwrap_or(-1);
-                let stderr = runtime
-                    .stderr_log
-                    .lock()
-                    .map(|stderr| stderr.clone())
-                    .unwrap_or_default();
-                *runtime_guard = None;
-                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-            };
-        if response.request_id != request_id {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response id: expected {request_id}, got {}",
-                response.request_id
-            )));
-        }
-        if response.kind != "windowMinimizeRequest" {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response kind for windowMinimizeRequest: {}",
-                response.kind
-            )));
-        }
-        if !response.ok {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(
-                response
-                    .error
-                    .unwrap_or_else(|| "runtime returned failure".into()),
-            ));
-        }
+            response,
+        } = roundtrip;
+        self.validate_runtime_response(
+            &runtime,
+            request_id,
+            response.request_id,
+            &response.kind,
+            "windowMinimizeRequest",
+            response.ok,
+            response.error.clone(),
+        )?;
 
         Ok(DecorationWindowStateRequestInvocation {
             invoked: response.invoked.unwrap_or(false),
@@ -2688,69 +3129,41 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         event: &WindowActivateRequestEventSnapshot,
         now_ms: u64,
     ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::WindowActivateRequest {
+        let roundtrip = self
+            .send_runtime_request::<RuntimeWindowStateRequestResponse, _>(
+                true,
+                None,
+                |request_id, display_state| {
+                    serde_json::to_string(&RuntimeRequest::WindowActivateRequest {
+                        request_id,
+                        window_id: &snapshot.id,
+                        snapshot,
+                        event,
+                        now_ms,
+                        display_state,
+                    })
+                    .map_err(|err| {
+                        DecorationEvaluationError::SnapshotSerialization(err.to_string())
+                    })
+                },
+            )?
+            .ok_or_else(|| {
+                DecorationEvaluationError::RuntimeProtocol("runtime unavailable".into())
+            })?;
+        let RuntimeRoundtrip {
+            runtime,
             request_id,
-            window_id: &snapshot.id,
-            snapshot,
-            event,
-            now_ms,
-            display_state: &display_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeWindowStateRequestResponse =
-            if let Some(response) = runtime.read_response()? {
-                response
-            } else {
-                let status = runtime
-                    .child
-                    .try_wait()?
-                    .and_then(|status| status.code())
-                    .unwrap_or(-1);
-                let stderr = runtime
-                    .stderr_log
-                    .lock()
-                    .map(|stderr| stderr.clone())
-                    .unwrap_or_default();
-                *runtime_guard = None;
-                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-            };
-        if response.request_id != request_id {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response id: expected {request_id}, got {}",
-                response.request_id
-            )));
-        }
-        if response.kind != "windowActivateRequest" {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response kind for windowActivateRequest: {}",
-                response.kind
-            )));
-        }
-        if !response.ok {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(
-                response
-                    .error
-                    .unwrap_or_else(|| "runtime returned failure".into()),
-            ));
-        }
+            response,
+        } = roundtrip;
+        self.validate_runtime_response(
+            &runtime,
+            request_id,
+            response.request_id,
+            &response.kind,
+            "windowActivateRequest",
+            response.ok,
+            response.error.clone(),
+        )?;
 
         Ok(DecorationWindowStateRequestInvocation {
             invoked: response.invoked.unwrap_or(false),
@@ -2779,70 +3192,36 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         window_id: &str,
         now_ms: u64,
     ) -> Result<DecorationHandlerInvocation, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-
-        let Some(_) = runtime_guard.as_ref() else {
+        let Some(roundtrip) = self.send_runtime_request::<RuntimeStartCloseResponse, _>(
+            false,
+            None,
+            |request_id, display_state| {
+                serde_json::to_string(&RuntimeRequest::StartClose {
+                    request_id,
+                    window_id,
+                    now_ms,
+                    display_state,
+                })
+                .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))
+            },
+        )?
+        else {
             return Ok(DecorationHandlerInvocation::default());
         };
-
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::StartClose {
+        let RuntimeRoundtrip {
+            runtime,
             request_id,
-            window_id,
-            now_ms,
-            display_state: &display_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeStartCloseResponse = if let Some(response) = runtime.read_response()? {
-            response
-        } else {
-            let status = runtime
-                .child
-                .try_wait()?
-                .and_then(|status| status.code())
-                .unwrap_or(-1);
-            let stderr = runtime
-                .stderr_log
-                .lock()
-                .map(|stderr| stderr.clone())
-                .unwrap_or_default();
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-        };
-        if response.request_id != request_id {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response id: expected {request_id}, got {}",
-                response.request_id
-            )));
-        }
-        if response.kind != "startClose" {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response kind for startClose: {}",
-                response.kind
-            )));
-        }
-        if !response.ok {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(
-                response
-                    .error
-                    .unwrap_or_else(|| "runtime returned failure".into()),
-            ));
-        }
+            response,
+        } = roundtrip;
+        self.validate_runtime_response(
+            &runtime,
+            request_id,
+            response.request_id,
+            &response.kind,
+            "startClose",
+            response.ok,
+            response.error.clone(),
+        )?;
 
         let node = if let Some(serialized) = response.serialized {
             let stdout = serde_json::to_string(&serialized)
@@ -2882,67 +3261,40 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         layers: &[WaylandLayerSnapshot],
         now_ms: u64,
     ) -> Result<LayerEffectEvaluationResult, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
-        let request_id = runtime.next_request_id;
-        runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::EvaluateLayerEffects {
+        let roundtrip = self
+            .send_runtime_request::<RuntimeLayerEffectsResponse, _>(
+                true,
+                None,
+                |request_id, display_state| {
+                    serde_json::to_string(&RuntimeRequest::EvaluateLayerEffects {
+                        request_id,
+                        output_name,
+                        layers,
+                        now_ms,
+                        display_state,
+                    })
+                    .map_err(|err| {
+                        DecorationEvaluationError::SnapshotSerialization(err.to_string())
+                    })
+                },
+            )?
+            .ok_or_else(|| {
+                DecorationEvaluationError::RuntimeProtocol("runtime unavailable".into())
+            })?;
+        let RuntimeRoundtrip {
+            runtime,
             request_id,
-            output_name,
-            layers,
-            now_ms,
-            display_state: &display_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeLayerEffectsResponse =
-            if let Some(response) = runtime.read_response()? {
-                response
-            } else {
-                let status = runtime
-                    .child
-                    .try_wait()?
-                    .and_then(|status| status.code())
-                    .unwrap_or(-1);
-                let stderr = runtime
-                    .stderr_log
-                    .lock()
-                    .map(|stderr| stderr.clone())
-                    .unwrap_or_default();
-                *runtime_guard = None;
-                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
-            };
-        if response.request_id != request_id {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response id: expected {request_id}, got {}",
-                response.request_id
-            )));
-        }
-        if response.kind != "evaluateLayerEffects" {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "mismatched response kind for evaluateLayerEffects: {}",
-                response.kind
-            )));
-        }
-        if !response.ok {
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeProtocol(
-                response
-                    .error
-                    .unwrap_or_else(|| "runtime returned failure".into()),
-            ));
-        }
+            response,
+        } = roundtrip;
+        self.validate_runtime_response(
+            &runtime,
+            request_id,
+            response.request_id,
+            &response.kind,
+            "evaluateLayerEffects",
+            response.ok,
+            response.error.clone(),
+        )?;
 
         Ok(LayerEffectEvaluationResult {
             effects: response

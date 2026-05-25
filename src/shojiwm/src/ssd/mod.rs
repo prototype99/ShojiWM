@@ -13,6 +13,7 @@ mod bridge;
 mod evaluator;
 mod integration;
 mod interaction;
+mod perf_stats;
 mod window_model;
 
 use smithay::utils::Logical;
@@ -28,14 +29,15 @@ pub use evaluator::{
     DecorationEvaluator, DecorationHandlerInvocation, DecorationKeyBindingInvocation,
     DecorationPointerMoveAsyncInvocation, DecorationSchedulerTick, DecorationWindowMoveInvocation,
     DecorationWindowResizeInvocation, DecorationWindowStateRequestInvocation,
-    LayerEffectEvaluationResult, NodeDecorationEvaluator, RuntimeEventConfigUpdate,
-    RuntimeLayerEffectAssignment, RuntimeWindowAction, StaticDecorationEvaluator,
-    evaluate_dynamic_decoration,
+    LayerEffectEvaluationResult, ManagedOnlyStateUpdate, NodeDecorationEvaluator,
+    RuntimeEventConfigUpdate, RuntimeLayerEffectAssignment, RuntimeWindowAction,
+    StaticDecorationEvaluator, evaluate_dynamic_decoration,
 };
 pub use integration::{
     CachedDecorationBuffer, ContentClip, DecorationRuntimeEvaluator, WindowDecorationState,
 };
 pub use interaction::DecorationInteractionSnapshot;
+pub use perf_stats::{DirtyOrigin, record_dirty_call, record_dirty_mark};
 pub use window_model::{
     LayerKindSnapshot, LayerPositionSnapshot, ManagedWindowState, OutputModeSnapshot,
     OutputPositionSnapshot, PointerModifierStateSnapshot, PointerMoveEventSnapshot,

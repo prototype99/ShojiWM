@@ -268,6 +268,12 @@ pub struct ShojiWM {
     pub runtime_poll_dirty: bool,
     pub runtime_dirty_window_ids: std::collections::HashSet<String>,
     pub runtime_managed_only_window_ids: std::collections::HashSet<String>,
+    /// Managed-only state updates pushed by the TS runtime through the scheduler
+    /// tick. When an entry exists, the next decoration refresh can apply it directly
+    /// and skip the per-window `evaluate_cached` IPC roundtrip. Cleared on
+    /// consumption inside `refresh_window_decorations_for_output`.
+    pub runtime_managed_only_window_states:
+        std::collections::HashMap<String, crate::ssd::ManagedOnlyStateUpdate>,
     pub runtime_scheduler_enabled: bool,
     pub runtime_animation_outputs: std::collections::HashSet<String>,
     pub runtime_output_configs: std::collections::BTreeMap<String, RuntimeOutputConfig>,
@@ -750,6 +756,7 @@ impl ShojiWM {
             runtime_poll_dirty: false,
             runtime_dirty_window_ids: Default::default(),
             runtime_managed_only_window_ids: Default::default(),
+            runtime_managed_only_window_states: Default::default(),
             runtime_scheduler_enabled: false,
             runtime_animation_outputs: Default::default(),
             runtime_output_configs: Default::default(),
@@ -1191,9 +1198,18 @@ impl ShojiWM {
                         );
                     }
                     state.runtime_poll_dirty = true;
-                    state.mark_runtime_dirty_windows(
+                    // Push the managed-only state map BEFORE marking windows dirty so the
+                    // next refresh sees both at once. The map is keyed by window id; later
+                    // refreshes consume entries as they apply the IPC-skip fast path.
+                    if !tick.dirty_managed_window_states.is_empty() {
+                        state
+                            .runtime_managed_only_window_states
+                            .extend(tick.dirty_managed_window_states);
+                    }
+                    state.mark_runtime_dirty_windows_with_origin(
                         tick.dirty_window_ids,
                         tick.dirty_managed_window_ids,
+                        crate::ssd::DirtyOrigin::SchedulerTick,
                     );
                     state.request_tty_maintenance("runtime-scheduler-dirty");
                     state.schedule_redraw();
@@ -1527,18 +1543,44 @@ impl ShojiWM {
         dirty_window_ids: impl IntoIterator<Item = String>,
         dirty_managed_window_ids: impl IntoIterator<Item = String>,
     ) {
+        self.mark_runtime_dirty_windows_with_origin(
+            dirty_window_ids,
+            dirty_managed_window_ids,
+            crate::ssd::DirtyOrigin::Other,
+        );
+    }
+
+    /// Origin-tagged version of `mark_runtime_dirty_windows`. The `origin` is
+    /// only used for diagnostic counters under `SHOJI_DIRTY_ORIGIN_STATS_DEBUG=1`
+    /// — semantics are otherwise identical to `mark_runtime_dirty_windows`.
+    ///
+    /// Per-window outcomes are recorded so the diagnostic can attribute *which*
+    /// code path is stripping previously-set managed-only markers (= driving
+    /// `NotManagedOnly` skip rejections downstream).
+    pub fn mark_runtime_dirty_windows_with_origin(
+        &mut self,
+        dirty_window_ids: impl IntoIterator<Item = String>,
+        dirty_managed_window_ids: impl IntoIterator<Item = String>,
+        origin: crate::ssd::DirtyOrigin,
+    ) {
+        crate::ssd::record_dirty_call(origin);
         let managed_only = dirty_managed_window_ids
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
         for window_id in dirty_window_ids {
+            let was_managed_only_before = self.runtime_managed_only_window_ids.contains(&window_id);
+            let now_managed_only = managed_only.contains(&window_id);
+            crate::ssd::record_dirty_mark(origin, was_managed_only_before, now_managed_only);
             if runtime_dirty_debug_enabled() {
                 info!(
                     window_id = %window_id,
-                    managed_only = managed_only.contains(&window_id),
+                    managed_only = now_managed_only,
+                    was_managed_only = was_managed_only_before,
+                    origin = ?origin,
                     "runtime dirty debug: mark window dirty"
                 );
             }
-            if managed_only.contains(&window_id) {
+            if now_managed_only {
                 self.runtime_managed_only_window_ids
                     .insert(window_id.clone());
             } else {
@@ -1554,9 +1596,10 @@ impl ShojiWM {
     ) {
         if invocation.dirty {
             self.runtime_poll_dirty = true;
-            self.mark_runtime_dirty_windows(
+            self.mark_runtime_dirty_windows_with_origin(
                 invocation.dirty_window_ids,
                 invocation.dirty_managed_window_ids,
+                crate::ssd::DirtyOrigin::PointerMoveAsync,
             );
             self.request_tty_maintenance("runtime-pointer-move-async-dirty");
             self.schedule_redraw();

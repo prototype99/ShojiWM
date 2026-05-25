@@ -1,5 +1,5 @@
-import { animationVariable, createManagedPoll, createWindowStack, createWindowState, cubicBezier, effect, read, seconds, WINDOW_MANAGER, type PointerMoveEvent, type PollHandle, type ReadonlySignal, type WaylandWindow, type WindowActivateRequestEvent, type WindowMaximizeRequestEvent, type WindowMinimizeRequestEvent, type WindowMoveEvent, type WindowResizeEvent, type WindowResizeRect, type WindowStateKey } from "shoji_wm";
-import type { ManagedWindowRect, WindowSizeConstraints } from "shoji_wm/types";
+import { animationVariable, computed, createManagedPoll, createWindowStack, createWindowState, cubicBezier, read, seconds, WINDOW_MANAGER, type PointerMoveEvent, type PollHandle, type ReadonlySignal, type WaylandWindow, type WindowActivateRequestEvent, type WindowMaximizeRequestEvent, type WindowMinimizeRequestEvent, type WindowMoveEvent, type WindowResizeEvent, type WindowResizeRect } from "shoji_wm";
+import type { ManagedWindowRect, MaybeSignal, WindowSizeConstraints } from "shoji_wm/types";
 import { playRectAnimation, stopRectAnimation } from "./window-animation";
 
 export const WINDOW_STATE_RECT = createWindowState<ManagedWindowRect>("rect", {
@@ -22,6 +22,18 @@ export const WINDOW_STATE_WORKSPACE_OFFSET_Y = createWindowState<number>("worksp
 });
 export const WINDOW_STATE_WORKSPACE_OPACITY = createWindowState<number>("workspaceOpacity", {
     default: 1,
+});
+export interface WorkspaceVisualState {
+    visible: boolean;
+    offsetY: MaybeSignal<number>;
+    opacity: MaybeSignal<number>;
+}
+export const WINDOW_STATE_WORKSPACE_VISUAL = createWindowState<WorkspaceVisualState>("workspaceVisual", {
+    default: {
+        visible: true,
+        offsetY: 0,
+        opacity: 1,
+    },
 });
 export const WINDOW_STATE_TILE_DRAGGING = createWindowState<boolean>("tileDragging", {
     default: false,
@@ -732,9 +744,7 @@ export class Workspace {
         this.windows.push(window);
         this.activeWindowId = window.id;
         const visible = this.isActive();
-        window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(visible);
-        window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(0);
-        window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(visible ? 1 : 0);
+        setWorkspaceVisual(window, visible, 0, visible ? 1 : 0);
         this.syncWindowVisibleOutputs(window);
 
         if (!WINDOW_MANAGER.output.list.includes(this.monitor)) {
@@ -800,14 +810,10 @@ export class Workspace {
         for (const window of this.windows) {
             this.syncWindowVisibleOutputs(window);
             if (window.state[WINDOW_STATE_TILE_DRAGGING]()) {
-                window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
-                window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(0);
-                window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(1);
+                setWorkspaceVisual(window, true, 0, 1);
                 continue;
             }
-            window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(visible);
-            window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(0);
-            window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(visible ? 1 : 0);
+            setWorkspaceVisual(window, visible, 0, visible ? 1 : 0);
         }
     }
 
@@ -816,14 +822,10 @@ export class Workspace {
         for (const window of this.windows) {
             this.syncWindowVisibleOutputs(window);
             if (window.state[WINDOW_STATE_TILE_DRAGGING]()) {
-                window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
-                window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(0);
-                window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(1);
+                setWorkspaceVisual(window, true, 0, 1);
                 continue;
             }
-            window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
-            window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(offsetY);
-            window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(opacity);
+            setWorkspaceVisual(window, true, offsetY, opacity);
         }
     }
 
@@ -840,26 +842,16 @@ export class Workspace {
         for (const window of this.windows) {
             this.syncWindowVisibleOutputs(window);
             if (window.state[WINDOW_STATE_TILE_DRAGGING]()) {
-                window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
-                window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(0);
-                window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(1);
+                setWorkspaceVisual(window, true, 0, 1);
                 continue;
             }
-            window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
-            playNumberStateAnimation(
+            playWorkspaceVisualAnimation(
                 window,
-                WINDOW_STATE_WORKSPACE_OFFSET_Y,
                 options.fromOffsetY,
                 options.toOffsetY,
-                WINDOW_MANAGEMENT_EASING,
-                WORKSPACE_SWITCH_ANIMATION_DURATION,
-                MANAGED_WINDOW_ONLY_ANIMATION,
-            );
-            playNumberStateAnimation(
-                window,
-                WINDOW_STATE_WORKSPACE_OPACITY,
                 options.fromOpacity,
                 options.toOpacity,
+                options.visibleAfter,
                 WINDOW_MANAGEMENT_EASING,
                 WORKSPACE_SWITCH_ANIMATION_DURATION,
                 MANAGED_WINDOW_ONLY_ANIMATION,
@@ -1023,9 +1015,7 @@ export class Workspace {
         window.state[WINDOW_STATE_MAXIMIZED].set(false);
         window.state[WINDOW_STATE_TILE_DRAGGING].set(true);
         this.syncWindowVisibleOutputs(window);
-        window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
-        window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(0);
-        window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(1);
+        setWorkspaceVisual(window, true, 0, 1);
         this.setTileWidthFromRect(window, window.state[WINDOW_STATE_RECT](), false);
         stopRectAnimation(window, WINDOW_STATE_RECT);
         window.state[WINDOW_STATE_RECT].set(rect);
@@ -1042,9 +1032,7 @@ export class Workspace {
         this.setTileWidthFromRect(window, rect, false);
         window.state[WINDOW_STATE_TILE_DRAGGING].set(true);
         this.syncWindowVisibleOutputs(window);
-        window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
-        window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(0);
-        window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(visible ? 1 : 0);
+        setWorkspaceVisual(window, true, 0, visible ? 1 : 0);
         stopRectAnimation(window, WINDOW_STATE_RECT);
         window.state[WINDOW_STATE_RECT].set(rect);
     }
@@ -1068,8 +1056,7 @@ export class Workspace {
         this.draggingWindowId = null;
         window.state[WINDOW_STATE_TILE_DRAGGING].set(false);
         this.syncWindowVisibleOutputs(window);
-        window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(0);
-        window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(this.isActive() ? 1 : 0);
+        setWorkspaceVisual(window, this.isActive(), 0, this.isActive() ? 1 : 0);
         if (!cancelled) {
             this.activeWindowId = window.id;
             this.scrollToWindow(window);
@@ -1396,88 +1383,85 @@ function withManagedWindowOnlySSDRebuildSuppressed<T>(callback: () => T): T {
     );
 }
 
-const numberAnimationVariableByStateKey = new Map<symbol, ReturnType<typeof animationVariable>>();
-const activeNumberAnimations = new WeakMap<WaylandWindow, Map<symbol, () => void>>();
+const WORKSPACE_VISUAL_ANIMATION = animationVariable("workspace.visual");
+const activeWorkspaceVisualAnimations = new WeakMap<WaylandWindow, () => void>();
 
-interface NumberStateAnimationOptions {
+interface WorkspaceVisualAnimationOptions {
     suppressSSDRebuild?: boolean;
 }
 
-function getNumberAnimationVariable(stateKey: symbol): ReturnType<typeof animationVariable> {
-    let variable = numberAnimationVariableByStateKey.get(stateKey);
-    if (!variable) {
-        variable = animationVariable(`number-anim:${stateKey.description ?? "anon"}`);
-        numberAnimationVariableByStateKey.set(stateKey, variable);
+function setWorkspaceVisual(
+    window: WaylandWindow,
+    visible: boolean,
+    offsetY: number,
+    opacity: number,
+): void {
+    const current = window.state[WINDOW_STATE_WORKSPACE_VISUAL]();
+    if (
+        current.visible === visible &&
+        read(current.offsetY) === offsetY &&
+        read(current.opacity) === opacity
+    ) {
+        return;
     }
-    return variable;
+    activeWorkspaceVisualAnimations.get(window)?.();
+    window.state[WINDOW_STATE_WORKSPACE_VISUAL].set({ visible, offsetY, opacity });
 }
 
-function playNumberStateAnimation(
+function playWorkspaceVisualAnimation(
     window: WaylandWindow,
-    stateKey: WindowStateKey<number>,
-    from: number,
-    to: number,
+    fromOffsetY: number,
+    toOffsetY: number,
+    fromOpacity: number,
+    toOpacity: number,
+    visibleAfter: boolean,
     easing: (progress: number) => number,
     duration: number,
-    options: NumberStateAnimationOptions = {},
+    options: WorkspaceVisualAnimationOptions = {},
 ): void {
-    const variable = getNumberAnimationVariable(stateKey);
-    let perWindow = activeNumberAnimations.get(window);
-    if (!perWindow) {
-        perWindow = new Map();
-        activeNumberAnimations.set(window, perWindow);
-    }
-
-    perWindow.get(stateKey)?.();
+    activeWorkspaceVisualAnimations.get(window)?.();
     const suppression = options.suppressSSDRebuild
         ? WINDOW_MANAGER.runtime.suppressSSDRebuild({
             ...MANAGED_WINDOW_ONLY_REBUILD_SUPPRESSION,
             windowIds: [window.id],
         })
         : null;
-    debugSSD("number-animation-start", {
-        windowId: window.id,
-        stateKey: stateKey.description,
-        from,
-        to,
-        suppressSSDRebuild: options.suppressSSDRebuild === true,
-    });
-    window.state[stateKey].set(from);
-    window.animation.set(variable, 0);
 
-    const progress = window.animation.signal(variable);
-    const dispose = effect(() => {
-        window.state[stateKey].set(from + (to - from) * progress());
+    window.animation.set(WORKSPACE_VISUAL_ANIMATION, 0);
+    const progress = window.animation.signal(WORKSPACE_VISUAL_ANIMATION);
+    window.state[WINDOW_STATE_WORKSPACE_VISUAL].set({
+        visible: true,
+        offsetY: computed(() => fromOffsetY + (toOffsetY - fromOffsetY) * progress()),
+        opacity: computed(() => fromOpacity + (toOpacity - fromOpacity) * progress()),
     });
 
     let poll: PollHandle | null = null;
     const teardown = () => {
         poll?.cancel();
         poll = null;
-        dispose();
-        suppression?.release();
-        debugSSD("number-animation-teardown", {
-            windowId: window.id,
-            stateKey: stateKey.description,
-            current: window.state[stateKey](),
+        window.state[WINDOW_STATE_WORKSPACE_VISUAL].set({
+            visible: visibleAfter,
+            offsetY: toOffsetY,
+            opacity: toOpacity,
         });
-        if (perWindow!.get(stateKey) === teardown) {
-            perWindow!.delete(stateKey);
+        suppression?.release();
+        if (activeWorkspaceVisualAnimations.get(window) === teardown) {
+            activeWorkspaceVisualAnimations.delete(window);
         }
     };
     poll = createManagedPoll(
         1,
         () => {
-            if (window.animation.running(variable)) {
+            if (window.animation.running(WORKSPACE_VISUAL_ANIMATION)) {
                 return;
             }
             teardown();
         },
         "none",
     );
-    perWindow.set(stateKey, teardown);
+    activeWorkspaceVisualAnimations.set(window, teardown);
 
-    window.animation.start(variable, {
+    window.animation.start(WORKSPACE_VISUAL_ANIMATION, {
         duration,
         from: 0,
         to: 1,

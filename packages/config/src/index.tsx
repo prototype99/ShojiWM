@@ -29,10 +29,8 @@ import {
     WINDOW_STATE_MINIMIZED,
     WINDOW_STATE_TILE_DRAGGING,
     WINDOW_STATE_VISIBLE_OUTPUTS,
-    WINDOW_STATE_WORKSPACE_OFFSET_Y,
-    WINDOW_STATE_WORKSPACE_OPACITY,
     WINDOW_STATE_RECT,
-    WINDOW_STATE_WORKSPACE_VISIBLE,
+    WINDOW_STATE_WORKSPACE_VISUAL,
 } from "./window-manager";
 
 const NOCTALIA_SHELL_PATH = "/home/bea4dev/Documents/development/noctalia-shell-shojiwm";
@@ -182,15 +180,13 @@ function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
 
 WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
     const openVariable = window.animation.signal(OPEN_ANIMATION);
-    const workspaceVisible = window.state[WINDOW_STATE_WORKSPACE_VISIBLE];
-    const workspaceOffsetY = window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y];
-    const workspaceOpacity = window.state[WINDOW_STATE_WORKSPACE_OPACITY];
+    const workspaceVisual = window.state[WINDOW_STATE_WORKSPACE_VISUAL];
     const tileDragging = window.state[WINDOW_STATE_TILE_DRAGGING];
-    const opacity = computed(() => openVariable() * (tileDragging() ? 1 : workspaceOpacity()));
+    const opacity = computed(() => openVariable() * (tileDragging() ? 1 : read(workspaceVisual().opacity)));
     const translateY = openVariable(variable => (1 - variable) * 200);
     const rect = computed(() => {
         const base = window.state[WINDOW_STATE_RECT]();
-        const dy = translateY() + (tileDragging() ? 0 : workspaceOffsetY());
+        const dy = translateY() + (tileDragging() ? 0 : read(workspaceVisual().offsetY));
         return {
             x: read(base.x),
             y: read(base.y) + dy,
@@ -200,7 +196,7 @@ WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
     });
     const forceRectSize = computed(() => window.isResizable() && !window.isTransient());
     const minimized = window.state[WINDOW_STATE_MINIMIZED];
-    const inactive = computed(() => minimized() || (!workspaceVisible() && !tileDragging()));
+    const inactive = computed(() => minimized() || (!workspaceVisual().visible && !tileDragging()));
 
     const borderColor = window.isFocused(focused => focused ? "#d7ba7d" : "#4f5666");
     const titlebarBackground = window.isFocused(focused => focused ? "#1f243080" : "#2a2f3a80");
