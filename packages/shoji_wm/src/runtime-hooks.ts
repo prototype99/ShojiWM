@@ -291,9 +291,18 @@ function releaseDelayedSSDRebuilds(entry: ActiveSSDRebuildSuppression): void {
   }
   debugSSD("runtime-suppress-flush-targets", suppressionForDebug(entry));
   for (const windowId of entry.delayedDirtyWindows) {
+    // The delayed entry came from a suppressed SSD structural/node dependency,
+    // not from ManagedWindow-only state. We intentionally force a full window
+    // reevaluation here because the exact node ids may have been lost while the
+    // rect animation was suppressing SSD rebuilds.
+    dirtyManagedWindowIds.delete(windowId);
+    dirtyWindowNodeIds.delete(windowId);
+    windowsWithStructuralWrite.add(windowId);
     markWindowDirty(windowId);
   }
   for (const layerId of entry.delayedDirtyLayers) {
+    dirtyLayerNodeIds.delete(layerId);
+    layersWithStructuralWrite.add(layerId);
     markLayerDirty(layerId);
   }
 }

@@ -54,6 +54,55 @@ fn apply_decoration_mode(
     state.schedule_redraw();
 }
 
+fn mark_toplevel_metadata_dirty(
+    state: &mut ShojiWM,
+    surface: &ToplevelSurface,
+    reason: &'static str,
+) {
+    let wl_surface = surface.wl_surface();
+    let window = state
+        .space
+        .elements()
+        .find(|window| {
+            window
+                .toplevel()
+                .is_some_and(|toplevel| toplevel.wl_surface() == wl_surface)
+        })
+        .cloned();
+
+    let Some(window) = window else {
+        warn!(
+            surface = ?wl_surface.id(),
+            reason,
+            "xdg toplevel metadata change did not match a mapped window"
+        );
+        return;
+    };
+
+    state.sync_foreign_toplevel(&window);
+
+    let snapshot = state.snapshot_window(&window);
+    let cached_snapshot = state
+        .window_decorations
+        .get(&window)
+        .map(|cached| &cached.snapshot);
+    info!(
+        window_id = %snapshot.id,
+        title = %snapshot.title,
+        cached_title = ?cached_snapshot.map(|snapshot| snapshot.title.as_str()),
+        app_id = ?snapshot.app_id,
+        cached_app_id = ?cached_snapshot.and_then(|snapshot| snapshot.app_id.as_deref()),
+        reason,
+        "xdg toplevel metadata changed"
+    );
+
+    state.runtime_dirty_window_ids.insert(snapshot.id.clone());
+    state.runtime_managed_only_window_ids.remove(&snapshot.id);
+    state.runtime_poll_dirty = true;
+    state.request_tty_maintenance(reason);
+    state.schedule_redraw();
+}
+
 impl XdgShellHandler for ShojiWM {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
@@ -403,6 +452,14 @@ impl XdgShellHandler for ShojiWM {
             true,
             crate::ssd::WindowStateRequestSourceSnapshot::ClientCsd,
         );
+    }
+
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        mark_toplevel_metadata_dirty(self, &surface, "xdg-toplevel-app-id-changed");
+    }
+
+    fn title_changed(&mut self, surface: ToplevelSurface) {
+        mark_toplevel_metadata_dirty(self, &surface, "xdg-toplevel-title-changed");
     }
 
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {

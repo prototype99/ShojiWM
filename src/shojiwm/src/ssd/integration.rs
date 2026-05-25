@@ -94,6 +94,26 @@ fn managed_rect_path_debug_enabled() -> bool {
     })
 }
 
+fn runtime_dirty_debug_enabled() -> bool {
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("SHOJI_RUNTIME_DIRTY_DEBUG")
+            .or_else(|| std::env::var_os("SHOJI_SSD_SUPPRESSION_DEBUG"))
+            .is_some_and(|value| value != "0" && !value.is_empty())
+    })
+}
+
+fn label_debug_enabled() -> bool {
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("SHOJI_LABEL_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
+    })
+}
+
 #[derive(Default)]
 struct ManagedRectPathStats {
     last_log: Option<Instant>,
@@ -426,13 +446,14 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
     fn evaluate_cached_window(
         &self,
         window_id: &str,
+        window: Option<&WaylandWindowSnapshot>,
         now_ms: u64,
     ) -> Result<DecorationCachedEvaluationResult, DecorationEvaluationError> {
         match self {
             Self::Static(_) => Err(DecorationEvaluationError::RuntimeProtocol(
                 "cached window evaluation unsupported for static evaluator".into(),
             )),
-            Self::Node(evaluator) => evaluator.evaluate_cached_window(window_id, now_ms),
+            Self::Node(evaluator) => evaluator.evaluate_cached_window(window_id, window, now_ms),
         }
     }
 
@@ -1315,14 +1336,40 @@ impl ShojiWM {
             let snapshot = self.snapshot_window(&window);
             let snapshot_id = snapshot.id.clone();
             let window_was_runtime_dirty = self.runtime_dirty_window_ids.contains(&snapshot_id);
-            if !should_process_window_for_refresh(
+            if runtime_dirty_debug_enabled() && window_was_runtime_dirty {
+                let cached_snapshot = self
+                    .window_decorations
+                    .get(&window)
+                    .map(|cached| &cached.snapshot);
+                info!(
+                    window_id = %snapshot_id,
+                    title = %snapshot.title,
+                    cached_title = ?cached_snapshot.map(|snapshot| snapshot.title.as_str()),
+                    app_id = ?snapshot.app_id,
+                    cached_app_id = ?cached_snapshot.and_then(|snapshot| snapshot.app_id.as_deref()),
+                    runtime_managed_only = self.runtime_managed_only_window_ids.contains(&snapshot_id),
+                    target_output = ?target_output_name,
+                    "runtime dirty debug: refresh candidate"
+                );
+            }
+            let should_process = should_process_window_for_refresh(
                 primary_output_name.as_deref(),
                 target_output_name,
                 force_async_asset_refresh,
                 force_output_animation_reevaluate,
                 force_runtime_reevaluate,
                 window_was_runtime_dirty,
-            ) {
+            );
+            if !should_process {
+                if runtime_dirty_debug_enabled() && window_was_runtime_dirty {
+                    info!(
+                        window_id = %snapshot_id,
+                        title = %snapshot.title,
+                        primary_output = ?primary_output_name,
+                        target_output = ?target_output_name,
+                        "runtime dirty debug: refresh candidate skipped"
+                    );
+                }
                 continue;
             }
             if let Some(primary_output_name) = primary_output_name {
@@ -1663,6 +1710,19 @@ impl ShojiWM {
                     let started_at = Instant::now();
                     let previous_root =
                         transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
+                    if runtime_dirty_debug_enabled() {
+                        info!(
+                            window_id = %snapshot_id,
+                            title = %snapshot.title,
+                            cached_title = %cached.snapshot.title,
+                            runtime_state_changed,
+                            window_was_runtime_dirty,
+                            force_runtime_reevaluate,
+                            force_output_animation_reevaluate,
+                            force_async_asset_refresh,
+                            "runtime dirty debug: evaluating cached window"
+                        );
+                    }
                     let evaluate_started_at = Instant::now();
                     let evaluation = if runtime_state_changed {
                         match self.decoration_evaluator.evaluate_window(&snapshot, now_ms) {
@@ -1681,10 +1741,11 @@ impl ShojiWM {
                             }
                         }
                     } else {
-                        match self
-                            .decoration_evaluator
-                            .evaluate_cached_window(&snapshot.id, now_ms)
-                        {
+                        match self.decoration_evaluator.evaluate_cached_window(
+                            &snapshot.id,
+                            Some(&snapshot),
+                            now_ms,
+                        ) {
                             Ok(evaluation) => evaluation,
                             Err(error) => {
                                 warn!(
@@ -1720,6 +1781,15 @@ impl ShojiWM {
                     pending_process_config_updates.push(evaluation.process_config.clone());
                     pending_process_actions.extend(evaluation.process_actions.clone());
                     if evaluation.managed_window_only {
+                        if runtime_dirty_debug_enabled() {
+                            info!(
+                                window_id = %snapshot_id,
+                                title = %snapshot.title,
+                                cached_title = %cached.snapshot.title,
+                                text_buffers = ?label_debug_enabled().then(|| summarize_text_buffers(&cached.text_buffers)),
+                                "runtime dirty debug: managed-window-only result"
+                            );
+                        }
                         cached.snapshot = snapshot;
                         cached.managed_window = evaluation.managed_window;
                         cached.window_effects = evaluation.window_effects;
@@ -1777,6 +1847,27 @@ impl ShojiWM {
                     let next_window_effects = evaluation.window_effects;
                     let dirty_node_ids = evaluation.dirty_node_ids;
                     let tree_changed = next_tree != cached.tree;
+                    let label_debug = label_debug_enabled();
+                    let cached_label_summary =
+                        label_debug.then(|| summarize_tree_labels(&cached.tree));
+                    let next_label_summary = label_debug.then(|| summarize_tree_labels(&next_tree));
+                    let previous_text_summary =
+                        label_debug.then(|| summarize_text_buffers(&previous_text_buffers));
+                    if runtime_dirty_debug_enabled() {
+                        info!(
+                            window_id = %snapshot_id,
+                            title = %snapshot.title,
+                            cached_title = %cached.snapshot.title,
+                            tree_changed,
+                            dirty_node_count = dirty_node_ids.len(),
+                            dirty_node_ids = ?dirty_node_ids,
+                            previous_text_count = previous_text_buffers.len(),
+                            cached_labels = ?cached_label_summary,
+                            next_labels = ?next_label_summary,
+                            previous_text_buffers = ?previous_text_summary,
+                            "runtime dirty debug: tree result"
+                        );
+                    }
                     let mut layout_equivalent_state = None;
                     cached.snapshot = snapshot;
                     cached.managed_window = next_managed_window;
@@ -1988,6 +2079,14 @@ impl ShojiWM {
                             &mut self.icon_rasterizer,
                         );
                     }
+                    if label_debug_enabled() {
+                        info!(
+                            window_id = %cached.snapshot.id,
+                            title = %cached.snapshot.title,
+                            text_buffers = ?summarize_text_buffers(&cached.text_buffers),
+                            "label debug: runtime dirty final text buffers"
+                        );
+                    }
                     log_decoration_refresh(
                         "runtime-dirty",
                         &cached.snapshot,
@@ -2058,7 +2157,7 @@ impl ShojiWM {
                 let previous_icon_buffers = closing.decoration.icon_buffers.clone();
                 let evaluation = self
                     .decoration_evaluator
-                    .evaluate_cached_window(&window_id, now_ms)?;
+                    .evaluate_cached_window(&window_id, None, now_ms)?;
                 pending_display_config_updates.push(evaluation.display_config.clone());
                 pending_process_config_updates.push(evaluation.process_config.clone());
                 pending_process_actions.extend(evaluation.process_actions.clone());
@@ -2860,6 +2959,7 @@ impl ShojiWM {
                 }
             }
             if size_changed {
+                let window_raster_scale = self.decoration_raster_scale_for_window(&window);
                 if force_rect_size
                     && let Some(decoration) = self.window_decorations.get_mut(&window)
                 {
@@ -2887,12 +2987,28 @@ impl ShojiWM {
                                 &previous_shader_buffers,
                                 &mut shader_buffers,
                             );
-                            let text_buffers = retarget_text_buffers_with_shared_edges(
+                            let text_buffers = if text_buffers_need_raster_for_layout(
                                 &layout,
-                                &order_map,
                                 &shared_edges,
                                 &previous_text_buffers,
-                            );
+                                window_raster_scale,
+                            ) {
+                                build_text_buffers_with_shared_edges(
+                                    &layout,
+                                    &order_map,
+                                    &shared_edges,
+                                    window_raster_scale,
+                                    &mut self.text_rasterizer,
+                                    &previous_text_buffers,
+                                )
+                            } else {
+                                retarget_text_buffers_with_shared_edges(
+                                    &layout,
+                                    &order_map,
+                                    &shared_edges,
+                                    &previous_text_buffers,
+                                )
+                            };
                             let icon_buffers = retarget_icon_buffers_with_shared_edges(
                                 &layout,
                                 &order_map,
@@ -4554,6 +4670,23 @@ fn collect_text_buffers(
         .resolved_effective_clip
         .map(|clip| clip.radius.to_f32().max(0.0));
 
+    if label_debug_enabled() {
+        info!(
+            path,
+            stable_key = %stable_key,
+            owner_node_id = ?node.stable_id,
+            text = %label_preview(&spec.text),
+            rect = %format_rect(spec.rect),
+            rect_precise = ?spec.rect_precise,
+            resolved_rect = %format_resolved_rect(node.resolved_rect),
+            clip_rect = ?node.effective_clip.map(|clip| clip.rect),
+            clip_rect_precise = ?current_clip_rect_precise,
+            raster_scale,
+            dirty_scoped = dirty_node_ids.is_some(),
+            "label debug: collect label"
+        );
+    }
+
     if let Some(buffer) = rasterizer.render_label(&spec) {
         let mut buffer = buffer;
         buffer.owner_node_id = node.stable_id.clone();
@@ -4564,6 +4697,19 @@ fn collect_text_buffers(
         buffer.clip_radius = node.effective_clip.map(|clip| clip.radius).unwrap_or(0);
         buffer.clip_rect_precise = current_clip_rect_precise;
         buffer.clip_radius_precise = current_clip_radius_precise;
+        if label_debug_enabled() {
+            info!(
+                stable_key = %buffer.stable_key,
+                owner_node_id = ?buffer.owner_node_id,
+                text = %label_preview(&buffer.text),
+                rect = %format_rect(buffer.rect),
+                rect_precise = ?buffer.rect_precise,
+                clip_rect = ?buffer.clip_rect,
+                clip_rect_precise = ?buffer.clip_rect_precise,
+                order = buffer.order,
+                "label debug: rendered label buffer"
+            );
+        }
         buffers.push(buffer);
     } else if let Some(mut buffer) =
         fallback_text_buffer(previous, node.stable_id.as_deref(), &stable_key)
@@ -4580,7 +4726,30 @@ fn collect_text_buffers(
         buffer.clip_rect_precise = current_clip_rect_precise;
         buffer.clip_radius_precise = current_clip_radius_precise;
         buffer.color = spec.color;
+        if label_debug_enabled() {
+            info!(
+                stable_key = %buffer.stable_key,
+                owner_node_id = ?buffer.owner_node_id,
+                previous_text = %label_preview(&buffer.text),
+                requested_text = %label_preview(&spec.text),
+                rect = %format_rect(buffer.rect),
+                rect_precise = ?buffer.rect_precise,
+                clip_rect = ?buffer.clip_rect,
+                clip_rect_precise = ?buffer.clip_rect_precise,
+                order = buffer.order,
+                "label debug: fallback label buffer"
+            );
+        }
         buffers.push(buffer);
+    } else if label_debug_enabled() {
+        info!(
+            path,
+            stable_key = %stable_key,
+            owner_node_id = ?node.stable_id,
+            text = %label_preview(&spec.text),
+            previous_count = previous.len(),
+            "label debug: label buffer unavailable"
+        );
     }
 }
 
@@ -4601,6 +4770,86 @@ fn fallback_text_buffer(
         .iter()
         .find(|buffer| buffer.stable_key == stable_key)
         .cloned()
+}
+
+fn text_buffers_need_raster_for_layout(
+    layout: &ComputedDecorationTree,
+    shared_edges: &impl SharedEdgeGeometryLookup,
+    previous: &[CachedDecorationLabel],
+    raster_scale: i32,
+) -> bool {
+    text_buffers_need_raster_for_node(
+        &layout.root,
+        "root".into(),
+        shared_edges,
+        previous,
+        raster_scale,
+    )
+}
+
+fn text_buffers_need_raster_for_node(
+    node: &super::ComputedDecorationNode,
+    path: String,
+    shared_edges: &impl SharedEdgeGeometryLookup,
+    previous: &[CachedDecorationLabel],
+    raster_scale: i32,
+) -> bool {
+    if node.style.visible == Some(false) {
+        return false;
+    }
+
+    let children_need_raster = node.children.iter().enumerate().any(|(index, child)| {
+        text_buffers_need_raster_for_node(
+            child,
+            format!("{path}/child-{index}"),
+            shared_edges,
+            previous,
+            raster_scale,
+        )
+    });
+    if children_need_raster {
+        return true;
+    }
+
+    let super::DecorationNodeKind::Label(label) = &node.kind else {
+        return false;
+    };
+
+    let stable_key = format!("{path}:label");
+    let previous_buffer = fallback_text_buffer(previous, node.stable_id.as_deref(), &stable_key);
+    let color = node
+        .style
+        .color
+        .unwrap_or(super::Color::WHITE)
+        .with_opacity(node.style.opacity);
+    let expects_no_buffer =
+        label.text.is_empty() || node.rect.width <= 0 || node.rect.height <= 0 || color.a == 0;
+    if expects_no_buffer {
+        return previous_buffer.is_some();
+    }
+
+    let Some(previous_buffer) = previous_buffer else {
+        return true;
+    };
+
+    let shared_geometry = node
+        .stable_id
+        .as_deref()
+        .and_then(|stable_id| shared_edges.shared_edge_geometry(stable_id));
+    let rect_precise = shared_geometry
+        .map(|geometry| geometry.rect_precise)
+        .unwrap_or_else(|| precise_rect_from_resolved(node.resolved_rect));
+    let previous_rect_precise = previous_buffer
+        .rendered_rect_precise
+        .unwrap_or_else(|| precise_rect_from_logical(previous_buffer.rendered_rect));
+
+    previous_buffer.text != label.text
+        || previous_buffer.color != color
+        || previous_buffer.raster_scale != raster_scale
+        || previous_buffer.rendered_rect.width != node.rect.width
+        || previous_buffer.rendered_rect.height != node.rect.height
+        || (previous_rect_precise.width - rect_precise.width).abs() > 0.001
+        || (previous_rect_precise.height - rect_precise.height).abs() > 0.001
 }
 
 fn collect_icon_buffers(
@@ -4759,6 +5008,55 @@ fn node_kind_name(kind: &super::DecorationNodeKind) -> &'static str {
         super::DecorationNodeKind::WindowBorder => "window-border",
         super::DecorationNodeKind::WindowSlot => "window-slot",
     }
+}
+
+fn summarize_tree_labels(tree: &DecorationTree) -> Vec<String> {
+    let mut labels = Vec::new();
+    collect_tree_label_summary(&tree.root, "root", &mut labels);
+    labels
+}
+
+fn collect_tree_label_summary(node: &super::DecorationNode, path: &str, labels: &mut Vec<String>) {
+    if let super::DecorationNodeKind::Label(label) = &node.kind {
+        labels.push(format!(
+            "{path} id={:?} text={} style={:?}",
+            node.stable_id,
+            label_preview(&label.text),
+            node.style,
+        ));
+    }
+
+    for (index, child) in node.children.iter().enumerate() {
+        collect_tree_label_summary(child, &format!("{path}/child-{index}"), labels);
+    }
+}
+
+fn summarize_text_buffers(buffers: &[CachedDecorationLabel]) -> Vec<String> {
+    buffers
+        .iter()
+        .map(|buffer| {
+            format!(
+                "key={} owner={:?} text={} rect={} precise={:?} clip={:?} clip_precise={:?} order={}",
+                buffer.stable_key,
+                buffer.owner_node_id,
+                label_preview(&buffer.text),
+                format_rect(buffer.rect),
+                buffer.rect_precise,
+                buffer.clip_rect,
+                buffer.clip_rect_precise,
+                buffer.order
+            )
+        })
+        .collect()
+}
+
+fn label_preview(text: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let mut preview = text.chars().take(MAX_CHARS).collect::<String>();
+    if text.chars().count() > MAX_CHARS {
+        preview.push('…');
+    }
+    preview
 }
 
 fn gap_debug_layout_enabled() -> bool {

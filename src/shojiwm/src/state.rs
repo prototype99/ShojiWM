@@ -115,6 +115,17 @@ use crate::{
 };
 use tracing::{debug, info, warn};
 
+fn runtime_dirty_debug_enabled() -> bool {
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("SHOJI_RUNTIME_DIRTY_DEBUG")
+            .or_else(|| std::env::var_os("SHOJI_SSD_SUPPRESSION_DEBUG"))
+            .is_some_and(|value| value != "0" && !value.is_empty())
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedDamageRect {
     pub owner: String,
@@ -1170,6 +1181,15 @@ impl ShojiWM {
                     }
                 };
                 if tick.dirty {
+                    if runtime_dirty_debug_enabled() {
+                        info!(
+                            dirty_window_ids = ?tick.dirty_window_ids,
+                            dirty_managed_window_ids = ?tick.dirty_managed_window_ids,
+                            dirty_window_node_ids = ?tick.dirty_window_node_ids,
+                            next_poll_in_ms = ?tick.next_poll_in_ms,
+                            "runtime dirty debug: scheduler tick dirty"
+                        );
+                    }
                     state.runtime_poll_dirty = true;
                     state.mark_runtime_dirty_windows(
                         tick.dirty_window_ids,
@@ -1511,6 +1531,13 @@ impl ShojiWM {
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
         for window_id in dirty_window_ids {
+            if runtime_dirty_debug_enabled() {
+                info!(
+                    window_id = %window_id,
+                    managed_only = managed_only.contains(&window_id),
+                    "runtime dirty debug: mark window dirty"
+                );
+            }
             if managed_only.contains(&window_id) {
                 self.runtime_managed_only_window_ids
                     .insert(window_id.clone());

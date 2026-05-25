@@ -11,6 +11,32 @@ import {
   leaveWindowNodeDependencyScope,
 } from "./runtime-hooks";
 
+function labelDebugEnabled(): boolean {
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } })
+    .process?.env;
+  const value = env?.SHOJI_LABEL_DEBUG;
+  return value !== undefined && value !== "" && value !== "0";
+}
+
+function debugSerializedLabel(
+  path: string,
+  props: Record<string, unknown>,
+  serialized: Record<string, unknown>,
+): void {
+  if (!labelDebugEnabled()) {
+    return;
+  }
+  console.info(
+    "label-debug serialize-label",
+    JSON.stringify({
+      path,
+      textType: typeof props.text,
+      serializedText: serialized.text,
+      style: serialized.style,
+    }),
+  );
+}
+
 export class CompositionSerializationError extends Error {
   constructor(message: string) {
     super(message);
@@ -79,7 +105,7 @@ function serializeElementNode(
     return {
       kind: node.type,
       nodeId: path,
-      props: serializeProps(node.props, context, path),
+      props: serializeProps(node.props, context, path, node.type),
       children: node.children.map((child, index) =>
         serializeCompositionTree(child, context, childNodePath(path, child, index))
       ),
@@ -93,6 +119,7 @@ function serializeProps(
   props: Record<string, unknown>,
   context?: CompositionSerializationContext,
   path = "root",
+  kind?: string,
 ): Record<string, unknown> {
   const serialized: Record<string, unknown> = {};
 
@@ -132,6 +159,10 @@ function serializeProps(
     }
 
     serialized[key] = serializeValue(value);
+  }
+
+  if (kind === "Label") {
+    debugSerializedLabel(path, props, serialized);
   }
 
   return serialized;

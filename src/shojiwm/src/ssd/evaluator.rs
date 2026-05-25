@@ -59,6 +59,7 @@ pub trait DecorationEvaluator {
     fn evaluate_cached_window(
         &self,
         _window_id: &str,
+        _window: Option<&WaylandWindowSnapshot>,
         _now_ms: u64,
     ) -> Result<DecorationCachedEvaluationResult, DecorationEvaluationError> {
         Err(DecorationEvaluationError::RuntimeProtocol(
@@ -692,6 +693,8 @@ enum RuntimeRequest<'a> {
         request_id: u64,
         #[serde(rename = "windowId")]
         window_id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        snapshot: Option<&'a WaylandWindowSnapshot>,
         #[serde(rename = "nowMs")]
         now_ms: u64,
         #[serde(rename = "displayState")]
@@ -1633,7 +1636,10 @@ fn spawn_stderr_drain(child: &mut Child) -> Arc<Mutex<String>> {
                     log.push_str(trimmed);
                     log.push('\n');
                     if log.len() > 64 * 1024 {
-                        let keep_from = log.len().saturating_sub(64 * 1024);
+                        let mut keep_from = log.len().saturating_sub(64 * 1024);
+                        while keep_from < log.len() && !log.is_char_boundary(keep_from) {
+                            keep_from += 1;
+                        }
                         log.drain(..keep_from);
                     }
                 }
@@ -1862,6 +1868,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
     fn evaluate_cached_window(
         &self,
         window_id: &str,
+        window: Option<&WaylandWindowSnapshot>,
         now_ms: u64,
     ) -> Result<DecorationCachedEvaluationResult, DecorationEvaluationError> {
         let mut runtime_guard = self.runtime.lock().map_err(|_| {
@@ -1879,6 +1886,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         let request = serde_json::to_string(&RuntimeRequest::EvaluateCached {
             request_id,
             window_id,
+            snapshot: window,
             now_ms,
             display_state: &display_state,
         })

@@ -1,4 +1,5 @@
 use crate::{backend::ShojiWMBackend, state::ShojiWM};
+use mimalloc::MiMalloc;
 use std::{
     backtrace::Backtrace,
     fs::{self, OpenOptions},
@@ -6,7 +7,6 @@ use std::{
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
-use mimalloc::MiMalloc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 

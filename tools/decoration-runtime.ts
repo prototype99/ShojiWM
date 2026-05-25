@@ -87,6 +87,13 @@ function debugSSD(message: string, details: Record<string, unknown> = {}): void 
   console.info(`ssd-suppression ${message}`, JSON.stringify(details));
 }
 
+function debugLabel(message: string, details: Record<string, unknown> = {}): void {
+  if (!process.env.SHOJI_LABEL_DEBUG) {
+    return;
+  }
+  console.info(`label-debug ${message}`, JSON.stringify(details));
+}
+
 function snapshotForDebug(snapshot: WaylandWindowSnapshot): Record<string, unknown> {
   return {
     windowId: snapshot.id,
@@ -142,6 +149,7 @@ interface EvaluateCachedRequest {
   requestId: number;
   kind: "evaluateCached";
   windowId: string;
+  snapshot?: WaylandWindowSnapshot;
   nowMs: number;
   displayState: Record<string, OutputStateSnapshot>;
 }
@@ -890,7 +898,7 @@ async function main() {
             processActions,
           });
         } else if (request.kind === "evaluateCached") {
-          const result = evaluateCached(effectConfig, request.windowId);
+          const result = evaluateCached(effectConfig, request.windowId, request.snapshot);
           const keyBindingConfig = pendingKeyBindingConfigPayload();
           const pointerConfig = pendingPointerConfigPayload();
           const processConfig = pendingProcessConfigPayload();
@@ -1118,6 +1126,7 @@ async function main() {
 function evaluateCached(
   effectConfig: RuntimeEffectConfig,
   windowId: string,
+  snapshot?: WaylandWindowSnapshot,
 ): {
   serialized?: unknown;
   transform: WindowTransform;
@@ -1132,7 +1141,47 @@ function evaluateCached(
     throw new Error(`missing cache entry for closing window ${windowId}`);
   }
 
+  let updated: ReturnType<CompositionEvaluationCache["update"]> = null;
+  if (snapshot !== undefined) {
+    if (snapshot.id !== windowId) {
+      throw new Error(`cached window snapshot id mismatch: ${windowId} != ${snapshot.id}`);
+    }
+    debugSSD("runtime-evaluate-cached-update-snapshot", {
+      windowId,
+      snapshot: snapshotForDebug(snapshot),
+    });
+    entry.latestSnapshot = snapshot;
+    updated = entry.cache.update(snapshot);
+    debugLabel("evaluate-cached-update-snapshot", {
+      windowId,
+      snapshotTitle: snapshot.title,
+      windowTitle: entry.cache.window.title.peek(),
+      updated: updated !== null,
+      labels: updated ? summarizeSerializedLabels(updated.serialized) : undefined,
+    });
+    // Updating reactive snapshot signals can mark this same window dirty.
+    // This cached evaluation is already consuming that snapshot update, so
+    // clear the outer dirty mark to avoid a duplicate follow-up tick.
+    dirtyWindowIds.delete(windowId);
+  }
+
   if (takeManagedWindowOnlyDirty(windowId)) {
+    const dirtyNodeIds = takeDirtyWindowNodeIds(windowId);
+    if (updated) {
+      debugLabel("evaluate-cached-managed-dirty-with-updated-tree", {
+        windowId,
+        dirtyNodeIds,
+        labels: summarizeSerializedLabels(updated.serialized),
+      });
+      return {
+        serialized: updated.serialized,
+        transform: updated.transform,
+        managedWindow: updated.managedWindow,
+        windowEffects: evaluateWindowEffects(effectConfig, windowId, entry),
+        dirtyNodeIds,
+        nextPollInMs: hasActiveAnimations() ? 0 : peekNextPollDelay(),
+      };
+    }
     const reevaluated = entry.cache.reevaluateManagedWindow();
     return {
       transform: reevaluated.transform,
@@ -1145,7 +1194,27 @@ function evaluateCached(
   }
 
   const dirtyNodeIds = takeDirtyWindowNodeIds(windowId);
+  if (updated) {
+    debugLabel("evaluate-cached-updated-tree", {
+      windowId,
+      dirtyNodeIds,
+      labels: summarizeSerializedLabels(updated.serialized),
+    });
+    return {
+      serialized: updated.serialized,
+      transform: updated.transform,
+      managedWindow: updated.managedWindow,
+      windowEffects: evaluateWindowEffects(effectConfig, windowId, entry),
+      dirtyNodeIds,
+      nextPollInMs: hasActiveAnimations() ? 0 : peekNextPollDelay(),
+    };
+  }
   const reevaluated = entry.cache.reevaluate(dirtyNodeIds);
+  debugLabel("evaluate-cached-reevaluate", {
+    windowId,
+    dirtyNodeIds,
+    labels: summarizeSerializedLabels(reevaluated.serialized),
+  });
   return {
     serialized: reevaluated.serialized,
     transform: entry.cache.lastTransform,
@@ -1154,6 +1223,34 @@ function evaluateCached(
     dirtyNodeIds,
     nextPollInMs: hasActiveAnimations() ? 0 : peekNextPollDelay(),
   };
+}
+
+function summarizeSerializedLabels(node: unknown): unknown[] {
+  const labels: unknown[] = [];
+  collectSerializedLabels(node, labels);
+  return labels;
+}
+
+function collectSerializedLabels(node: unknown, labels: unknown[]): void {
+  if (!node || typeof node !== "object") {
+    return;
+  }
+  const record = node as {
+    kind?: unknown;
+    nodeId?: unknown;
+    props?: Record<string, unknown>;
+    children?: unknown[];
+  };
+  if (record.kind === "Label") {
+    labels.push({
+      nodeId: record.nodeId,
+      text: record.props?.text,
+      style: record.props?.style,
+    });
+  }
+  for (const child of record.children ?? []) {
+    collectSerializedLabels(child, labels);
+  }
 }
 
 function evaluateSnapshot(
