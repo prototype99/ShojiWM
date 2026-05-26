@@ -37,7 +37,11 @@ pub use integration::{
 };
 pub use interaction::DecorationInteractionSnapshot;
 pub use window_model::{
-    LayerKindSnapshot, LayerPositionSnapshot, ManagedWindowState, OutputModeSnapshot,
+    LayerKindSnapshot, LayerPositionSnapshot, ManagedWindowAnimationEasingSnapshot,
+    ManagedWindowAnimationMode, ManagedWindowAnimationSnapshot,
+    ManagedWindowPointAnimationSnapshot, ManagedWindowPointSnapshot,
+    ManagedWindowRectAnimationSnapshot, ManagedWindowRectSnapshot,
+    ManagedWindowScalarAnimationSnapshot, ManagedWindowState, OutputModeSnapshot,
     OutputPositionSnapshot, PointerModifierStateSnapshot, PointerMoveEventSnapshot,
     PointerMovePointSnapshot, TransformOrigin, WaylandLayerSnapshot, WaylandOutputSnapshot,
     WaylandWindowAction, WaylandWindowSnapshot, WindowActivateRequestEventSnapshot,

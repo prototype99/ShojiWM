@@ -4,6 +4,10 @@
  */
 export type EasingFunction = (progress: number) => number;
 
+export interface CubicBezierEasingFunction extends EasingFunction {
+  readonly __shojiCubicBezier: readonly [number, number, number, number];
+}
+
 const NEWTON_ITERATIONS = 8;
 const NEWTON_EPSILON = 1e-6;
 const SUBDIVISION_EPSILON = 1e-7;
@@ -29,7 +33,7 @@ export function cubicBezier(
   y1: number,
   x2: number,
   y2: number,
-): EasingFunction {
+): CubicBezierEasingFunction {
   const sampleCurveX = (t: number) =>
     ((ax * t + bx) * t + cx) * t;
   const sampleCurveY = (t: number) =>
@@ -84,14 +88,19 @@ export function cubicBezier(
     return t;
   };
 
-  return (progress: number) => {
+  const easing = ((progress: number) => {
     const clamped = clampUnit(progress);
     if (clamped === 0 || clamped === 1) {
       return clamped;
     }
 
     return sampleCurveY(solveCurveX(clamped));
-  };
+  }) as CubicBezierEasingFunction;
+  Object.defineProperty(easing, "__shojiCubicBezier", {
+    value: [x1, y1, x2, y2] as const,
+    enumerable: false,
+  });
+  return easing;
 }
 
 /**

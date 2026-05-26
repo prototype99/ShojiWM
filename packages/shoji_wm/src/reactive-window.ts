@@ -176,6 +176,8 @@ export function createReactiveWindow(
     unmaximize: actions.unmaximize,
     minimize: actions.minimize,
     focus: actions.focus,
+    scheduleAnimation: actions.scheduleAnimation,
+    cancelAnimation: actions.cancelAnimation,
     setCloseAnimationDuration: actions.setCloseAnimationDuration,
     isXWayland() {
       return signals.isXwayland.value;

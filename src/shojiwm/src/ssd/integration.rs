@@ -17,7 +17,7 @@ use crate::backend::{
     text::{CachedDecorationLabel, LabelSpec},
     visual::PreciseLogicalRect,
 };
-use crate::state::ShojiWM;
+use crate::state::{ActiveManagedWindowAnimation, ShojiWM};
 
 use super::{
     ComputedDecorationTree, DecorationCachedEvaluationResult, DecorationEvaluationError,
@@ -25,7 +25,12 @@ use super::{
     DecorationHitTestResult, DecorationSchedulerTick, DecorationTree, LayerEffectEvaluationResult,
     LogicalPoint, LogicalRect, StaticDecorationEvaluator, WaylandLayerSnapshot,
     WaylandWindowSnapshot, WindowPositionSnapshot, WindowTransform, reapply_tree_preserving_layout,
-    window_model::ManagedWindowRectSnapshot,
+    window_model::{
+        ManagedWindowAnimationEasingSnapshot, ManagedWindowAnimationMode,
+        ManagedWindowAnimationSnapshot, ManagedWindowPointAnimationSnapshot,
+        ManagedWindowPointSnapshot, ManagedWindowRectAnimationSnapshot, ManagedWindowRectSnapshot,
+        ManagedWindowScalarAnimationSnapshot, ManagedWindowState,
+    },
 };
 
 type BumpSharedEdgeGeometryMap<'a> =
@@ -101,6 +106,19 @@ fn runtime_dirty_debug_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var_os("SHOJI_RUNTIME_DIRTY_DEBUG")
             .or_else(|| std::env::var_os("SHOJI_SSD_SUPPRESSION_DEBUG"))
+            .is_some_and(|value| value != "0" && !value.is_empty())
+    })
+}
+
+/// `SHOJI_ANIMATION_DEBUG=1` traces every schedule / cancel / per-frame advance
+/// of a managed-window animation. Useful for diagnosing animation "ghost"
+/// states (window ends up offscreen, hit-test missing, etc.).
+fn managed_animation_debug_enabled() -> bool {
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("SHOJI_ANIMATION_DEBUG")
             .is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
@@ -314,8 +332,25 @@ pub struct WindowDecorationState {
     /// coherent — which is the steady-state hot path (~25% CPU during
     /// ufo-test).
     pub client_rect_potentially_stale: bool,
+    /// Last animated transform produced by `advance_managed_window_animations`,
+    /// **or** the static value when no animation is active. This is the value
+    /// rendering reads — it changes per frame while an animation is in flight.
     pub visual_transform: WindowTransform,
+    /// Last animated managed-window state. Same lifetime semantics as
+    /// `visual_transform` — replaced per frame during animations, then frozen
+    /// at the final sample until the next TS evaluation arrives.
     pub managed_window: super::ManagedWindowState,
+    /// Composition-declared transform from the most recent TS evaluation,
+    /// **without** any animation deltas applied. `advance_managed_window_animations`
+    /// resets `visual_transform` from this each frame before sampling the
+    /// active animations, so additive animations (mode = add / sub / multiply)
+    /// don't compound from one frame to the next.
+    pub static_visual_transform: WindowTransform,
+    /// Composition-declared managed-window state from the most recent TS
+    /// evaluation. Same role as `static_visual_transform` — anchors animation
+    /// sampling so each frame starts from the composition's intent rather than
+    /// from yesterday's animated result.
+    pub static_managed_window: super::ManagedWindowState,
     pub window_effects: Option<super::WindowEffectConfig>,
     pub content_clip: Option<ContentClip>,
     pub buffers: Vec<CachedDecorationBuffer>,
@@ -718,9 +753,11 @@ impl ShojiWM {
 
         if let Some(transform) = invocation.transform {
             decoration.visual_transform = transform;
+            decoration.static_visual_transform = transform;
         }
         if let Some(managed_window) = &invocation.managed_window {
             decoration.managed_window = managed_window.clone();
+            decoration.static_managed_window = managed_window.clone();
         }
 
         let next_root =
@@ -1181,6 +1218,412 @@ impl ShojiWM {
         self.refresh_window_decorations_for_output(None)
     }
 
+    /// Split the action list returned by an in-band evaluation: schedule /
+    /// cancel animation actions are applied **immediately** (so the upcoming
+    /// `advance_managed_window_animations` already sees them), the rest are
+    /// returned to be deferred to the standard end-of-refresh action sweep.
+    /// This is the fix for the "open animation flashes static target for one
+    /// frame" bug — without immediate application, scheduleAnimation actions
+    /// would sit in `pending_window_actions` until after rendering the static
+    /// frame.
+    fn apply_pre_advance_animation_actions(
+        &mut self,
+        actions: Vec<crate::ssd::RuntimeWindowAction>,
+    ) -> Vec<crate::ssd::RuntimeWindowAction> {
+        let mut deferred = Vec::with_capacity(actions.len());
+        for action in actions {
+            match action.action {
+                crate::ssd::WaylandWindowAction::ScheduleAnimation => {
+                    if let Some(animation) = action.animation {
+                        self.schedule_managed_window_animation(action.window_id, animation);
+                    }
+                }
+                crate::ssd::WaylandWindowAction::CancelAnimation => {
+                    self.cancel_managed_window_animation(
+                        &action.window_id,
+                        action.channel.as_deref(),
+                    );
+                }
+                _ => deferred.push(action),
+            }
+        }
+        deferred
+    }
+
+    pub fn schedule_managed_window_animation(
+        &mut self,
+        window_id: String,
+        mut animation: ManagedWindowAnimationSnapshot,
+    ) {
+        self.managed_window_animation_sequence =
+            self.managed_window_animation_sequence.wrapping_add(1);
+        let channel = animation.channel.clone();
+        let started_at_ms = Duration::from(self.clock.now()).as_millis() as u64;
+        let had_any_existing = self
+            .managed_window_animations
+            .get(&window_id)
+            .is_some_and(|channels| !channels.is_empty());
+        if managed_animation_debug_enabled() {
+            let had_existing = self
+                .managed_window_animations
+                .get(&window_id)
+                .and_then(|channels| channels.get(&channel))
+                .is_some();
+            info!(
+                window_id = %window_id,
+                channel = %channel,
+                started_at_ms,
+                had_existing,
+                rect = ?animation.rect,
+                offset = ?animation.offset,
+                opacity = ?animation.opacity,
+                "managed animation: schedule"
+            );
+        }
+
+        if !had_any_existing {
+            self.reset_managed_window_animation_state_to_static(&window_id);
+        }
+
+        // Smooth handoff: when overriding an in-flight animation in the same
+        // channel, TS-provided `from` values reflect the *declarative target*
+        // (state.set() value), not the current visual position. If we used
+        // them as-is the visual would snap from "mid-lerp" to "previous target"
+        // before continuing toward the new target. Instead, sample the existing
+        // animation at "now" and use those samples as `from`. This produces a
+        // continuous lerp from where the user actually sees the window.
+        if let Some(existing) = self
+            .managed_window_animations
+            .get(&window_id)
+            .and_then(|channels| channels.get(&channel))
+        {
+            let (existing_progress, _) = managed_animation_progress(existing, started_at_ms);
+            if let (Some(new_rect), Some(existing_rect)) =
+                (animation.rect.as_mut(), existing.animation.rect.as_ref())
+            {
+                let sampled =
+                    sample_rect_animation(existing_rect, existing_progress, existing_rect.from);
+                new_rect.from = Some(sampled);
+            }
+            if let (Some(new_offset), Some(existing_offset)) = (
+                animation.offset.as_mut(),
+                existing.animation.offset.as_ref(),
+            ) {
+                let sampled = sample_point_animation(existing_offset, existing_progress);
+                new_offset.from = Some(sampled);
+            }
+            if let (Some(new_opacity), Some(existing_opacity)) = (
+                animation.opacity.as_mut(),
+                existing.animation.opacity.as_ref(),
+            ) {
+                let sampled = sample_scalar_animation(
+                    existing_opacity,
+                    existing_progress,
+                    existing_opacity.from.unwrap_or(existing_opacity.to),
+                );
+                new_opacity.from = Some(sampled);
+            }
+        }
+
+        self.managed_window_animations
+            .entry(window_id)
+            .or_default()
+            .insert(
+                channel,
+                ActiveManagedWindowAnimation {
+                    sequence: self.managed_window_animation_sequence,
+                    started_at_ms,
+                    animation,
+                },
+            );
+        self.schedule_redraw();
+        self.request_tty_maintenance("managed-window-animation-scheduled");
+    }
+
+    fn reset_managed_window_animation_state_to_static(&mut self, window_id: &str) {
+        for (_, decoration) in self.window_decorations.iter_mut() {
+            if decoration.snapshot.id != window_id {
+                continue;
+            }
+
+            let previous_root =
+                transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
+            let previous_transform = decoration.visual_transform;
+            decoration.managed_window = decoration.static_managed_window.clone();
+            decoration.visual_transform = decoration.static_visual_transform;
+            let next_root =
+                transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
+            if previous_transform != decoration.visual_transform || previous_root != next_root {
+                push_damage_pair(
+                    &mut self.pending_decoration_damage,
+                    Some(previous_root),
+                    next_root,
+                );
+            }
+            break;
+        }
+
+        if let Some(closing) = self.closing_window_snapshots.get_mut(window_id) {
+            let previous_root = transformed_root_rect(
+                closing.decoration.layout.root.rect,
+                closing.decoration.visual_transform,
+            );
+            let previous_transform = closing.decoration.visual_transform;
+            closing.decoration.managed_window = closing.decoration.static_managed_window.clone();
+            closing.decoration.visual_transform = closing.decoration.static_visual_transform;
+            closing.transform = closing.decoration.static_visual_transform;
+            let next_root = transformed_root_rect(
+                closing.decoration.layout.root.rect,
+                closing.decoration.visual_transform,
+            );
+            if previous_transform != closing.decoration.visual_transform
+                || previous_root != next_root
+            {
+                push_damage_pair(
+                    &mut self.pending_decoration_damage,
+                    Some(previous_root),
+                    next_root,
+                );
+            }
+        }
+    }
+
+    pub fn cancel_managed_window_animation(&mut self, window_id: &str, channel: Option<&str>) {
+        if managed_animation_debug_enabled() {
+            info!(
+                window_id,
+                channel = ?channel,
+                "managed animation: cancel"
+            );
+        }
+        if let Some(channel) = channel {
+            if let Some(channels) = self.managed_window_animations.get_mut(window_id) {
+                channels.remove(channel);
+                if channels.is_empty() {
+                    self.managed_window_animations.remove(window_id);
+                }
+            }
+        } else {
+            self.managed_window_animations.remove(window_id);
+        }
+        self.schedule_redraw();
+        self.request_tty_maintenance("managed-window-animation-cancelled");
+    }
+
+    fn advance_managed_window_animations(
+        &mut self,
+        now_ms: u64,
+    ) -> std::collections::HashSet<String> {
+        let mut dirty_rect_window_ids = std::collections::HashSet::new();
+        if self.managed_window_animations.is_empty() {
+            return dirty_rect_window_ids;
+        }
+
+        let window_ids = self
+            .managed_window_animations
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut active_any = false;
+
+        for window_id in window_ids {
+            let Some(channels) = self.managed_window_animations.get(&window_id) else {
+                continue;
+            };
+            let channel_values = channels.values().cloned().collect::<Vec<_>>();
+            if channel_values.is_empty() {
+                continue;
+            }
+
+            let mut completed_channels = Vec::new();
+            // Sort by mode priority first, then scheduling sequence. Override is
+            // the "base layer" — it must run before Add / Sub / Multiply so the
+            // additive modes apply their delta on top of the override's result
+            // rather than the other way round. Within the same priority, the
+            // scheduling order (newer last) decides who wins / stacks.
+            let mut channel_values = channel_values;
+            channel_values.sort_by_key(|animation| {
+                let mode_priority = animation_mode_priority(&animation.animation);
+                (mode_priority, animation.sequence)
+            });
+
+            // Always seed from the *static* composition state (not last frame's
+            // animated result). Without this reset, additive/multiplicative
+            // animations (mode = add / sub / multiply) would compound their
+            // delta into the base every frame — the source of the workspace-
+            // switch "runaway offset" bug. Override-mode animations don't care
+            // because they replace the field outright, but resetting is cheap
+            // and uniform.
+            let Some(base_managed_window) = self
+                .window_decorations
+                .iter()
+                .find_map(|(_, decoration)| {
+                    (decoration.snapshot.id == window_id)
+                        .then(|| decoration.static_managed_window.clone())
+                })
+                .or_else(|| {
+                    self.closing_window_snapshots
+                        .get(&window_id)
+                        .map(|closing| closing.decoration.static_managed_window.clone())
+                })
+            else {
+                self.managed_window_animations.remove(&window_id);
+                continue;
+            };
+
+            let mut next_managed_window = base_managed_window.clone();
+            let mut rect_changed = false;
+            let mut transform_changed = false;
+
+            for active in &channel_values {
+                let (progress, running) = managed_animation_progress(active, now_ms);
+                active_any |= running;
+                if !running {
+                    completed_channels.push(active.animation.channel.clone());
+                }
+
+                if let Some(rect_animation) = &active.animation.rect {
+                    let mut value =
+                        sample_rect_animation(rect_animation, progress, next_managed_window.rect);
+                    // Override mode lock: keep the size at the animation's
+                    // target throughout the lerp so we don't ask the client
+                    // for a sequence of intermediate sizes (which causes the
+                    // "buffer stretched while it catches up" symptom). Only
+                    // position interpolates visually for size-changing tile
+                    // animations; the resize itself becomes a one-shot
+                    // configure at scheduling time.
+                    if matches!(rect_animation.mode, ManagedWindowAnimationMode::Override) {
+                        value.width = rect_animation.to.width;
+                        value.height = rect_animation.to.height;
+                    }
+                    apply_rect_animation_value(
+                        &mut next_managed_window,
+                        value,
+                        rect_animation.mode,
+                    );
+                    rect_changed = true;
+                }
+
+                if let Some(offset_animation) = &active.animation.offset {
+                    let value = sample_point_animation(offset_animation, progress);
+                    apply_offset_animation_value(
+                        &mut next_managed_window,
+                        value,
+                        offset_animation.mode,
+                    );
+                    transform_changed = true;
+                }
+
+                if let Some(opacity_animation) = &active.animation.opacity {
+                    let value = sample_scalar_animation(
+                        opacity_animation,
+                        progress,
+                        next_managed_window.transform.opacity as f64,
+                    );
+                    apply_opacity_animation_value(
+                        &mut next_managed_window,
+                        value,
+                        opacity_animation.mode,
+                    );
+                    transform_changed = true;
+                }
+            }
+
+            if let Some(channels) = self.managed_window_animations.get_mut(&window_id) {
+                for channel in completed_channels {
+                    channels.remove(&channel);
+                }
+                if channels.is_empty() {
+                    self.managed_window_animations.remove(&window_id);
+                }
+            }
+
+            for (_, decoration) in self.window_decorations.iter_mut() {
+                if decoration.snapshot.id != window_id {
+                    continue;
+                }
+                let previous_root =
+                    transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
+                let previous_transform = decoration.visual_transform;
+                decoration.managed_window = next_managed_window.clone();
+                if transform_changed {
+                    decoration.visual_transform = next_managed_window.transform;
+                }
+                if rect_changed {
+                    dirty_rect_window_ids.insert(window_id.clone());
+                }
+                let next_root =
+                    transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
+                if previous_transform != decoration.visual_transform || previous_root != next_root {
+                    push_damage_pair(
+                        &mut self.pending_decoration_damage,
+                        Some(previous_root),
+                        next_root,
+                    );
+                }
+                if managed_animation_debug_enabled() {
+                    let active_channels = self
+                        .managed_window_animations
+                        .get(&window_id)
+                        .map(|channels| {
+                            channels
+                                .values()
+                                .map(|active| active.animation.channel.as_str())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    info!(
+                        window_id = %window_id,
+                        now_ms,
+                        active_channels = ?active_channels,
+                        static_rect = ?decoration.static_managed_window.rect,
+                        result_rect = ?decoration.managed_window.rect,
+                        result_translate_x = decoration.visual_transform.translate_x,
+                        result_translate_y = decoration.visual_transform.translate_y,
+                        result_opacity = decoration.visual_transform.opacity,
+                        rect_changed,
+                        transform_changed,
+                        "managed animation: advance frame result"
+                    );
+                }
+                break;
+            }
+
+            if let Some(closing) = self.closing_window_snapshots.get_mut(&window_id) {
+                let previous_root = transformed_root_rect(
+                    closing.decoration.layout.root.rect,
+                    closing.decoration.visual_transform,
+                );
+                let previous_transform = closing.decoration.visual_transform;
+                closing.decoration.managed_window = next_managed_window.clone();
+                if transform_changed {
+                    closing.decoration.visual_transform = next_managed_window.transform;
+                    closing.transform = next_managed_window.transform;
+                }
+                let next_root = transformed_root_rect(
+                    closing.decoration.layout.root.rect,
+                    closing.decoration.visual_transform,
+                );
+                if previous_transform != closing.decoration.visual_transform
+                    || previous_root != next_root
+                {
+                    push_damage_pair(
+                        &mut self.pending_decoration_damage,
+                        Some(previous_root),
+                        next_root,
+                    );
+                }
+            }
+        }
+
+        if active_any {
+            self.schedule_redraw();
+            self.request_tty_maintenance("managed-window-animation-active");
+        }
+
+        dirty_rect_window_ids
+    }
+
     pub fn refresh_layer_effects_for_output(
         &mut self,
         output_name: &str,
@@ -1269,6 +1712,13 @@ impl ShojiWM {
             .is_some_and(|output_name| self.runtime_animation_outputs.contains(output_name));
         let force_async_asset_refresh = self.async_asset_dirty;
         let mut pending_window_actions = Vec::new();
+        // Window actions returned in-band from evaluations that need to take
+        // effect *before* `advance_managed_window_animations` runs this frame
+        // (scheduleAnimation / cancelAnimation). Collected during the windows
+        // pass because most evaluation sites hold a `&mut self.window_decorations`
+        // borrow which prevents calling `self.apply_pre_advance_animation_actions`
+        // inline. We drain this list after the windows pass, before `advance`.
+        let mut pre_advance_actions: Vec<crate::ssd::RuntimeWindowAction> = Vec::new();
         let mut pending_finalize_close_damage = Vec::new();
         let mut pending_display_config_updates = Vec::new();
         let mut pending_key_binding_config_updates = Vec::new();
@@ -1437,7 +1887,9 @@ impl ShojiWM {
                     transformed_root_rect(cached.layout.root.rect, cached.visual_transform)
                 });
                 let evaluate_started_at = Instant::now();
-                let evaluation = match self.decoration_evaluator.evaluate_window(&snapshot, now_ms)
+                let mut evaluation = match self
+                    .decoration_evaluator
+                    .evaluate_window(&snapshot, now_ms)
                 {
                     Ok(evaluation) => evaluation,
                     Err(error) => {
@@ -1458,6 +1910,7 @@ impl ShojiWM {
                 pending_event_config_updates.push(evaluation.event_config.clone());
                 pending_process_config_updates.push(evaluation.process_config.clone());
                 pending_process_actions.extend(evaluation.process_actions.clone());
+                pre_advance_actions.extend(std::mem::take(&mut evaluation.actions));
                 let tree = DecorationTree::new(evaluation.node);
                 let layout_client_rect = managed_client_rect_for_state(
                     &tree,
@@ -1561,6 +2014,8 @@ impl ShojiWM {
                     })
                     .unwrap_or_default();
                 let (rounded_cache, shader_cache, backdrop_cache, window_effect_cache) = caches;
+                let static_transform = evaluation.transform;
+                let static_managed = evaluation.managed_window.clone();
                 self.window_decorations.insert(
                     window,
                     WindowDecorationState {
@@ -1570,8 +2025,10 @@ impl ShojiWM {
                         layout_scale,
                         client_rect: layout_client_rect,
                         client_rect_potentially_stale: false,
-                        visual_transform: evaluation.transform,
+                        visual_transform: static_transform,
                         managed_window: evaluation.managed_window,
+                        static_visual_transform: static_transform,
+                        static_managed_window: static_managed,
                         window_effects: evaluation.window_effects,
                         content_clip,
                         buffers,
@@ -1724,7 +2181,7 @@ impl ShojiWM {
                         );
                     }
                     let evaluate_started_at = Instant::now();
-                    let evaluation = if runtime_state_changed {
+                    let mut evaluation = if runtime_state_changed {
                         match self.decoration_evaluator.evaluate_window(&snapshot, now_ms) {
                             Ok(evaluation) => evaluation.into(),
                             Err(error) => {
@@ -1780,6 +2237,7 @@ impl ShojiWM {
                     pending_event_config_updates.push(evaluation.event_config.clone());
                     pending_process_config_updates.push(evaluation.process_config.clone());
                     pending_process_actions.extend(evaluation.process_actions.clone());
+                    pre_advance_actions.extend(std::mem::take(&mut evaluation.actions));
                     if evaluation.managed_window_only {
                         if runtime_dirty_debug_enabled() {
                             info!(
@@ -1791,9 +2249,11 @@ impl ShojiWM {
                             );
                         }
                         cached.snapshot = snapshot;
-                        cached.managed_window = evaluation.managed_window;
+                        cached.managed_window = evaluation.managed_window.clone();
+                        cached.static_managed_window = evaluation.managed_window;
                         cached.window_effects = evaluation.window_effects;
                         cached.visual_transform = evaluation.transform;
+                        cached.static_visual_transform = evaluation.transform;
                         let next_root =
                             transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
                         push_damage_pair(
@@ -1870,11 +2330,13 @@ impl ShojiWM {
                     }
                     let mut layout_equivalent_state = None;
                     cached.snapshot = snapshot;
+                    cached.static_managed_window = next_managed_window.clone();
                     cached.managed_window = next_managed_window;
                     cached.window_effects = next_window_effects;
 
                     if !tree_changed {
                         cached.visual_transform = next_transform;
+                        cached.static_visual_transform = next_transform;
                     } else {
                         let layout_equivalent = cached.tree.root.layout_equivalent(&next_tree.root);
                         layout_equivalent_state = Some(layout_equivalent);
@@ -2000,6 +2462,7 @@ impl ShojiWM {
                             self.suggested_window_offset = suggested_window_offset(&cached.layout);
                         }
                         cached.visual_transform = next_transform;
+                        cached.static_visual_transform = next_transform;
                     }
                     let rebuild_ms = rebuild_started_at.elapsed().as_secs_f64() * 1000.0;
                     let finalize_started_at = Instant::now();
@@ -2128,6 +2591,12 @@ impl ShojiWM {
             }
         }
         let windows_pass_elapsed_ms = windows_pass_started_at.elapsed().as_secs_f64() * 1000.0;
+        if !pre_advance_actions.is_empty() {
+            let deferred =
+                self.apply_pre_advance_animation_actions(std::mem::take(&mut pre_advance_actions));
+            pending_window_actions.extend(deferred);
+        }
+        managed_rect_apply_window_ids.extend(self.advance_managed_window_animations(now_ms));
         self.apply_managed_window_rects(&managed_rect_apply_window_ids);
 
         let closing_pass_started_at = Instant::now();
@@ -2155,16 +2624,19 @@ impl ShojiWM {
                 let previous_shader_buffers = closing.decoration.shader_buffers.clone();
                 let previous_text_buffers = closing.decoration.text_buffers.clone();
                 let previous_icon_buffers = closing.decoration.icon_buffers.clone();
-                let evaluation = self
+                let mut evaluation = self
                     .decoration_evaluator
                     .evaluate_cached_window(&window_id, None, now_ms)?;
                 pending_display_config_updates.push(evaluation.display_config.clone());
                 pending_process_config_updates.push(evaluation.process_config.clone());
                 pending_process_actions.extend(evaluation.process_actions.clone());
+                pre_advance_actions.extend(std::mem::take(&mut evaluation.actions));
                 if evaluation.managed_window_only {
-                    closing.decoration.managed_window = evaluation.managed_window;
+                    closing.decoration.managed_window = evaluation.managed_window.clone();
+                    closing.decoration.static_managed_window = evaluation.managed_window;
                     closing.decoration.window_effects = evaluation.window_effects;
                     closing.decoration.visual_transform = evaluation.transform;
+                    closing.decoration.static_visual_transform = evaluation.transform;
                     if closing.decoration.managed_window.managed
                         && let Some(desired_root) = closing.decoration.managed_window.rect
                     {
@@ -2257,6 +2729,8 @@ impl ShojiWM {
                         pending_window_actions.push(crate::ssd::RuntimeWindowAction {
                             window_id: window_id.clone(),
                             action: crate::ssd::WaylandWindowAction::FinalizeClose,
+                            animation: None,
+                            channel: None,
                         });
                     }
                     self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
@@ -2273,12 +2747,14 @@ impl ShojiWM {
                     ));
                 };
                 let next_tree = DecorationTree::new(evaluation_node);
-                closing.decoration.managed_window = evaluation.managed_window;
+                closing.decoration.managed_window = evaluation.managed_window.clone();
+                closing.decoration.static_managed_window = evaluation.managed_window;
                 closing.decoration.window_effects = evaluation.window_effects;
                 let dirty_node_ids = evaluation.dirty_node_ids;
                 let tree_changed = next_tree != closing.decoration.tree;
                 if !tree_changed {
                     closing.decoration.visual_transform = evaluation.transform;
+                    closing.decoration.static_visual_transform = evaluation.transform;
                 } else {
                     let layout_equivalent = closing
                         .decoration
@@ -2413,6 +2889,7 @@ impl ShojiWM {
                             suggested_window_offset(&closing.decoration.layout);
                     }
                     closing.decoration.visual_transform = evaluation.transform;
+                    closing.decoration.static_visual_transform = evaluation.transform;
                 }
                 if closing.decoration.managed_window.managed
                     && let Some(desired_root) = closing.decoration.managed_window.rect
@@ -2491,6 +2968,7 @@ impl ShojiWM {
                     }
                 }
                 closing.decoration.visual_transform = evaluation.transform;
+                closing.decoration.static_visual_transform = evaluation.transform;
                 closing.transform = evaluation.transform;
                 let next_root =
                     transformed_root_rect(closing.decoration.layout.root.rect, closing.transform);
@@ -2545,6 +3023,8 @@ impl ShojiWM {
                     pending_window_actions.push(crate::ssd::RuntimeWindowAction {
                         window_id: window_id.clone(),
                         action: crate::ssd::WaylandWindowAction::FinalizeClose,
+                        animation: None,
+                        channel: None,
                     });
                 }
                 self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
@@ -3084,6 +3564,234 @@ fn managed_rect_snapshot_to_logical_rect(rect: ManagedWindowRectSnapshot) -> Log
     let bottom = (rect.y + rect.height).round() as i32;
 
     LogicalRect::new(left, top, right - left, bottom - top)
+}
+
+fn managed_animation_progress(active: &ActiveManagedWindowAnimation, now_ms: u64) -> (f64, bool) {
+    let duration = active
+        .animation
+        .rect
+        .as_ref()
+        .map(|animation| animation.duration)
+        .into_iter()
+        .chain(
+            active
+                .animation
+                .offset
+                .as_ref()
+                .map(|animation| animation.duration),
+        )
+        .chain(
+            active
+                .animation
+                .opacity
+                .as_ref()
+                .map(|animation| animation.duration),
+        )
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let elapsed = now_ms.saturating_sub(active.started_at_ms);
+    let raw = (elapsed as f64 / duration as f64).clamp(0.0, 1.0);
+    let eased = sample_easing(
+        active
+            .animation
+            .rect
+            .as_ref()
+            .map(|animation| animation.easing)
+            .or_else(|| {
+                active
+                    .animation
+                    .offset
+                    .as_ref()
+                    .map(|animation| animation.easing)
+            })
+            .or_else(|| {
+                active
+                    .animation
+                    .opacity
+                    .as_ref()
+                    .map(|animation| animation.easing)
+            })
+            .unwrap_or_default(),
+        raw,
+    );
+    (eased, elapsed < duration)
+}
+
+fn sample_rect_animation(
+    animation: &ManagedWindowRectAnimationSnapshot,
+    progress: f64,
+    fallback: Option<ManagedWindowRectSnapshot>,
+) -> ManagedWindowRectSnapshot {
+    let from = animation.from.or(fallback).unwrap_or(animation.to);
+    ManagedWindowRectSnapshot {
+        x: lerp(from.x, animation.to.x, progress),
+        y: lerp(from.y, animation.to.y, progress),
+        width: lerp(from.width, animation.to.width, progress),
+        height: lerp(from.height, animation.to.height, progress),
+    }
+}
+
+fn sample_point_animation(
+    animation: &ManagedWindowPointAnimationSnapshot,
+    progress: f64,
+) -> ManagedWindowPointSnapshot {
+    let from = animation
+        .from
+        .unwrap_or(ManagedWindowPointSnapshot { x: 0.0, y: 0.0 });
+    ManagedWindowPointSnapshot {
+        x: lerp(from.x, animation.to.x, progress),
+        y: lerp(from.y, animation.to.y, progress),
+    }
+}
+
+fn sample_scalar_animation(
+    animation: &ManagedWindowScalarAnimationSnapshot,
+    progress: f64,
+    fallback: f64,
+) -> f64 {
+    let from = animation.from.unwrap_or(fallback);
+    lerp(from, animation.to, progress)
+}
+
+fn apply_rect_animation_value(
+    managed: &mut ManagedWindowState,
+    value: ManagedWindowRectSnapshot,
+    mode: ManagedWindowAnimationMode,
+) {
+    let base = managed.rect.unwrap_or(value);
+    managed.rect = Some(match mode {
+        ManagedWindowAnimationMode::Override | ManagedWindowAnimationMode::Multiply => value,
+        ManagedWindowAnimationMode::Add => ManagedWindowRectSnapshot {
+            x: base.x + value.x,
+            y: base.y + value.y,
+            width: base.width + value.width,
+            height: base.height + value.height,
+        },
+        ManagedWindowAnimationMode::Sub => ManagedWindowRectSnapshot {
+            x: base.x - value.x,
+            y: base.y - value.y,
+            width: base.width - value.width,
+            height: base.height - value.height,
+        },
+    });
+}
+
+fn apply_offset_animation_value(
+    managed: &mut ManagedWindowState,
+    value: ManagedWindowPointSnapshot,
+    mode: ManagedWindowAnimationMode,
+) {
+    match mode {
+        ManagedWindowAnimationMode::Override => {
+            managed.transform.translate_x = value.x;
+            managed.transform.translate_y = value.y;
+        }
+        ManagedWindowAnimationMode::Add | ManagedWindowAnimationMode::Multiply => {
+            managed.transform.translate_x += value.x;
+            managed.transform.translate_y += value.y;
+        }
+        ManagedWindowAnimationMode::Sub => {
+            managed.transform.translate_x -= value.x;
+            managed.transform.translate_y -= value.y;
+        }
+    }
+}
+
+fn apply_opacity_animation_value(
+    managed: &mut ManagedWindowState,
+    value: f64,
+    mode: ManagedWindowAnimationMode,
+) {
+    let next = match mode {
+        ManagedWindowAnimationMode::Override => value,
+        ManagedWindowAnimationMode::Add => managed.transform.opacity as f64 + value,
+        ManagedWindowAnimationMode::Sub => managed.transform.opacity as f64 - value,
+        ManagedWindowAnimationMode::Multiply => managed.transform.opacity as f64 * value,
+    };
+    managed.transform.opacity = next.clamp(0.0, 1.0) as f32;
+}
+
+fn sample_easing(easing: ManagedWindowAnimationEasingSnapshot, progress: f64) -> f64 {
+    match easing {
+        ManagedWindowAnimationEasingSnapshot::Linear => progress,
+        ManagedWindowAnimationEasingSnapshot::CubicBezier { x1, y1, x2, y2 } => {
+            sample_cubic_bezier(x1, y1, x2, y2, progress)
+        }
+    }
+}
+
+fn sample_cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, progress: f64) -> f64 {
+    if progress <= 0.0 || progress >= 1.0 {
+        return progress.clamp(0.0, 1.0);
+    }
+    let cx = 3.0 * x1;
+    let bx = 3.0 * (x2 - x1) - cx;
+    let ax = 1.0 - cx - bx;
+    let cy = 3.0 * y1;
+    let by = 3.0 * (y2 - y1) - cy;
+    let ay = 1.0 - cy - by;
+    let sample_x = |t: f64| ((ax * t + bx) * t + cx) * t;
+    let sample_y = |t: f64| ((ay * t + by) * t + cy) * t;
+    let sample_dx = |t: f64| (3.0 * ax * t + 2.0 * bx) * t + cx;
+    let mut t = progress;
+    for _ in 0..8 {
+        let estimate = sample_x(t) - progress;
+        if estimate.abs() < 1e-6 {
+            return sample_y(t).clamp(0.0, 1.0);
+        }
+        let derivative = sample_dx(t);
+        if derivative.abs() < 1e-6 {
+            break;
+        }
+        t -= estimate / derivative;
+    }
+    let mut lower = 0.0;
+    let mut upper = 1.0;
+    t = progress;
+    for _ in 0..12 {
+        let estimate = sample_x(t);
+        if (estimate - progress).abs() < 1e-7 {
+            break;
+        }
+        if progress > estimate {
+            lower = t;
+        } else {
+            upper = t;
+        }
+        t = (upper + lower) * 0.5;
+    }
+    sample_y(t).clamp(0.0, 1.0)
+}
+
+fn lerp(from: f64, to: f64, progress: f64) -> f64 {
+    from + (to - from) * progress
+}
+
+/// Composition priority for animations within a single window. Override
+/// channels run first (priority 0) so they set the *base* for the frame, then
+/// additive / subtractive / multiplicative channels (priority 1) compose
+/// their delta on top of that base. Tie-broken by `sequence` so newer
+/// animations within the same priority bucket override older ones.
+fn animation_mode_priority(animation: &ManagedWindowAnimationSnapshot) -> u8 {
+    let is_override = animation
+        .rect
+        .as_ref()
+        .map(|r| matches!(r.mode, ManagedWindowAnimationMode::Override))
+        .or_else(|| {
+            animation
+                .offset
+                .as_ref()
+                .map(|o| matches!(o.mode, ManagedWindowAnimationMode::Override))
+        })
+        .or_else(|| {
+            animation
+                .opacity
+                .as_ref()
+                .map(|o| matches!(o.mode, ManagedWindowAnimationMode::Override))
+        })
+        .unwrap_or(false);
+    if is_override { 0 } else { 1 }
 }
 
 fn managed_client_rect_for_state(

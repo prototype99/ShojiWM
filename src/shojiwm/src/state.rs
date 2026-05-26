@@ -93,9 +93,9 @@ use crate::runtime_process::{
 use crate::ssd::{
     BackgroundEffectConfig, DecorationEvaluator, DecorationInteractionSnapshot,
     DecorationInteractionTarget, DecorationPointerMoveAsyncInvocation, DecorationRuntimeEvaluator,
-    LogicalPoint, LogicalRect, NodeDecorationEvaluator, OutputModeSnapshot, OutputPositionSnapshot,
-    RuntimeEventConfigUpdate, WaylandOutputSnapshot, WaylandWindowSnapshot, WindowDecorationState,
-    WindowPositionSnapshot,
+    LogicalPoint, LogicalRect, ManagedWindowAnimationSnapshot, NodeDecorationEvaluator,
+    OutputModeSnapshot, OutputPositionSnapshot, RuntimeEventConfigUpdate, WaylandOutputSnapshot,
+    WaylandWindowSnapshot, WindowDecorationState, WindowPositionSnapshot,
 };
 use crate::xwayland_satellite::{SatelliteInstance, satellite_requested, spawn_satellite};
 use crate::{
@@ -180,6 +180,13 @@ pub struct PopupLifecycleDebugEntry {
     pub root_surface_id: Option<u32>,
     pub kind: &'static str,
     pub tracked_at: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveManagedWindowAnimation {
+    pub sequence: u64,
+    pub started_at_ms: u64,
+    pub animation: ManagedWindowAnimationSnapshot,
 }
 
 fn popup_lifecycle_debug_enabled() -> bool {
@@ -270,6 +277,8 @@ pub struct ShojiWM {
     pub runtime_managed_only_window_ids: std::collections::HashSet<String>,
     pub runtime_scheduler_enabled: bool,
     pub runtime_animation_outputs: std::collections::HashSet<String>,
+    pub managed_window_animations: HashMap<String, BTreeMap<String, ActiveManagedWindowAnimation>>,
+    pub managed_window_animation_sequence: u64,
     pub runtime_output_configs: std::collections::BTreeMap<String, RuntimeOutputConfig>,
     pub runtime_process_config_generation: u64,
     pub runtime_process_supervision_enabled: bool,
@@ -752,6 +761,8 @@ impl ShojiWM {
             runtime_managed_only_window_ids: Default::default(),
             runtime_scheduler_enabled: false,
             runtime_animation_outputs: Default::default(),
+            managed_window_animations: Default::default(),
+            managed_window_animation_sequence: 0,
             runtime_output_configs: Default::default(),
             runtime_process_config_generation: 0,
             runtime_process_supervision_enabled: false,
@@ -1166,8 +1177,23 @@ impl ShojiWM {
             .insert_source(Timer::immediate(), |_, _, state| {
                 state.record_event_source_wake("runtime-scheduler-timer");
                 state.refresh_runtime_processes();
-                if !state.runtime_scheduler_enabled && !state.runtime_process_supervision_enabled {
+                let managed_window_animation_active = !state.managed_window_animations.is_empty();
+                if !state.runtime_scheduler_enabled
+                    && !state.runtime_process_supervision_enabled
+                    && !managed_window_animation_active
+                {
                     return TimeoutAction::ToDuration(Duration::from_millis(250));
+                }
+
+                if managed_window_animation_active
+                    && !state.runtime_scheduler_enabled
+                    && !state.runtime_process_supervision_enabled
+                {
+                    state.request_tty_maintenance("managed-window-animation-tick");
+                    state.schedule_redraw();
+                    return TimeoutAction::ToDuration(Duration::from_millis(
+                        state.runtime_frame_sync_interval_ms(),
+                    ));
                 }
 
                 let now_ms = Duration::from(state.clock.now()).as_millis() as u64;

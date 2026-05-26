@@ -76,6 +76,10 @@ import {
   type WaylandWindowActions,
   type WaylandWindowSnapshot,
   type WindowEffectAssignment,
+  type ManagedWindowAnimationEasing,
+  type ManagedWindowPoint,
+  type ManagedWindowRect,
+  type ManagedWindowScheduleAnimationOptions,
   type ManagedWindowState,
   type WindowTransform,
 } from "shoji_wm";
@@ -273,6 +277,13 @@ interface EvaluateSuccess {
   dirtyNodeIds?: string[];
   managedWindowOnly?: boolean;
   nextPollInMs?: number;
+  // Window actions queued by user handlers during this evaluation (typically
+  // scheduleAnimation from onOpen/onFirstCommit). Returned here — rather than
+  // letting them sit in pendingActions until the next scheduler tick — so the
+  // compositor can apply them *before* sampling animations for the same
+  // refresh, eliminating the one-frame flash at the static target position
+  // before the open animation kicks in.
+  actions?: RuntimeWindowAction[];
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
@@ -314,8 +325,59 @@ interface WindowClosedSuccess {
 
 interface RuntimeWindowAction {
   windowId: string;
-  action: "close" | "finalizeClose" | "maximize" | "unmaximize" | "minimize" | "focus";
+  action:
+    | "close"
+    | "finalizeClose"
+    | "maximize"
+    | "unmaximize"
+    | "minimize"
+    | "focus"
+    | "scheduleAnimation"
+    | "cancelAnimation";
+  animation?: RuntimeManagedWindowAnimation;
+  channel?: string;
 }
+
+interface RuntimeManagedWindowAnimation {
+  channel: string;
+  rect?: {
+    from?: RuntimeManagedWindowRect;
+    to: RuntimeManagedWindowRect;
+    duration: number;
+    easing: RuntimeManagedWindowAnimationEasing;
+    mode: "override" | "add" | "sub";
+  };
+  offset?: {
+    from?: RuntimeManagedWindowPoint;
+    to: RuntimeManagedWindowPoint;
+    duration: number;
+    easing: RuntimeManagedWindowAnimationEasing;
+    mode: "override" | "add" | "sub";
+  };
+  opacity?: {
+    from?: number;
+    to: number;
+    duration: number;
+    easing: RuntimeManagedWindowAnimationEasing;
+    mode: "override" | "add" | "sub" | "multiply";
+  };
+}
+
+interface RuntimeManagedWindowRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface RuntimeManagedWindowPoint {
+  x: number;
+  y: number;
+}
+
+type RuntimeManagedWindowAnimationEasing =
+  | { kind: "linear" }
+  | { kind: "cubicBezier"; x1: number; y1: number; x2: number; y2: number };
 
 interface InvokeHandlerSuccess {
   requestId: number;
@@ -816,6 +878,14 @@ async function main() {
         const cached = request.kind === "evaluate"
           ? cacheByWindowId.get(request.snapshot.id)?.cache
           : undefined;
+        // Drain this window's queued actions so they ride along with the
+        // evaluation response (typically scheduleAnimation from onOpen /
+        // onFirstCommit). Without this they'd sit in pendingActions until the
+        // next scheduler tick, causing a one-frame flash at the static target.
+        const evaluationEntry = cacheByWindowId.get(request.snapshot.id);
+        const evaluationActions = evaluationEntry
+          ? evaluationEntry.pendingActions.splice(0, evaluationEntry.pendingActions.length)
+          : [];
         await writeResponse(output, {
           requestId: request.requestId,
           ok: true,
@@ -830,6 +900,7 @@ async function main() {
           nextPollInMs: request.kind === "evaluate"
             ? hasActiveAnimations() ? 0 : peekNextPollDelay()
             : undefined,
+          actions: evaluationActions.length > 0 ? evaluationActions : undefined,
           displayConfig: pendingDisplayConfigPayload(),
           keyBindingConfig,
           pointerConfig,
@@ -903,6 +974,12 @@ async function main() {
           const pointerConfig = pendingPointerConfigPayload();
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
+          // Same as evaluate: drain queued window actions (scheduleAnimation /
+          // cancelAnimation) so Rust sees them in lockstep with this evaluation.
+          const cachedEntry = cacheByWindowId.get(request.windowId);
+          const cachedActions = cachedEntry
+            ? cachedEntry.pendingActions.splice(0, cachedEntry.pendingActions.length)
+            : [];
           await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
@@ -914,6 +991,7 @@ async function main() {
             dirtyNodeIds: result.dirtyNodeIds,
             managedWindowOnly: result.managedWindowOnly,
             nextPollInMs: hasActiveAnimations() ? 0 : result.nextPollInMs,
+            actions: cachedActions.length > 0 ? cachedActions : undefined,
             displayConfig: pendingDisplayConfigPayload(),
             keyBindingConfig,
             pointerConfig,
@@ -1476,6 +1554,80 @@ function reanchorAnimationEntries(entries: Map<symbol, unknown>, nowMs: number):
   }
 }
 
+function serializeManagedWindowAnimation(
+  options: ManagedWindowScheduleAnimationOptions,
+): RuntimeManagedWindowAnimation {
+  return {
+    channel: options.channel ?? "default",
+    rect: options.rect
+      ? {
+          from: options.rect.from ? snapshotManagedWindowRectOption(options.rect.from) : undefined,
+          to: snapshotManagedWindowRectOption(options.rect.to),
+          duration: Math.max(1, Math.floor(options.rect.duration)),
+          easing: serializeManagedWindowEasing(options.rect.easing),
+          mode: options.rect.mode ?? "override",
+        }
+      : undefined,
+    offset: options.offset
+      ? {
+          from: options.offset.from ? snapshotManagedWindowPointOption(options.offset.from) : undefined,
+          to: snapshotManagedWindowPointOption(options.offset.to),
+          duration: Math.max(1, Math.floor(options.offset.duration)),
+          easing: serializeManagedWindowEasing(options.offset.easing),
+          mode: options.offset.mode ?? "add",
+        }
+      : undefined,
+    opacity: options.opacity
+      ? {
+          from: options.opacity.from === undefined ? undefined : read(options.opacity.from),
+          to: read(options.opacity.to),
+          duration: Math.max(1, Math.floor(options.opacity.duration)),
+          easing: serializeManagedWindowEasing(options.opacity.easing),
+          mode: options.opacity.mode ?? "multiply",
+        }
+      : undefined,
+  };
+}
+
+function snapshotManagedWindowRectOption(rect: ManagedWindowRect): RuntimeManagedWindowRect {
+  return {
+    x: read(rect.x),
+    y: read(rect.y),
+    width: read(rect.width),
+    height: read(rect.height),
+  };
+}
+
+function snapshotManagedWindowPointOption(point: ManagedWindowPoint): RuntimeManagedWindowPoint {
+  return {
+    x: read(point.x),
+    y: read(point.y),
+  };
+}
+
+function serializeManagedWindowEasing(
+  easing: ManagedWindowAnimationEasing | undefined,
+): RuntimeManagedWindowAnimationEasing {
+  if (!easing || easing === "linear") {
+    return { kind: "linear" };
+  }
+  if (typeof easing === "function") {
+    const bezier = (easing as {
+      __shojiCubicBezier?: readonly [number, number, number, number];
+    }).__shojiCubicBezier;
+    if (bezier) {
+      const [x1, y1, x2, y2] = bezier;
+      return { kind: "cubicBezier", x1, y1, x2, y2 };
+    }
+    console.warn("window.scheduleAnimation received a non-serializable easing; using linear");
+    return { kind: "linear" };
+  }
+  if (easing.kind === "cubicBezier") {
+    return easing;
+  }
+  return { kind: "linear" };
+}
+
 function createRuntimeCacheEntry(
   snapshot: WaylandWindowSnapshot,
   composition: WindowCompositionFunction,
@@ -1497,6 +1649,20 @@ function createRuntimeCacheEntry(
     },
     focus() {
       entry.pendingActions.push({ windowId: latestSnapshot.id, action: "focus" });
+    },
+    scheduleAnimation(options) {
+      entry.pendingActions.push({
+        windowId: latestSnapshot.id,
+        action: "scheduleAnimation",
+        animation: serializeManagedWindowAnimation(options),
+      });
+    },
+    cancelAnimation(channel) {
+      entry.pendingActions.push({
+        windowId: latestSnapshot.id,
+        action: "cancelAnimation",
+        channel,
+      });
     },
     setCloseAnimationDuration(durationMs) {
       entry.closeAnimationDurationMs = Math.max(0, Math.floor(durationMs));

@@ -227,6 +227,97 @@ pub struct ManagedWindowRectSnapshot {
     pub height: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedWindowPointSnapshot {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ManagedWindowAnimationMode {
+    Override,
+    Add,
+    Sub,
+    Multiply,
+}
+
+impl Default for ManagedWindowAnimationMode {
+    fn default() -> Self {
+        Self::Override
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ManagedWindowAnimationEasingSnapshot {
+    Linear,
+    CubicBezier { x1: f64, y1: f64, x2: f64, y2: f64 },
+}
+
+impl Default for ManagedWindowAnimationEasingSnapshot {
+    fn default() -> Self {
+        Self::Linear
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedWindowRectAnimationSnapshot {
+    #[serde(default)]
+    pub from: Option<ManagedWindowRectSnapshot>,
+    pub to: ManagedWindowRectSnapshot,
+    pub duration: u64,
+    #[serde(default)]
+    pub easing: ManagedWindowAnimationEasingSnapshot,
+    #[serde(default)]
+    pub mode: ManagedWindowAnimationMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedWindowPointAnimationSnapshot {
+    #[serde(default)]
+    pub from: Option<ManagedWindowPointSnapshot>,
+    pub to: ManagedWindowPointSnapshot,
+    pub duration: u64,
+    #[serde(default)]
+    pub easing: ManagedWindowAnimationEasingSnapshot,
+    #[serde(default)]
+    pub mode: ManagedWindowAnimationMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedWindowScalarAnimationSnapshot {
+    #[serde(default)]
+    pub from: Option<f64>,
+    pub to: f64,
+    pub duration: u64,
+    #[serde(default)]
+    pub easing: ManagedWindowAnimationEasingSnapshot,
+    #[serde(default)]
+    pub mode: ManagedWindowAnimationMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedWindowAnimationSnapshot {
+    #[serde(default = "default_animation_channel")]
+    pub channel: String,
+    #[serde(default)]
+    pub rect: Option<ManagedWindowRectAnimationSnapshot>,
+    #[serde(default)]
+    pub offset: Option<ManagedWindowPointAnimationSnapshot>,
+    #[serde(default)]
+    pub opacity: Option<ManagedWindowScalarAnimationSnapshot>,
+}
+
+fn default_animation_channel() -> String {
+    "default".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WaylandLayerSnapshot {
@@ -422,6 +513,8 @@ pub enum WaylandWindowAction {
     Unmaximize,
     Minimize,
     Focus,
+    ScheduleAnimation,
+    CancelAnimation,
 }
 
 impl ShojiWM {
@@ -789,6 +882,10 @@ mod tests {
         let minimize =
             serde_json::to_string(&WaylandWindowAction::Minimize).expect("serialize minimize");
         let focus = serde_json::to_string(&WaylandWindowAction::Focus).expect("serialize focus");
+        let schedule_animation = serde_json::to_string(&WaylandWindowAction::ScheduleAnimation)
+            .expect("serialize schedule animation");
+        let cancel_animation = serde_json::to_string(&WaylandWindowAction::CancelAnimation)
+            .expect("serialize cancel animation");
 
         assert_eq!(close, "\"close\"");
         assert_eq!(finalize_close, "\"finalizeClose\"");
@@ -796,5 +893,7 @@ mod tests {
         assert_eq!(unmaximize, "\"unmaximize\"");
         assert_eq!(minimize, "\"minimize\"");
         assert_eq!(focus, "\"focus\"");
+        assert_eq!(schedule_animation, "\"scheduleAnimation\"");
+        assert_eq!(cancel_animation, "\"cancelAnimation\"");
     }
 }

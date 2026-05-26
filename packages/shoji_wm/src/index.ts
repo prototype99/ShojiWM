@@ -22,6 +22,14 @@ import type {
   ButtonProps,
   LabelProps,
   ManagedWindowProps,
+  ManagedWindowAnimationEasing,
+  ManagedWindowAnimationMode,
+  ManagedWindowPoint,
+  ManagedWindowPointAnimationOptions,
+  ManagedWindowRect,
+  ManagedWindowRectAnimationOptions,
+  ManagedWindowScalarAnimationOptions,
+  ManagedWindowScheduleAnimationOptions,
   ManagedWindowState,
   ManagedWindowTransform,
   MaybeSignal,
@@ -187,6 +195,7 @@ export {
   easeOutCubic,
   easeOutExpo,
   linear,
+  type CubicBezierEasingFunction,
   type EasingFunction,
 } from "./easing";
 export {

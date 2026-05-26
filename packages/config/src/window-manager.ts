@@ -1,4 +1,4 @@
-import { animationVariable, createManagedPoll, createWindowStack, createWindowState, cubicBezier, effect, read, seconds, WINDOW_MANAGER, type PointerMoveEvent, type PollHandle, type ReadonlySignal, type WaylandWindow, type WindowActivateRequestEvent, type WindowMaximizeRequestEvent, type WindowMinimizeRequestEvent, type WindowMoveEvent, type WindowResizeEvent, type WindowResizeRect, type WindowStateKey } from "shoji_wm";
+import { createWindowStack, createWindowState, cubicBezier, read, seconds, WINDOW_MANAGER, type EasingFunction, type PointerMoveEvent, type ReadonlySignal, type WaylandWindow, type WindowActivateRequestEvent, type WindowMaximizeRequestEvent, type WindowMinimizeRequestEvent, type WindowMoveEvent, type WindowResizeEvent, type WindowResizeRect } from "shoji_wm";
 import type { ManagedWindowRect, WindowSizeConstraints } from "shoji_wm/types";
 import { playRectAnimation, stopRectAnimation } from "./window-animation";
 
@@ -74,7 +74,11 @@ function rectForDebug(rect: ManagedWindowRect) {
     };
 }
 
-export const OPEN_ANIMATION = animationVariable("window.open");
+const OPEN_ANIMATION_CHANNEL = "window.open";
+const CLOSE_ANIMATION_CHANNEL = "window.close";
+const WORKSPACE_VISUAL_ANIMATION_CHANNEL = "workspace.visual";
+const WORKSPACE_VISUAL_RECT_ANIMATION_CHANNEL = `${WORKSPACE_VISUAL_ANIMATION_CHANNEL}.rect`;
+const WORKSPACE_VISUAL_OPACITY_ANIMATION_CHANNEL = `${WORKSPACE_VISUAL_ANIMATION_CHANNEL}.opacity`;
 export const WINDOW_BORDER_PX = 2;
 export const TITLEBAR_HEIGHT = 30;
 export const MAXIMIZED_WINDOW_PADDING = {
@@ -120,11 +124,6 @@ export class HybridWindowManager {
         this.windowStack.add(window);
 
         window.setCloseAnimationDuration(OPEN_CLOSE_ANIMATION_DURATION);
-        window.animation.start(OPEN_ANIMATION, {
-            duration: OPEN_CLOSE_ANIMATION_DURATION,
-            to: 1,
-            easing: WINDOW_MANAGEMENT_EASING,
-        });
     }
 
     public onFirstCommit(window: WaylandWindow) {
@@ -150,14 +149,11 @@ export class HybridWindowManager {
             window.state[WINDOW_STATE_RECT].set(this.maximizedRectForWindow(window));
             window.state[WINDOW_STATE_MAXIMIZED].set(true);
         }
+        scheduleOpenAnimation(window);
     }
 
     public onStartClose(window: WaylandWindow) {
-        window.animation.start(OPEN_ANIMATION, {
-            duration: OPEN_CLOSE_ANIMATION_DURATION,
-            to: 0,
-            easing: WINDOW_CLOSE_EASING,
-        });
+        scheduleCloseAnimation(window);
 
         for (const workspace of this.workspaces.values()) {
             const nextFocus = workspace.removeWindow(window);
@@ -397,51 +393,49 @@ export class HybridWindowManager {
     }
 
     public switchWorkspace(direction: -1 | 1) {
-        withManagedWindowOnlySSDRebuildSuppressed(() => {
-            this.syncWorkspaces();
-            const monitor = this.currentMonitor || WINDOW_MANAGER.output.list.at(0);
-            if (!monitor) {
-                return;
+        this.syncWorkspaces();
+        const monitor = this.currentMonitor || WINDOW_MANAGER.output.list.at(0);
+        if (!monitor) {
+            return;
+        }
+
+        const currentIndex = this.activeWorkspaceByMonitor.get(monitor) ?? 1;
+        const nextIndex = Math.max(1, currentIndex + direction);
+        if (nextIndex === currentIndex) {
+            return;
+        }
+
+        const fromWorkspace = this.ensureWorkspace(monitor, currentIndex);
+        const toWorkspace = this.ensureWorkspace(monitor, nextIndex);
+        const distance = this.workspaceTransitionDistance(monitor);
+
+        this.activeWorkspaceByMonitor.set(monitor, nextIndex);
+        this.currentMonitor = monitor;
+
+        for (const workspace of this.workspaces.values()) {
+            if (workspace === fromWorkspace || workspace === toWorkspace) {
+                continue;
             }
+            workspace.setVisible(workspace.isActive());
+        }
 
-            const currentIndex = this.activeWorkspaceByMonitor.get(monitor) ?? 1;
-            const nextIndex = Math.max(1, currentIndex + direction);
-            if (nextIndex === currentIndex) {
-                return;
-            }
-
-            const fromWorkspace = this.ensureWorkspace(monitor, currentIndex);
-            const toWorkspace = this.ensureWorkspace(monitor, nextIndex);
-            const distance = this.workspaceTransitionDistance(monitor);
-
-            this.activeWorkspaceByMonitor.set(monitor, nextIndex);
-            this.currentMonitor = monitor;
-
-            for (const workspace of this.workspaces.values()) {
-                if (workspace === fromWorkspace || workspace === toWorkspace) {
-                    continue;
-                }
-                workspace.setVisible(workspace.isActive());
-            }
-
-            fromWorkspace.animateWorkspaceTransition({
-                fromOffsetY: 0,
-                toOffsetY: -direction * distance,
-                fromOpacity: 1,
-                toOpacity: 0,
-                visibleAfter: false,
-            });
-            toWorkspace.prepareWorkspaceTransition(direction * distance, 0);
-            toWorkspace.applyLayout();
-            toWorkspace.animateWorkspaceTransition({
-                fromOffsetY: direction * distance,
-                toOffsetY: 0,
-                fromOpacity: 0,
-                toOpacity: 1,
-                visibleAfter: true,
-            });
-            toWorkspace.focusActiveWindow();
+        fromWorkspace.animateWorkspaceTransition({
+            fromOffsetY: 0,
+            toOffsetY: -direction * distance,
+            fromOpacity: 1,
+            toOpacity: 0,
+            visibleAfter: false,
         });
+        toWorkspace.prepareWorkspaceTransition(direction * distance, 0);
+        toWorkspace.applyLayout();
+        toWorkspace.animateWorkspaceTransition({
+            fromOffsetY: direction * distance,
+            toOffsetY: 0,
+            fromOpacity: 0,
+            toOpacity: 1,
+            visibleAfter: true,
+        });
+        toWorkspace.focusActiveWindow();
     }
 
     public getCurrentWorkspace(): Workspace | undefined {
@@ -725,7 +719,7 @@ export class Workspace {
             workspace: this.index,
             tiled: this.isTiled,
             beforeCount: this.windows.length,
-            openRunning: window.animation.running(OPEN_ANIMATION),
+            openRunning: false,
             rect: rectForDebug(window.rect),
             position: { ...window.position },
         });
@@ -846,23 +840,14 @@ export class Workspace {
                 continue;
             }
             window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
-            playNumberStateAnimation(
+            scheduleWorkspaceVisualAnimation(
                 window,
-                WINDOW_STATE_WORKSPACE_OFFSET_Y,
                 options.fromOffsetY,
                 options.toOffsetY,
-                WINDOW_MANAGEMENT_EASING,
-                WORKSPACE_SWITCH_ANIMATION_DURATION,
-                MANAGED_WINDOW_ONLY_ANIMATION,
-            );
-            playNumberStateAnimation(
-                window,
-                WINDOW_STATE_WORKSPACE_OPACITY,
                 options.fromOpacity,
                 options.toOpacity,
                 WINDOW_MANAGEMENT_EASING,
                 WORKSPACE_SWITCH_ANIMATION_DURATION,
-                MANAGED_WINDOW_ONLY_ANIMATION,
             );
         }
 
@@ -978,7 +963,7 @@ export class Workspace {
                     monitor: this.monitor,
                     workspace: this.index,
                     index,
-                    openRunning: window.animation.running(OPEN_ANIMATION),
+                    openRunning: false,
                     maximized: window.state[WINDOW_STATE_MAXIMIZED](),
                     targetRect: rectForDebug(rect),
                     usingSuppression: animationOptions !== undefined,
@@ -1131,7 +1116,7 @@ export class Workspace {
         // icons, and shader inputs. SSD rebuild suppression is global, so using
         // it for existing windows' layout animation would also hide those
         // initial decoration updates until an unrelated interaction occurs.
-        return !tileable.some((window) => window.animation.running(OPEN_ANIMATION));
+        return true;
     }
 
     private tileableWindows(): WaylandWindow[] {
@@ -1396,91 +1381,82 @@ function withManagedWindowOnlySSDRebuildSuppressed<T>(callback: () => T): T {
     );
 }
 
-const numberAnimationVariableByStateKey = new Map<symbol, ReturnType<typeof animationVariable>>();
-const activeNumberAnimations = new WeakMap<WaylandWindow, Map<symbol, () => void>>();
+// Rect deltas use `add` so open/close/workspace motion can layer on top of
+// override-mode layout animation. Open/close opacity uses `multiply`; workspace
+// opacity is a separate override channel so an inactive workspace whose base
+// opacity is already 0 can still fade back in deterministically.
 
-interface NumberStateAnimationOptions {
-    suppressSSDRebuild?: boolean;
-}
-
-function getNumberAnimationVariable(stateKey: symbol): ReturnType<typeof animationVariable> {
-    let variable = numberAnimationVariableByStateKey.get(stateKey);
-    if (!variable) {
-        variable = animationVariable(`number-anim:${stateKey.description ?? "anon"}`);
-        numberAnimationVariableByStateKey.set(stateKey, variable);
-    }
-    return variable;
-}
-
-function playNumberStateAnimation(
-    window: WaylandWindow,
-    stateKey: WindowStateKey<number>,
-    from: number,
-    to: number,
-    easing: (progress: number) => number,
-    duration: number,
-    options: NumberStateAnimationOptions = {},
-): void {
-    const variable = getNumberAnimationVariable(stateKey);
-    let perWindow = activeNumberAnimations.get(window);
-    if (!perWindow) {
-        perWindow = new Map();
-        activeNumberAnimations.set(window, perWindow);
-    }
-
-    perWindow.get(stateKey)?.();
-    const suppression = options.suppressSSDRebuild
-        ? WINDOW_MANAGER.runtime.suppressSSDRebuild({
-            ...MANAGED_WINDOW_ONLY_REBUILD_SUPPRESSION,
-            windowIds: [window.id],
-        })
-        : null;
-    debugSSD("number-animation-start", {
-        windowId: window.id,
-        stateKey: stateKey.description,
-        from,
-        to,
-        suppressSSDRebuild: options.suppressSSDRebuild === true,
-    });
-    window.state[stateKey].set(from);
-    window.animation.set(variable, 0);
-
-    const progress = window.animation.signal(variable);
-    const dispose = effect(() => {
-        window.state[stateKey].set(from + (to - from) * progress());
-    });
-
-    let poll: PollHandle | null = null;
-    const teardown = () => {
-        poll?.cancel();
-        poll = null;
-        dispose();
-        suppression?.release();
-        debugSSD("number-animation-teardown", {
-            windowId: window.id,
-            stateKey: stateKey.description,
-            current: window.state[stateKey](),
-        });
-        if (perWindow!.get(stateKey) === teardown) {
-            perWindow!.delete(stateKey);
-        }
-    };
-    poll = createManagedPoll(
-        1,
-        () => {
-            if (window.animation.running(variable)) {
-                return;
-            }
-            teardown();
+function scheduleOpenAnimation(window: WaylandWindow): void {
+    window.scheduleAnimation({
+        channel: OPEN_ANIMATION_CHANNEL,
+        rect: {
+            from: { x: 0, y: 200, width: 0, height: 0 },
+            to: { x: 0, y: 0, width: 0, height: 0 },
+            duration: OPEN_CLOSE_ANIMATION_DURATION,
+            easing: WINDOW_MANAGEMENT_EASING,
+            mode: "add",
         },
-        "none",
-    );
-    perWindow.set(stateKey, teardown);
+        opacity: {
+            from: 0,
+            to: 1,
+            duration: OPEN_CLOSE_ANIMATION_DURATION,
+            easing: WINDOW_MANAGEMENT_EASING,
+            mode: "multiply",
+        },
+    });
+}
 
-    window.animation.start(variable, {
-        duration,
-        from: 0,
-        to: 1,
-        easing,
+function scheduleCloseAnimation(window: WaylandWindow): void {
+    window.scheduleAnimation({
+        channel: CLOSE_ANIMATION_CHANNEL,
+        rect: {
+            from: { x: 0, y: 0, width: 0, height: 0 },
+            to: { x: 0, y: 120, width: 0, height: 0 },
+            duration: OPEN_CLOSE_ANIMATION_DURATION,
+            easing: WINDOW_CLOSE_EASING,
+            mode: "add",
+        },
+        opacity: {
+            from: 1,
+            to: 0,
+            duration: OPEN_CLOSE_ANIMATION_DURATION,
+            easing: WINDOW_CLOSE_EASING,
+            mode: "multiply",
+        },
+    });
+}
+
+function scheduleWorkspaceVisualAnimation(
+    window: WaylandWindow,
+    fromOffsetY: number,
+    toOffsetY: number,
+    fromOpacity: number,
+    toOpacity: number,
+    easing: EasingFunction,
+    duration: number,
+): void {
+    window.cancelAnimation(WORKSPACE_VISUAL_ANIMATION_CHANNEL);
+    window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(toOffsetY);
+    window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(toOpacity);
+
+    window.scheduleAnimation({
+        channel: WORKSPACE_VISUAL_RECT_ANIMATION_CHANNEL,
+        rect: {
+            from: { x: 0, y: fromOffsetY, width: 0, height: 0 },
+            to: { x: 0, y: toOffsetY, width: 0, height: 0 },
+            duration,
+            easing,
+            mode: "add",
+        },
+    });
+    window.scheduleAnimation({
+        channel: WORKSPACE_VISUAL_OPACITY_ANIMATION_CHANNEL,
+        opacity: {
+            from: fromOpacity,
+            to: toOpacity,
+            duration,
+            easing,
+            mode: "override",
+        },
     });
 }

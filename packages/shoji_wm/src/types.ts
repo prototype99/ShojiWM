@@ -114,6 +114,8 @@ export interface WaylandWindow {
   unmaximize(): void;
   minimize(): void;
   focus(): void;
+  scheduleAnimation(options: ManagedWindowScheduleAnimationOptions): void;
+  cancelAnimation(channel?: string): void;
   setCloseAnimationDuration(durationMs: number): void;
   isXWayland(): boolean;
 }
@@ -177,6 +179,56 @@ export interface ManagedWindowRect {
   y: MaybeSignal<number>;
   width: MaybeSignal<number>;
   height: MaybeSignal<number>;
+}
+
+export interface ManagedWindowPoint {
+  x: MaybeSignal<number>;
+  y: MaybeSignal<number>;
+}
+
+export type ManagedWindowAnimationMode = "override" | "add" | "sub" | "multiply";
+
+export type ManagedWindowAnimationEasing =
+  | "linear"
+  | import("./easing").EasingFunction
+  | { kind: "linear" }
+  | {
+      kind: "cubicBezier";
+      x1: number;
+      y1: number;
+      x2: number;
+      y2: number;
+    };
+
+export interface ManagedWindowRectAnimationOptions {
+  from?: ManagedWindowRect;
+  to: ManagedWindowRect;
+  duration: number;
+  easing?: ManagedWindowAnimationEasing;
+  mode?: Exclude<ManagedWindowAnimationMode, "multiply">;
+}
+
+export interface ManagedWindowPointAnimationOptions {
+  from?: ManagedWindowPoint;
+  to: ManagedWindowPoint;
+  duration: number;
+  easing?: ManagedWindowAnimationEasing;
+  mode?: Exclude<ManagedWindowAnimationMode, "multiply">;
+}
+
+export interface ManagedWindowScalarAnimationOptions {
+  from?: MaybeSignal<number>;
+  to: MaybeSignal<number>;
+  duration: number;
+  easing?: ManagedWindowAnimationEasing;
+  mode?: ManagedWindowAnimationMode;
+}
+
+export interface ManagedWindowScheduleAnimationOptions {
+  channel?: string;
+  rect?: ManagedWindowRectAnimationOptions;
+  offset?: ManagedWindowPointAnimationOptions;
+  opacity?: ManagedWindowScalarAnimationOptions;
 }
 
 export interface ManagedWindowTransform {
@@ -877,6 +929,8 @@ export interface WaylandWindowActions {
   unmaximize(): void;
   minimize(): void;
   focus(): void;
+  scheduleAnimation(options: ManagedWindowScheduleAnimationOptions): void;
+  cancelAnimation(channel?: string): void;
   setCloseAnimationDuration(durationMs: number): void;
   isXWayland(): boolean;
 }

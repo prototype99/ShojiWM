@@ -1,38 +1,22 @@
 import {
-    type AnimationVariable,
+    read,
+    type EasingFunction,
     type WaylandWindow,
     type WindowStateKey,
-    WINDOW_MANAGER,
-    animationVariable,
-    computed,
-    createManagedPoll,
-    read,
-    type PollHandle,
 } from "shoji_wm";
 import type { ManagedWindowRect } from "shoji_wm/types";
 
-// One animation variable per rect-state key. Sharing across windows is fine
-// because window.animation is per-window — same id, isolated progress.
-// Different state keys get different vars so concurrent animations don't
-// trample each other's progress.
-const rectAnimationVariableByStateKey = new Map<symbol, AnimationVariable>();
-
-// Per-(window, state-key) teardown for the currently-running rect animation.
-// WeakMap on the window so entries vanish when the window does.
-const activeRectAnimations = new WeakMap<WaylandWindow, Map<symbol, () => void>>();
 export interface RectAnimationOptions {
     suppressSSDRebuild?: boolean;
 }
 
-function debugSSD(message: string, details: Record<string, unknown> = {}) {
-    const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
-    if (!env?.SHOJI_SSD_SUPPRESSION_DEBUG) {
-        return;
-    }
-    console.info(`ssd-suppression ${message}`, JSON.stringify(details));
+const lastRectAnimationTargetByWindow = new WeakMap<WaylandWindow, Map<symbol, ManagedWindowRect>>();
+
+function rectAnimationChannel(windowRectState: WindowStateKey<ManagedWindowRect>): string {
+    return `rect:${windowRectState.description ?? "anon"}`;
 }
 
-function snapshotRectForDebug(rect: ManagedWindowRect) {
+function snapshotRect(rect: ManagedWindowRect): ManagedWindowRect {
     return {
         x: read(rect.x),
         y: read(rect.y),
@@ -41,121 +25,70 @@ function snapshotRectForDebug(rect: ManagedWindowRect) {
     };
 }
 
-function getRectAnimationVariable(stateKey: symbol): AnimationVariable {
-    let variable = rectAnimationVariableByStateKey.get(stateKey);
-    if (!variable) {
-        variable = animationVariable(`rect-anim:${stateKey.description ?? "anon"}`);
-        rectAnimationVariableByStateKey.set(stateKey, variable);
-    }
-    return variable;
+function sameRect(a: ManagedWindowRect, b: ManagedWindowRect): boolean {
+    return read(a.x) === read(b.x)
+        && read(a.y) === read(b.y)
+        && read(a.width) === read(b.width)
+        && read(a.height) === read(b.height);
 }
 
-/**
- * Drive `window.state[windowRectState]` from its current rect to `to` over
- * `duration` ms, applying `easing` to the progress. The state is replaced
- * once with per-field computed signals, so each animation frame only updates
- * the animation variable instead of also writing the window state signal.
- *
- * Calling again while an animation is in flight cancels the previous one
- * and retargets from the rect's current (possibly mid-lerp) value — so
- * `playRectAnimation(window, KEY, A, ...)` followed immediately by
- * `playRectAnimation(window, KEY, B, ...)` slides smoothly toward B
- * without snapping.
- *
- * Both `to` and the current state may use `MaybeSignal<number>` fields;
- * they are resolved to plain numbers at the moment the animation starts.
- */
+function lastRectTarget(window: WaylandWindow, windowRectState: WindowStateKey<ManagedWindowRect>): ManagedWindowRect | undefined {
+    return lastRectAnimationTargetByWindow.get(window)?.get(windowRectState);
+}
+
+function setLastRectTarget(
+    window: WaylandWindow,
+    windowRectState: WindowStateKey<ManagedWindowRect>,
+    target: ManagedWindowRect | undefined,
+): void {
+    let perWindow = lastRectAnimationTargetByWindow.get(window);
+    if (!perWindow) {
+        perWindow = new Map();
+        lastRectAnimationTargetByWindow.set(window, perWindow);
+    }
+
+    if (target) {
+        perWindow.set(windowRectState, target);
+    } else {
+        perWindow.delete(windowRectState);
+    }
+}
+
 export function playRectAnimation(
     window: WaylandWindow,
     windowRectState: WindowStateKey<ManagedWindowRect>,
     to: ManagedWindowRect,
-    easing: (progress: number) => number,
+    easing: EasingFunction,
     duration: number,
-    options: RectAnimationOptions = {},
+    _options: RectAnimationOptions = {},
 ): void {
-    const variable = getRectAnimationVariable(windowRectState);
+    const from = snapshotRect(window.state[windowRectState]());
+    const target = snapshotRect(to);
 
-    let perWindow = activeRectAnimations.get(window);
-    if (!perWindow) {
-        perWindow = new Map();
-        activeRectAnimations.set(window, perWindow);
+    // Layout/focus updates can ask for the same target repeatedly while Rust is
+    // already interpolating toward it. Re-scheduling the same channel in that
+    // case races with focus-driven reevaluations and can leave one window using
+    // an older animated rect for a frame. Treat rect animation requests as
+    // idempotent at the declarative target level.
+    const previousTarget = lastRectTarget(window, windowRectState);
+    if (previousTarget && sameRect(previousTarget, target) && sameRect(from, target)) {
+        return;
     }
-    const previous = perWindow.get(windowRectState);
-    previous?.();
-    const suppression = options.suppressSSDRebuild
-        ? WINDOW_MANAGER.runtime.suppressSSDRebuild({
-            allowManagedWindowOnly: true,
-            onViolation: "fallback-last",
-            windowIds: [window.id],
-        })
-        : null;
 
-    const currentRect = window.state[windowRectState]();
-    const from = {
-        x: read(currentRect.x),
-        y: read(currentRect.y),
-        width: read(currentRect.width),
-        height: read(currentRect.height),
-    };
-    const target = {
-        x: read(to.x),
-        y: read(to.y),
-        width: read(to.width),
-        height: read(to.height),
-    };
-    debugSSD("rect-animation-start", {
-        windowId: window.id,
-        stateKey: windowRectState.description,
-        hadPrevious: previous !== undefined,
-        suppressSSDRebuild: options.suppressSSDRebuild === true,
-        from,
-        target,
-    });
-
-    // Snap the variable to 0 *before* subscribing so the first effect tick
-    // writes the from-rect verbatim. Without this, a prior animation that
-    // ended at 1 would cause a one-frame jump to the target.
-    window.animation.set(variable, 0);
-
-    const progress = window.animation.signal(variable);
-    window.state[windowRectState].set({
-        x: computed(() => from.x + (target.x - from.x) * progress()),
-        y: computed(() => from.y + (target.y - from.y) * progress()),
-        width: computed(() => from.width + (target.width - from.width) * progress()),
-        height: computed(() => from.height + (target.height - from.height) * progress()),
-    });
-
-    let poll: PollHandle | null = null;
-    const teardown = () => {
-        poll?.cancel();
-        poll = null;
-        suppression?.release();
-        debugSSD("rect-animation-teardown", {
-            windowId: window.id,
-            stateKey: windowRectState.description,
-            current: snapshotRectForDebug(window.state[windowRectState]()),
-        });
-        if (perWindow!.get(windowRectState) === teardown) {
-            perWindow!.delete(windowRectState);
-        }
-    };
-    poll = createManagedPoll(
-        1,
-        () => {
-            if (window.animation.running(variable)) {
-                return;
-            }
-            teardown();
+    // TS keeps the declarative target. Rust owns the frame-by-frame visual
+    // interpolation and falls back to this target when the scheduled animation
+    // finishes or is cancelled.
+    window.state[windowRectState].set(target);
+    setLastRectTarget(window, windowRectState, target);
+    window.scheduleAnimation({
+        channel: rectAnimationChannel(windowRectState),
+        rect: {
+            from,
+            to: target,
+            duration,
+            easing,
+            mode: "override",
         },
-        "none",
-    );
-    perWindow.set(windowRectState, teardown);
-
-    window.animation.start(variable, {
-        duration,
-        from: 0,
-        to: 1,
-        easing,
     });
 }
 
@@ -163,5 +96,6 @@ export function stopRectAnimation(
     window: WaylandWindow,
     windowRectState: WindowStateKey<ManagedWindowRect>,
 ): void {
-    activeRectAnimations.get(window)?.get(windowRectState)?.();
+    setLastRectTarget(window, windowRectState, undefined);
+    window.cancelAnimation(rectAnimationChannel(windowRectState));
 }

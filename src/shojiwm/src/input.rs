@@ -893,6 +893,23 @@ impl ShojiWM {
                 continue;
             }
 
+            match runtime_action.action {
+                crate::ssd::WaylandWindowAction::ScheduleAnimation => {
+                    if let Some(animation) = runtime_action.animation {
+                        self.schedule_managed_window_animation(runtime_action.window_id, animation);
+                    }
+                    continue;
+                }
+                crate::ssd::WaylandWindowAction::CancelAnimation => {
+                    self.cancel_managed_window_animation(
+                        &runtime_action.window_id,
+                        runtime_action.channel.as_deref(),
+                    );
+                    continue;
+                }
+                _ => {}
+            }
+
             let target_window = self
                 .space
                 .elements()
@@ -928,6 +945,8 @@ impl ShojiWM {
                     self.focus_window(&window, serial);
                 }
                 crate::ssd::WaylandWindowAction::FinalizeClose => {}
+                crate::ssd::WaylandWindowAction::ScheduleAnimation
+                | crate::ssd::WaylandWindowAction::CancelAnimation => {}
                 crate::ssd::WaylandWindowAction::Minimize => {
                     self.request_window_minimize(
                         &window,

@@ -13,10 +13,10 @@ use std::{
 use tracing::{debug, error, info, warn};
 
 use super::window_model::{
-    ManagedWindowState, PointerMoveEventSnapshot, WaylandLayerSnapshot, WaylandOutputSnapshot,
-    WaylandWindowAction, WaylandWindowSnapshot, WindowActivateRequestEventSnapshot,
-    WindowMaximizeRequestEventSnapshot, WindowMinimizeRequestEventSnapshot,
-    WindowMoveEventSnapshot, WindowResizeEventSnapshot,
+    ManagedWindowAnimationSnapshot, ManagedWindowState, PointerMoveEventSnapshot,
+    WaylandLayerSnapshot, WaylandOutputSnapshot, WaylandWindowAction, WaylandWindowSnapshot,
+    WindowActivateRequestEventSnapshot, WindowMaximizeRequestEventSnapshot,
+    WindowMinimizeRequestEventSnapshot, WindowMoveEventSnapshot, WindowResizeEventSnapshot,
 };
 use super::{
     BackgroundEffectConfig, DecorationBridgeError, DecorationLayoutError, DecorationNode,
@@ -168,6 +168,12 @@ pub struct DecorationEvaluationResult {
     pub window_effects: Option<WindowEffectConfig>,
     pub dirty_node_ids: Vec<String>,
     pub next_poll_in_ms: Option<u64>,
+    /// Window actions (typically scheduleAnimation / cancelAnimation) queued
+    /// by user handlers during this evaluation. Returned in-band so the
+    /// compositor can apply them *before* sampling animations for the same
+    /// refresh — fixing the one-frame flash at the static target position
+    /// before open / first-commit animations kick in.
+    pub actions: Vec<RuntimeWindowAction>,
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
@@ -185,6 +191,8 @@ pub struct DecorationCachedEvaluationResult {
     pub dirty_node_ids: Vec<String>,
     pub managed_window_only: bool,
     pub next_poll_in_ms: Option<u64>,
+    /// See `DecorationEvaluationResult::actions`. Same role on the cached path.
+    pub actions: Vec<RuntimeWindowAction>,
     pub display_config: Option<RuntimeDisplayConfigUpdate>,
     pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
     pub pointer_config: Option<RuntimePointerConfigUpdate>,
@@ -203,6 +211,7 @@ impl From<DecorationEvaluationResult> for DecorationCachedEvaluationResult {
             dirty_node_ids: result.dirty_node_ids,
             managed_window_only: false,
             next_poll_in_ms: result.next_poll_in_ms,
+            actions: result.actions,
             display_config: result.display_config,
             key_binding_config: result.key_binding_config,
             pointer_config: result.pointer_config,
@@ -364,11 +373,15 @@ pub struct RuntimeLayerEffectAssignment {
     pub effect: Option<BackgroundEffectConfig>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct RuntimeWindowAction {
     #[serde(rename = "windowId")]
     pub window_id: String,
     pub action: WaylandWindowAction,
+    #[serde(default)]
+    pub animation: Option<ManagedWindowAnimationSnapshot>,
+    #[serde(default)]
+    pub channel: Option<String>,
 }
 
 /// Temporary Rust-side evaluator that mirrors the intended TS-level behavior:
@@ -461,6 +474,7 @@ impl DecorationEvaluator for StaticDecorationEvaluator {
             window_effects: None,
             dirty_node_ids: Vec::new(),
             next_poll_in_ms: None,
+            actions: Vec::new(),
             display_config: None,
             key_binding_config: None,
             pointer_config: None,
@@ -737,6 +751,7 @@ struct RuntimeEvaluateResponse {
     managed_window_only: Option<bool>,
     #[serde(rename = "nextPollInMs")]
     next_poll_in_ms: Option<u64>,
+    actions: Option<Vec<RuntimeWindowAction>>,
     #[serde(rename = "displayConfig")]
     display_config: Option<RuntimeDisplayConfigUpdate>,
     #[serde(rename = "keyBindingConfig")]
@@ -1763,6 +1778,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
                 .map_err(DecorationEvaluationError::Bridge)?,
             dirty_node_ids: response.dirty_node_ids.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,
+            actions: response.actions.unwrap_or_default(),
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
@@ -1856,6 +1872,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
                 .map_err(DecorationEvaluationError::Bridge)?,
             dirty_node_ids: response.dirty_node_ids.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,
+            actions: response.actions.unwrap_or_default(),
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
@@ -1958,6 +1975,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             dirty_node_ids: response.dirty_node_ids.unwrap_or_default(),
             managed_window_only,
             next_poll_in_ms: response.next_poll_in_ms,
+            actions: response.actions.unwrap_or_default(),
             display_config: response.display_config,
             key_binding_config: response.key_binding_config,
             pointer_config: response.pointer_config,
