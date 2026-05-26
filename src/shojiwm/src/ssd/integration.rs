@@ -345,6 +345,17 @@ pub struct WindowDecorationState {
     /// workspace-switch animation must still be renderable while it is bringing
     /// an idle window back on screen.
     pub managed_window_animation_active: bool,
+    /// The client size (width, height) most recently delivered via xdg /
+    /// X11 configure. Tracked separately from `client_rect` because we want
+    /// to keep the client configured at the animation's final target size for
+    /// the entire animation — sending the animated intermediate size each
+    /// frame would make the client buffer chase a moving target and the
+    /// compositor would scale the lagging buffer up to fit, producing the
+    /// "buffer stretched" visual. By pinning the configure size to the static
+    /// target we only need to send one configure for the resize, while the
+    /// visual rect still animates smoothly (the client buffer is rendered at
+    /// its committed size and our viewporter / SSD layout handles the rest).
+    pub last_configured_client_size: Option<(i32, i32)>,
     /// Composition-declared transform from the most recent TS evaluation,
     /// **without** any animation deltas applied. `advance_managed_window_animations`
     /// resets `visual_transform` from this each frame before sampling the
@@ -1520,19 +1531,8 @@ impl ShojiWM {
                 }
 
                 if let Some(rect_animation) = &active.animation.rect {
-                    let mut value =
+                    let value =
                         sample_rect_animation(rect_animation, progress, next_managed_window.rect);
-                    // Override mode lock: keep the size at the animation's
-                    // target throughout the lerp so we don't ask the client
-                    // for a sequence of intermediate sizes (which causes the
-                    // "buffer stretched while it catches up" symptom). Only
-                    // position interpolates visually for size-changing tile
-                    // animations; the resize itself becomes a one-shot
-                    // configure at scheduling time.
-                    if matches!(rect_animation.mode, ManagedWindowAnimationMode::Override) {
-                        value.width = rect_animation.to.width;
-                        value.height = rect_animation.to.height;
-                    }
                     apply_rect_animation_value(
                         &mut next_managed_window,
                         value,
@@ -2071,6 +2071,7 @@ impl ShojiWM {
                         visual_transform: static_transform,
                         managed_window: evaluation.managed_window,
                         managed_window_animation_active: false,
+                        last_configured_client_size: None,
                         static_visual_transform: static_transform,
                         static_managed_window: static_managed,
                         window_effects: evaluation.window_effects,
@@ -3347,6 +3348,8 @@ impl ShojiWM {
                 current_root,
                 current_client,
                 window_id,
+                static_root,
+                last_configured_client_size,
             )) = ({
                 let Some(decoration) = self.window_decorations.get(&window) else {
                     continue;
@@ -3359,6 +3362,11 @@ impl ShojiWM {
                 let current_root = decoration.layout.root.rect;
                 let current_client = decoration.client_rect;
                 let window_id = decoration.snapshot.id.clone();
+                let static_root = decoration
+                    .static_managed_window
+                    .rect
+                    .map(managed_rect_snapshot_to_logical_rect);
+                let last_configured_client_size = decoration.last_configured_client_size;
                 Some((
                     managed.force_rect_size,
                     self.pending_xdg_state_configure_window_ids
@@ -3368,11 +3376,34 @@ impl ShojiWM {
                     current_root,
                     current_client,
                     window_id,
+                    static_root,
+                    last_configured_client_size,
                 ))
             })
             else {
                 continue;
             };
+
+            // When an Override rect animation is in flight we want the client
+            // configured at its **final** target size — not the animated
+            // intermediate — so its buffer arrives at the right resolution
+            // exactly once and the visual scaling is handled by viewporter /
+            // SSD layout instead of by stretching a lagging buffer. The
+            // visual rect (relocate, SSD layout) still uses the animated
+            // `desired_client`; only the size we hand the client deviates.
+            let active_rect_override = self
+                .managed_window_animations
+                .get(&window_id)
+                .is_some_and(|channels| {
+                    channels.values().any(|active| {
+                        active.animation.rect.as_ref().is_some_and(|rect_anim| {
+                            matches!(
+                                rect_anim.mode,
+                                ManagedWindowAnimationMode::Override
+                            )
+                        })
+                    })
+                });
 
             if desired_root == current_root && !needs_xdg_state_configure {
                 record_managed_rect_path_event(ManagedRectPathEvent::ApplyNoop);
@@ -3456,26 +3487,55 @@ impl ShojiWM {
                 self.space.relocate_element(&window, next_location);
             }
 
-            if size_changed || needs_xdg_state_configure {
+            // Pick the size we'll send to the client. During an active rect
+            // Override animation, lock this to the static target's client
+            // size (computed via the same inset logic as the animated
+            // desired_client) so we issue exactly one resize-configure and
+            // the buffer doesn't have to chase intermediate sizes.
+            let configure_client_size = if active_rect_override
+                && let Some(static_root) = static_root
+            {
+                let static_client = managed_client_rect_from_current_insets(
+                    current_root,
+                    current_client,
+                    static_root,
+                );
+                (static_client.width, static_client.height)
+            } else {
+                (desired_client.width, desired_client.height)
+            };
+            // Only push a configure when the size actually changes from what
+            // the client was last told. `needs_xdg_state_configure` still
+            // forces one through for non-size state updates (maximize, etc.).
+            let configure_size_changed =
+                last_configured_client_size != Some(configure_client_size);
+            let should_configure = configure_size_changed || needs_xdg_state_configure;
+
+            if should_configure {
                 if let Some(toplevel) = window.toplevel() {
                     toplevel.with_pending_state(|state| {
-                        state.size =
-                            Some(Size::from((desired_client.width, desired_client.height)));
+                        state.size = Some(Size::from(configure_client_size));
                     });
                     toplevel.send_pending_configure();
                     self.pending_xdg_state_configure_window_ids
                         .remove(&window_id);
+                    if let Some(decoration) = self.window_decorations.get_mut(&window) {
+                        decoration.last_configured_client_size = Some(configure_client_size);
+                    }
                 } else if let Some(x11) = window.x11_surface() {
-                    if size_changed {
+                    if configure_size_changed {
                         let placed = Rectangle::<i32, Logical>::new(
                             Point::from((desired_client.x, desired_client.y)),
-                            Size::from((desired_client.width, desired_client.height)),
+                            Size::from(configure_client_size),
                         );
                         if let Err(error) = x11.configure(Some(placed)) {
                             warn!(
                                 ?error,
                                 window_id, "failed to configure managed X11 window rect"
                             );
+                        }
+                        if let Some(decoration) = self.window_decorations.get_mut(&window) {
+                            decoration.last_configured_client_size = Some(configure_client_size);
                         }
                     }
                     self.pending_xdg_state_configure_window_ids
