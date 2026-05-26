@@ -96,17 +96,6 @@ fn mark_toplevel_metadata_dirty(
         "xdg toplevel metadata changed"
     );
 
-    // Bypass `mark_runtime_dirty_windows_with_origin` because this path
-    // intentionally strips the managed-only marker (title/app_id/icon change
-    // demands a real re-eval, not a managed-only update). We still record the
-    // strip for the origin diagnostic so the counter attributes the cause.
-    let was_managed_only = state.runtime_managed_only_window_ids.contains(&snapshot.id);
-    crate::ssd::record_dirty_call(crate::ssd::DirtyOrigin::XdgMetadata);
-    crate::ssd::record_dirty_mark(
-        crate::ssd::DirtyOrigin::XdgMetadata,
-        was_managed_only,
-        false,
-    );
     state.runtime_dirty_window_ids.insert(snapshot.id.clone());
     state.runtime_managed_only_window_ids.remove(&snapshot.id);
     state.runtime_poll_dirty = true;

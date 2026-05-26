@@ -288,17 +288,6 @@ interface SchedulerTickSuccess {
   dirty: boolean;
   dirtyWindowIds: string[];
   dirtyManagedWindowIds?: string[];
-  // Pre-computed managed-only state per window id, delivered to let Rust skip the
-  // per-window `evaluateCached` IPC roundtrip. Present only for windows that
-  // (a) are in `dirtyManagedWindowIds` and (b) have an existing cache entry.
-  dirtyManagedWindowStates?: Record<
-    string,
-    {
-      managedWindow: ManagedWindowState;
-      transform: WindowTransform;
-      windowEffects: WindowEffectAssignment | null;
-    }
-  >;
   dirtyWindowNodeIds?: Record<string, string[]>;
   dirtyLayerNodeIds?: Record<string, string[]>;
   actions: RuntimeWindowAction[];
@@ -754,20 +743,13 @@ async function main() {
   const socket = socketPath ? await connectSocket(socketPath) : null;
   const input = socket ?? process.stdin;
   const output = socket ?? process.stdout;
-  let writeQueue = Promise.resolve();
-  const enqueueResponse = (response: Parameters<typeof writeResponse>[1]): Promise<void> => {
-    writeQueue = writeQueue
-      .catch(() => undefined)
-      .then(() => writeResponse(output, response));
-    return writeQueue;
-  };
 
   for await (const payload of readFramedMessages(input)) {
     let request: RuntimeRequest;
     try {
       request = JSON.parse(payload.toString("utf8")) as RuntimeRequest;
     } catch (error) {
-        await enqueueResponse({
+        await writeResponse(output, {
             requestId: -1,
             ok: false,
             error: error instanceof Error ? error.message : String(error),
@@ -775,7 +757,6 @@ async function main() {
         continue;
     }
 
-    void (async () => {
     try {
       updateOutputState(request.displayState);
       if (hasRuntimeTimestamp(request)) {
@@ -835,7 +816,7 @@ async function main() {
         const cached = request.kind === "evaluate"
           ? cacheByWindowId.get(request.snapshot.id)?.cache
           : undefined;
-        await enqueueResponse({
+        await writeResponse(output, {
           requestId: request.requestId,
           ok: true,
           kind: request.kind,
@@ -858,21 +839,20 @@ async function main() {
         });
       } else {
         if (request.kind === "schedulerTick") {
-          const tick = processSchedulerTick(request.nowMs, effectConfig);
+          const tick = processSchedulerTick(request.nowMs);
           if (statsEnabled && tick.dirty) stats.schedulerTickDirty++;
           const keyBindingConfig = pendingKeyBindingConfigPayload();
           const pointerConfig = pendingPointerConfigPayload();
           const eventConfig = pendingEventConfigPayload(events);
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
-          await enqueueResponse({
+          await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
             kind: "schedulerTick",
             dirty: tick.dirty,
             dirtyWindowIds: tick.dirtyWindowIds,
             dirtyManagedWindowIds: tick.dirtyManagedWindowIds,
-            dirtyManagedWindowStates: tick.dirtyManagedWindowStates,
             dirtyWindowNodeIds: tick.dirtyWindowNodeIds,
             dirtyLayerNodeIds: tick.dirtyLayerNodeIds,
             actions: tick.actions,
@@ -890,7 +870,7 @@ async function main() {
           const pointerConfig = pendingPointerConfigPayload();
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
-          await enqueueResponse({
+          await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
             kind: "windowClosed",
@@ -906,7 +886,7 @@ async function main() {
           const pointerConfig = pendingPointerConfigPayload();
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
-          await enqueueResponse({
+          await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
             kind: "startClose",
@@ -923,7 +903,7 @@ async function main() {
           const pointerConfig = pendingPointerConfigPayload();
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
-          await enqueueResponse({
+          await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
             kind: "evaluateCached",
@@ -941,7 +921,7 @@ async function main() {
             processActions,
           });
         } else if (request.kind === "getEffectConfig") {
-          await enqueueResponse({
+          await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
             kind: "getEffectConfig",
@@ -954,7 +934,7 @@ async function main() {
           const pointerConfig = pendingPointerConfigPayload();
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
-          await enqueueResponse({
+          await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
             kind: "evaluateLayerEffects",
@@ -972,7 +952,7 @@ async function main() {
           const pointerConfig = pendingPointerConfigPayload();
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
-          await enqueueResponse({
+          await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
             kind: "invokeKeyBinding",
@@ -989,7 +969,7 @@ async function main() {
           const pointerConfig = pendingPointerConfigPayload();
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
-          await enqueueResponse({
+          await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
             kind: "windowResize",
@@ -1007,7 +987,7 @@ async function main() {
           const eventConfig = pendingEventConfigPayload(events);
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
-          await enqueueResponse({
+          await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
             kind: "windowMove",
@@ -1032,7 +1012,7 @@ async function main() {
           const eventConfig = pendingEventConfigPayload(events);
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
-          await enqueueResponse({
+          await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
             kind: "windowMaximizeRequest",
@@ -1057,7 +1037,7 @@ async function main() {
           const eventConfig = pendingEventConfigPayload(events);
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
-          await enqueueResponse({
+          await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
             kind: "windowMinimizeRequest",
@@ -1082,7 +1062,7 @@ async function main() {
           const eventConfig = pendingEventConfigPayload(events);
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
-          await enqueueResponse({
+          await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
             kind: "windowActivateRequest",
@@ -1101,7 +1081,7 @@ async function main() {
           const eventConfig = pendingEventConfigPayload(events);
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
-          await enqueueResponse({
+          await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
             kind: "pointerMoveAsync",
@@ -1119,7 +1099,7 @@ async function main() {
           const pointerConfig = pendingPointerConfigPayload();
           const processConfig = pendingProcessConfigPayload();
           const processActions = pendingProcessActionsPayload();
-          await enqueueResponse({
+          await writeResponse(output, {
             requestId: request.requestId,
             ok: true,
             kind: "invokeHandler",
@@ -1133,14 +1113,13 @@ async function main() {
         }
       }
     } catch (error) {
-      await enqueueResponse({
+      await writeResponse(output, {
         requestId: request.requestId,
         ok: false,
         error: error instanceof Error ? error.stack ?? error.message : String(error),
         displayConfig: pendingDisplayConfigPayload(),
       });
     }
-    })();
   }
 }
 
@@ -1771,21 +1750,10 @@ function ensureImmediateDirtyPoll(): void {
   debugSSD("runtime-immediate-dirty-poll-scheduled");
 }
 
-function processSchedulerTick(
-  nowMs: number,
-  effectConfig: RuntimeEffectConfig,
-): {
+function processSchedulerTick(nowMs: number): {
   dirty: boolean;
   dirtyWindowIds: string[];
   dirtyManagedWindowIds?: string[];
-  dirtyManagedWindowStates?: Record<
-    string,
-    {
-      managedWindow: ManagedWindowState;
-      transform: WindowTransform;
-      windowEffects: WindowEffectAssignment | null;
-    }
-  >;
   dirtyWindowNodeIds?: Record<string, string[]>;
   dirtyLayerNodeIds?: Record<string, string[]>;
   actions: RuntimeWindowAction[];
@@ -1813,91 +1781,7 @@ function processSchedulerTick(
     }
   }
 
-  const base = collectRuntimeMutationState();
-
-  // Pre-compute managed-only state for each managed-only-dirty window. This
-  // matches what `evaluateCached`'s managed-only branch would return, so the
-  // Rust side can apply it directly and bypass the per-window IPC roundtrip.
-  // We consume the managed-only marker via `takeManagedWindowOnlyDirty` so the
-  // window is not double-processed if `evaluateCached` is later called for it
-  // (e.g., a non-tick code path falls back to IPC).
-  let dirtyManagedWindowStates:
-    | Record<
-        string,
-        {
-          managedWindow: ManagedWindowState;
-          transform: WindowTransform;
-          windowEffects: WindowEffectAssignment | null;
-        }
-      >
-    | undefined;
-  if (base.dirtyManagedWindowIds && base.dirtyManagedWindowIds.length > 0) {
-    for (const windowId of base.dirtyManagedWindowIds) {
-      const entry = cacheByWindowId.get(windowId);
-      if (!entry) {
-        continue;
-      }
-      // Skip if a structural change came in during the same tick — that case
-      // requires the full evaluateCached path with a serialized tree, which Rust
-      // will handle through the normal IPC.
-      if (!takeManagedWindowOnlyDirty(windowId)) {
-        continue;
-      }
-      const reevaluated = entry.cache.reevaluateManagedWindow();
-      (dirtyManagedWindowStates ??= {})[windowId] = {
-        managedWindow: reevaluated.managedWindow,
-        transform: reevaluated.transform,
-        windowEffects: evaluateWindowEffects(effectConfig, windowId, entry),
-      };
-    }
-  }
-
-  // Output animation refreshes are output-wide, so Rust may visit windows that
-  // did not happen to receive a signal write in this scheduler tick. If we only
-  // push explicitly-dirty managed windows, those untouched windows fall back to
-  // per-window `evaluateCached` IPC even though their SSD tree is unchanged.
-  //
-  // During active animations we can safely batch-push the current ManagedWindow
-  // state for cached windows that are not already structurally dirty. This gives
-  // Rust the same managed-only state it would obtain from `evaluateCached`, but
-  // amortized into the single scheduler-tick IPC.
-  if (hasActiveAnimations()) {
-    const dirtyWindowIds = new Set(base.dirtyWindowIds);
-    const managedWindowIds = new Set(base.dirtyManagedWindowIds ?? []);
-    const structurallyDirtyWindowIds = new Set(
-      base.dirtyWindowIds.filter((windowId) => !managedWindowIds.has(windowId)),
-    );
-
-    for (const [windowId, entry] of cacheByWindowId) {
-      if (structurallyDirtyWindowIds.has(windowId)) {
-        continue;
-      }
-      if (dirtyManagedWindowStates?.[windowId]) {
-        continue;
-      }
-
-      const reevaluated = entry.cache.reevaluateManagedWindow();
-      (dirtyManagedWindowStates ??= {})[windowId] = {
-        managedWindow: reevaluated.managedWindow,
-        transform: reevaluated.transform,
-        windowEffects: evaluateWindowEffects(effectConfig, windowId, entry),
-      };
-      dirtyWindowIds.add(windowId);
-      managedWindowIds.add(windowId);
-    }
-
-    base.dirtyWindowIds = Array.from(dirtyWindowIds);
-    base.dirtyManagedWindowIds =
-      managedWindowIds.size > 0 ? Array.from(managedWindowIds) : undefined;
-    if (base.dirtyWindowIds.length > 0) {
-      base.dirty = true;
-    }
-  }
-
-  return {
-    ...base,
-    dirtyManagedWindowStates,
-  };
+  return collectRuntimeMutationState();
 }
 
 function collectRuntimeMutationState(): {

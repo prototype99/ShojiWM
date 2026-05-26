@@ -182,10 +182,9 @@ impl ShojiWM {
                                 }
                                 if invocation.dirty {
                                     self.runtime_poll_dirty = true;
-                                    self.mark_runtime_dirty_windows_with_origin(
+                                    self.mark_runtime_dirty_windows(
                                         invocation.dirty_window_ids,
                                         invocation.dirty_managed_window_ids,
-                                        crate::ssd::DirtyOrigin::InvokeKeyBinding,
                                     );
                                     self.request_tty_maintenance("runtime-key-binding-dirty");
                                     self.schedule_redraw();
@@ -624,10 +623,9 @@ impl ShojiWM {
                                     self.apply_runtime_handler_invocation(&window, &invocation);
 
                                     if invocation.invoked {
-                                        self.mark_runtime_dirty_windows_with_origin(
+                                        self.mark_runtime_dirty_windows(
                                             invocation.dirty_window_ids,
                                             invocation.dirty_managed_window_ids,
-                                            crate::ssd::DirtyOrigin::InvokeHandler,
                                         );
                                         self.runtime_scheduler_enabled =
                                             invocation.next_poll_in_ms.is_some();
@@ -1561,10 +1559,9 @@ impl ShojiWM {
 
         let invoked = invocation.invoked;
         if invoked {
-            self.mark_runtime_dirty_windows_with_origin(
+            self.mark_runtime_dirty_windows(
                 invocation.dirty_window_ids,
                 invocation.dirty_managed_window_ids,
-                crate::ssd::DirtyOrigin::InvokeHandler,
             );
             self.runtime_scheduler_enabled = invocation.next_poll_in_ms.is_some();
             self.apply_runtime_window_actions(invocation.actions);

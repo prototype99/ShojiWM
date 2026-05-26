@@ -19,7 +19,6 @@ use crate::backend::{
 };
 use crate::state::ShojiWM;
 
-use super::perf_stats::{RefreshFrameRecorder, SkipRejectReason};
 use super::{
     ComputedDecorationTree, DecorationCachedEvaluationResult, DecorationEvaluationError,
     DecorationEvaluationResult, DecorationEvaluator, DecorationHandlerInvocation,
@@ -112,29 +111,6 @@ fn label_debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var_os("SHOJI_LABEL_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
-    })
-}
-
-/// Returns true while the IPC-skip fast path for TS-pushed managed-only state is
-/// allowed. Set `SHOJI_IPC_SKIP_DISABLE=1` to force every dirty window through the
-/// full `evaluate_cached` IPC roundtrip — the original "fallback-last" behavior.
-fn ipc_skip_enabled() -> bool {
-    use std::sync::OnceLock;
-
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !std::env::var_os("SHOJI_IPC_SKIP_DISABLE")
-            .is_some_and(|value| value != "0" && !value.is_empty())
-    })
-}
-
-fn cached_eval_prefetch_enabled() -> bool {
-    use std::sync::OnceLock;
-
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !std::env::var_os("SHOJI_CACHED_EVAL_PREFETCH_DISABLE")
-            .is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
 
@@ -481,34 +457,6 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         }
     }
 
-    fn prefetch_cached_window(
-        &self,
-        window_id: &str,
-        window: Option<&WaylandWindowSnapshot>,
-        now_ms: u64,
-    ) -> Result<(), DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(()),
-            Self::Node(evaluator) => evaluator.prefetch_cached_window(window_id, window, now_ms),
-        }
-    }
-
-    fn evaluate_prefetched_cached_window(
-        &self,
-        window_id: &str,
-        window: Option<&WaylandWindowSnapshot>,
-        now_ms: u64,
-    ) -> Result<DecorationCachedEvaluationResult, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Err(DecorationEvaluationError::RuntimeProtocol(
-                "cached window evaluation unsupported for static evaluator".into(),
-            )),
-            Self::Node(evaluator) => {
-                evaluator.evaluate_prefetched_cached_window(window_id, window, now_ms)
-            }
-        }
-    }
-
     fn window_closed(&self, window_id: &str) -> Result<(), DecorationEvaluationError> {
         match self {
             Self::Static(_) => Ok(()),
@@ -814,10 +762,9 @@ impl ShojiWM {
 
         if invocation.dirty {
             self.runtime_poll_dirty = true;
-            self.mark_runtime_dirty_windows_with_origin(
+            self.mark_runtime_dirty_windows(
                 invocation.dirty_window_ids,
                 invocation.dirty_managed_window_ids,
-                crate::ssd::DirtyOrigin::WindowResize,
             );
             self.request_tty_maintenance("runtime-window-resize-dirty");
             self.schedule_redraw();
@@ -865,10 +812,9 @@ impl ShojiWM {
 
         if invocation.dirty {
             self.runtime_poll_dirty = true;
-            self.mark_runtime_dirty_windows_with_origin(
+            self.mark_runtime_dirty_windows(
                 invocation.dirty_window_ids,
                 invocation.dirty_managed_window_ids,
-                crate::ssd::DirtyOrigin::WindowMove,
             );
             self.request_tty_maintenance("runtime-window-move-dirty");
             self.schedule_redraw();
@@ -975,10 +921,9 @@ impl ShojiWM {
 
         if invocation.dirty {
             self.runtime_poll_dirty = true;
-            self.mark_runtime_dirty_windows_with_origin(
+            self.mark_runtime_dirty_windows(
                 invocation.dirty_window_ids,
                 invocation.dirty_managed_window_ids,
-                crate::ssd::DirtyOrigin::WindowStateRequest,
             );
             self.request_tty_maintenance(reason);
             self.schedule_redraw();
@@ -1060,10 +1005,9 @@ impl ShojiWM {
                 transform: invocation.transform.unwrap_or(decoration.visual_transform),
             },
         );
-        self.mark_runtime_dirty_windows_with_origin(
+        self.mark_runtime_dirty_windows(
             invocation.dirty_window_ids,
             invocation.dirty_managed_window_ids,
-            crate::ssd::DirtyOrigin::WindowStateRequest,
         );
         self.runtime_scheduler_enabled = invocation.next_poll_in_ms.is_some();
         self.apply_runtime_window_actions(invocation.actions);
@@ -1318,8 +1262,6 @@ impl ShojiWM {
         target_output_name: Option<&str>,
     ) -> Result<(), DecorationEvaluationError> {
         let refresh_started_at = Instant::now();
-        let mut frame_recorder = RefreshFrameRecorder::start();
-        frame_recorder.observe_pushed_states_len(self.runtime_managed_only_window_states.len());
         let spike_threshold_ms = animation_spike_threshold_ms();
         let force_runtime_reevaluate =
             self.runtime_poll_dirty && self.runtime_dirty_window_ids.is_empty();
@@ -1388,72 +1330,8 @@ impl ShojiWM {
         let removed_windows_elapsed_ms =
             removed_windows_started_at.elapsed().as_secs_f64() * 1000.0;
 
-        // Start expensive cached TS evaluations before the main refresh loop reaches
-        // them. Results are keyed by `(window_id, now_ms)`, so the branch below only
-        // consumes same-frame responses and cannot accidentally apply stale animation
-        // state from an older tick. This overlaps Node work with Rust-side layout and
-        // damage bookkeeping without changing the visible fallback behavior.
-        if cached_eval_prefetch_enabled() {
-            for window in &windows {
-                let primary_output_name = self.primary_output_name_for_window(window);
-                let snapshot = self.snapshot_window(window);
-                let snapshot_id = snapshot.id.clone();
-                let window_was_runtime_dirty = self.runtime_dirty_window_ids.contains(&snapshot_id);
-                let should_process = should_process_window_for_refresh(
-                    primary_output_name.as_deref(),
-                    target_output_name,
-                    force_async_asset_refresh,
-                    force_output_animation_reevaluate,
-                    force_runtime_reevaluate,
-                    window_was_runtime_dirty,
-                );
-                if !should_process {
-                    continue;
-                }
-                let Some(cached) = self.window_decorations.get(window) else {
-                    continue;
-                };
-                let runtime_state_changed =
-                    window_snapshot_requires_runtime_refresh(&cached.snapshot, &snapshot);
-                let snapshot_changed =
-                    window_snapshot_requires_rebuild(&cached.snapshot, &snapshot);
-                let runtime_dirty = force_runtime_reevaluate
-                    || force_output_animation_reevaluate
-                    || runtime_state_changed
-                    || window_was_runtime_dirty;
-                if !runtime_dirty || runtime_state_changed || snapshot_changed {
-                    continue;
-                }
-
-                let skip_has_pushed_state = ipc_skip_enabled()
-                    && !force_runtime_reevaluate
-                    && !force_async_asset_refresh
-                    && self.runtime_managed_only_window_ids.contains(&snapshot_id)
-                    && self
-                        .runtime_managed_only_window_states
-                        .contains_key(&snapshot_id);
-                if skip_has_pushed_state {
-                    continue;
-                }
-
-                if let Err(error) = self.decoration_evaluator.prefetch_cached_window(
-                    &snapshot_id,
-                    Some(&snapshot),
-                    now_ms,
-                ) {
-                    debug!(
-                        window_id = %snapshot_id,
-                        title = %snapshot.title,
-                        ?error,
-                        "failed to prefetch cached decoration evaluation"
-                    );
-                }
-            }
-        }
-
         let windows_pass_started_at = Instant::now();
         for window in windows {
-            frame_recorder.record_window_seen();
             let primary_output_name = self.primary_output_name_for_window(&window);
             let snapshot = self.snapshot_window(&window);
             let snapshot_id = snapshot.id.clone();
@@ -1483,7 +1361,6 @@ impl ShojiWM {
                 window_was_runtime_dirty,
             );
             if !should_process {
-                frame_recorder.record_window_skipped();
                 if runtime_dirty_debug_enabled() && window_was_runtime_dirty {
                     info!(
                         window_id = %snapshot_id,
@@ -1539,21 +1416,6 @@ impl ShojiWM {
                 .transpose()?
                 .unwrap_or(client_rect);
             let had_cached_decoration = self.window_decorations.contains_key(&window);
-            if frame_recorder.enabled() {
-                let (position_changed, size_changed) = self
-                    .window_decorations
-                    .get(&window)
-                    .map(|cached| {
-                        let prev = cached.snapshot.rect;
-                        let cur = snapshot.rect;
-                        (
-                            prev.x != cur.x || prev.y != cur.y,
-                            prev.width != cur.width || prev.height != cur.height,
-                        )
-                    })
-                    .unwrap_or((false, false));
-                frame_recorder.record_rect_diff(position_changed, size_changed);
-            }
             let runtime_state_changed = self
                 .window_decorations
                 .get(&window)
@@ -1656,7 +1518,6 @@ impl ShojiWM {
                 self.suggested_window_offset = suggested_window_offset(&layout);
                 let finalize_ms = finalize_started_at.elapsed().as_secs_f64() * 1000.0;
                 rebuilt += 1;
-                frame_recorder.record_full_rebuild();
                 record_managed_rect_path_event(ManagedRectPathEvent::FullRebuild);
                 if evaluation.managed_window.managed && evaluation.managed_window.rect.is_some() {
                     managed_rect_apply_window_ids.insert(snapshot.id.clone());
@@ -1752,7 +1613,6 @@ impl ShojiWM {
                         next_root,
                     );
                     self.schedule_redraw();
-                    frame_recorder.record_position_translate();
                     record_managed_rect_path_event(ManagedRectPathEvent::RefreshPositionTranslate);
                 } else if cached.client_rect != cached_effective_client_rect
                     && !runtime_dirty
@@ -1845,91 +1705,8 @@ impl ShojiWM {
                         &cached.buffers,
                     );
                     self.schedule_redraw();
-                    frame_recorder.record_relayout();
                     record_managed_rect_path_event(ManagedRectPathEvent::RefreshSizeRelayout);
                 } else if runtime_dirty {
-                    // === IPC-SKIP FAST PATH ===
-                    // When TS pushed a managed-only state for this window through the
-                    // most recent scheduler tick, we can apply it directly — no
-                    // `evaluate_cached` IPC roundtrip needed. Strict preconditions
-                    // (fallback-last):
-                    //   1. SHOJI_IPC_SKIP_DISABLE is not set
-                    //   2. TS explicitly declared this window as managed-only-dirty
-                    //   3. TS actually pushed the new managed-only state
-                    //   4. No focus / interaction change (state_changed) — otherwise
-                    //      the cached tree's reactivity would be wrong
-                    //   5. No force flags (full re-eval requested)
-                    // If any precondition is false, we fall through to the existing
-                    // IPC path which itself has its own evaluate_cached → evaluate →
-                    // static fallback chain.
-                    // Evaluate preconditions individually so we can attribute *why*
-                    // a candidate window failed to skip. Reasons are reported in the
-                    // same order they're checked.
-                    //
-                    // Note: `force_output_animation_reevaluate` is intentionally NOT
-                    // a skip-rejection reason. That flag is set whenever the output
-                    // is in an animating state (`runtime_animation_outputs`) — i.e.,
-                    // exactly the situation where TS is pushing managed-only states
-                    // for us through scheduler ticks. Rejecting on it would defeat
-                    // the entire fast path. The two remaining force flags
-                    // (`force_runtime_reevaluate` for "TS says poll-dirty but we
-                    // don't know which window" and `force_async_asset_refresh` for
-                    // "icon/font asset changed and the cached tree must rebuild")
-                    // do still inhibit skip — they signal cases the pushed
-                    // managed-only state cannot satisfy.
-                    let skip_eligible = if !ipc_skip_enabled() {
-                        frame_recorder.record_skip_reject(SkipRejectReason::Disabled);
-                        false
-                    } else if runtime_state_changed {
-                        frame_recorder.record_skip_reject(SkipRejectReason::StateChanged);
-                        false
-                    } else if force_runtime_reevaluate || force_async_asset_refresh {
-                        frame_recorder.record_skip_reject(SkipRejectReason::ForceFlags);
-                        false
-                    } else if !self.runtime_managed_only_window_ids.contains(&snapshot_id) {
-                        frame_recorder.record_skip_reject(SkipRejectReason::NotManagedOnly);
-                        false
-                    } else if !self
-                        .runtime_managed_only_window_states
-                        .contains_key(&snapshot_id)
-                    {
-                        frame_recorder.record_skip_reject(SkipRejectReason::NoPushedState);
-                        false
-                    } else {
-                        true
-                    };
-
-                    if skip_eligible {
-                        let pushed = self
-                            .runtime_managed_only_window_states
-                            .remove(&snapshot_id)
-                            .expect("skip_eligible guarantees presence");
-                        let previous_root =
-                            transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
-                        cached.snapshot = snapshot;
-                        cached.managed_window = pushed.managed_window;
-                        cached.window_effects = pushed.window_effects;
-                        cached.visual_transform = pushed.transform;
-                        let next_root =
-                            transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
-                        push_damage_pair(
-                            &mut self.pending_decoration_damage,
-                            Some(previous_root),
-                            next_root,
-                        );
-                        cached.client_rect_potentially_stale = false;
-                        if cached.managed_window.managed && cached.managed_window.rect.is_some() {
-                            managed_rect_apply_window_ids.insert(snapshot_id.clone());
-                        }
-                        runtime_dirty_updates = runtime_dirty_updates.saturating_add(1);
-                        record_managed_rect_path_event(ManagedRectPathEvent::RuntimeManagedOnly);
-                        frame_recorder.record_ipc_skipped();
-                        frame_recorder.record_managed_only();
-                        self.schedule_redraw();
-                        processed_runtime_dirty_window_ids.insert(snapshot_id);
-                        continue;
-                    }
-
                     let started_at = Instant::now();
                     let previous_root =
                         transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
@@ -1948,7 +1725,6 @@ impl ShojiWM {
                     }
                     let evaluate_started_at = Instant::now();
                     let evaluation = if runtime_state_changed {
-                        frame_recorder.record_runtime_dirty_full();
                         match self.decoration_evaluator.evaluate_window(&snapshot, now_ms) {
                             Ok(evaluation) => evaluation.into(),
                             Err(error) => {
@@ -1965,8 +1741,7 @@ impl ShojiWM {
                             }
                         }
                     } else {
-                        frame_recorder.record_runtime_dirty_cached();
-                        match self.decoration_evaluator.evaluate_prefetched_cached_window(
+                        match self.decoration_evaluator.evaluate_cached_window(
                             &snapshot.id,
                             Some(&snapshot),
                             now_ms,
@@ -2006,7 +1781,6 @@ impl ShojiWM {
                     pending_process_config_updates.push(evaluation.process_config.clone());
                     pending_process_actions.extend(evaluation.process_actions.clone());
                     if evaluation.managed_window_only {
-                        frame_recorder.record_managed_only();
                         if runtime_dirty_debug_enabled() {
                             info!(
                                 window_id = %snapshot_id,
@@ -2938,19 +2712,11 @@ impl ShojiWM {
             live_window_ids.contains(window_id)
                 || self.closing_window_snapshots.contains_key(window_id)
         });
-        // Drop pushed managed-only states for dead windows so the map can't grow
-        // unbounded if a window closes between scheduler tick and refresh.
-        self.runtime_managed_only_window_states
-            .retain(|window_id, _| {
-                live_window_ids.contains(window_id)
-                    || self.closing_window_snapshots.contains_key(window_id)
-            });
         self.pending_xdg_state_configure_window_ids
             .retain(|window_id| live_window_ids.contains(window_id));
         self.runtime_poll_dirty = !self.runtime_dirty_window_ids.is_empty();
         self.async_asset_dirty = false;
 
-        frame_recorder.finish();
         Ok(())
     }
 
