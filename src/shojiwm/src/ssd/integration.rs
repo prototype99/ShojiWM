@@ -1310,10 +1310,21 @@ impl ShojiWM {
             );
         }
 
-        if !had_any_existing {
-            self.reset_managed_window_animation_state_to_static(&window_id);
-        }
-        self.set_managed_window_animation_active(&window_id, true);
+        // NOTE: previously we (a) reset `decoration.managed_window` and
+        // `decoration.visual_transform` to their static values when the window
+        // had no in-flight animations and (b) eagerly set
+        // `managed_window_animation_active = true`. Together they opened a
+        // race window: the reset moves the window back to its in-viewport
+        // static rect with opacity = 1.0, and the eager flag bypasses the
+        // `idle` filter in `managed_window_allows_render`. If a render fires
+        // before the immediate advance+apply below has had a chance to push
+        // the rect off-screen / drop opacity to 0, a now-hidden workspace's
+        // window appears at full opacity in its static position for one
+        // frame. Both ops are redundant — `advance_managed_window_animations`
+        // already seeds from `static_managed_window`, applies the freshly
+        // inserted animation's progress-0 sample, and sets the active flag
+        // exactly when the animation begins driving the decoration. Skipping
+        // the eager pair eliminates the flash without losing any cleanup.
 
         // Smooth handoff: when overriding an in-flight animation in the same
         // channel, TS-provided `from` values reflect the *declarative target*
@@ -1355,17 +1366,60 @@ impl ShojiWM {
             }
         }
 
+        let inserted_window_id = window_id.clone();
+        // Snapshot the pre-insert decoration state so the diagnostic below
+        // can show exactly what would have been rendered if a render had
+        // fired in the gap.
+        let pre_decoration = self.window_decorations.iter().find_map(|(_, d)| {
+            (d.snapshot.id == inserted_window_id).then(|| {
+                (
+                    d.managed_window.rect,
+                    d.managed_window.idle,
+                    d.managed_window.visible,
+                    d.managed_window_animation_active,
+                    d.layout.root.rect,
+                    d.visual_transform.opacity,
+                )
+            })
+        });
         self.managed_window_animations
             .entry(window_id)
             .or_default()
             .insert(
-                channel,
+                channel.clone(),
                 ActiveManagedWindowAnimation {
                     sequence: self.managed_window_animation_sequence,
                     started_at_ms,
                     animation,
                 },
             );
+        let _ = self.advance_managed_window_animations(started_at_ms);
+        let mut just_scheduled = std::collections::HashSet::new();
+        just_scheduled.insert(inserted_window_id.clone());
+        self.apply_managed_window_rects(&just_scheduled);
+        if managed_animation_debug_enabled()
+            && let Some(post) = self.window_decorations.iter().find_map(|(_, d)| {
+                (d.snapshot.id == inserted_window_id).then(|| {
+                    (
+                        d.managed_window.rect,
+                        d.managed_window.idle,
+                        d.managed_window.visible,
+                        d.managed_window_animation_active,
+                        d.layout.root.rect,
+                        d.visual_transform.opacity,
+                        d.managed_window_allows_render(),
+                    )
+                })
+            })
+        {
+            info!(
+                window_id = %inserted_window_id,
+                channel = %channel,
+                pre = ?pre_decoration,
+                post = ?post,
+                "managed animation: schedule pre/post state"
+            );
+        }
         self.schedule_redraw();
         self.request_tty_maintenance("managed-window-animation-scheduled");
     }
