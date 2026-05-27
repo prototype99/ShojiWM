@@ -18,6 +18,7 @@ import {
     shaderStage,
     loadShader,
     ManagedWindow,
+    read,
 } from "shoji_wm";
 import type { CompositionRenderable, ManagedWindowRect } from "shoji_wm/types";
 import {
@@ -100,11 +101,11 @@ WINDOW_MANAGER.output.applyDisplayConfig((display) => {
         position: "auto",
         scale: 1.5,
     },
-    display["DP-4"] = {
-        resolution: "best",
-        position: "auto",
-        scale: 1.5,
-    };
+        display["DP-4"] = {
+            resolution: "best",
+            position: "auto",
+            scale: 1.5,
+        };
     display["DP-2"] = {
         resolution: "best",
         position: "auto",
@@ -200,7 +201,6 @@ WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
         invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
         pipeline: [
             dualKawaseBlur({ radius: 2, passes: 2 }),
-            /*
             shaderStage(loadShader("./src/liquid-glass.frag"), {
                 uniforms: {
                     glass_radius_px: 10.0,
@@ -209,7 +209,7 @@ WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
                     chromatic_shift_px: 3.0,
                     glass_tint: 0.9,
                 },
-            }),*/
+            }),
         ],
     });
 
@@ -218,16 +218,6 @@ WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
         invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
         pipeline: [
             dualKawaseBlur({ radius: 2, passes: 2 }),
-            /*
-            shaderStage(loadShader("./src/liquid-glass.frag"), {
-                uniforms: {
-                    glass_radius_px: 10.0,
-                    distortion_depth: 0.3,
-                    distortion_strength: 0.1,
-                    chromatic_shift_px: 3.0,
-                    glass_tint: 0.9,
-                },
-            }),*/
         ],
     });
 

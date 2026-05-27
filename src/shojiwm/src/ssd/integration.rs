@@ -2347,12 +2347,58 @@ impl ShojiWM {
                                 "runtime dirty debug: managed-window-only result"
                             );
                         }
+                        info!(
+                            window_id = %snapshot_id,
+                            old_rect = ?cached.managed_window.rect,
+                            old_visible = cached.managed_window.visible,
+                            old_idle = cached.managed_window.idle,
+                            old_opacity = cached.managed_window.transform.opacity,
+                            old_translate_y = cached.managed_window.transform.translate_y,
+                            old_animation_active = cached.managed_window_animation_active,
+                            new_rect = ?evaluation.managed_window.rect,
+                            new_visible = evaluation.managed_window.visible,
+                            new_idle = evaluation.managed_window.idle,
+                            new_opacity = evaluation.managed_window.transform.opacity,
+                            new_translate_y = evaluation.managed_window.transform.translate_y,
+                            "runtime dirty debug: managed-window overwrite"
+                        );
+                        let has_active_animation = cached.managed_window_animation_active;
+
+                        let next_managed_window = evaluation.managed_window;
+                        let next_transform = evaluation.transform;
+
                         cached.snapshot = snapshot;
-                        cached.managed_window = evaluation.managed_window.clone();
-                        cached.static_managed_window = evaluation.managed_window;
+                        cached.static_managed_window = next_managed_window.clone();
+                        cached.static_visual_transform = next_transform;
                         cached.window_effects = evaluation.window_effects;
-                        cached.visual_transform = evaluation.transform;
-                        cached.static_visual_transform = evaluation.transform;
+
+                        if has_active_animation {
+                            // 重要:
+                            // 現在の cached.managed_window / cached.visual_transform は
+                            // animation が生成した「今フレームの見た目」なので潰さない。
+                            //
+                            // refresh の最後で advance_managed_window_animations(now_ms) が走り、
+                            // static_managed_window / static_visual_transform から
+                            // 正しい animated state を再計算する。
+                            cached.client_rect_potentially_stale = true;
+
+                            runtime_dirty_updates = runtime_dirty_updates.saturating_add(1);
+                            record_managed_rect_path_event(
+                                ManagedRectPathEvent::RuntimeManagedOnly,
+                            );
+                            managed_rect_apply_window_ids.insert(snapshot_id.clone());
+
+                            self.schedule_redraw();
+                            self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
+                            animation_active_for_target |= evaluation.next_poll_in_ms == Some(0);
+                            processed_runtime_dirty_window_ids.insert(snapshot_id);
+                            continue;
+                        }
+
+                        // animation が無い場合だけ dynamic state も更新する
+                        cached.managed_window = next_managed_window;
+                        cached.visual_transform = next_transform;
+
                         let next_root =
                             transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
                         push_damage_pair(
@@ -2430,11 +2476,18 @@ impl ShojiWM {
                     let mut layout_equivalent_state = None;
                     cached.snapshot = snapshot;
                     cached.static_managed_window = next_managed_window.clone();
-                    cached.managed_window = next_managed_window;
+
+                    let has_active_animation = cached.managed_window_animation_active;
+
+                    if !has_active_animation {
+                        cached.managed_window = next_managed_window;
+                    }
                     cached.window_effects = next_window_effects;
 
                     if !tree_changed {
-                        cached.visual_transform = next_transform;
+                        if !has_active_animation {
+                            cached.visual_transform = next_transform;
+                        }
                         cached.static_visual_transform = next_transform;
                     } else {
                         let layout_equivalent = cached.tree.root.layout_equivalent(&next_tree.root);
@@ -2560,7 +2613,9 @@ impl ShojiWM {
                             );
                             self.suggested_window_offset = suggested_window_offset(&cached.layout);
                         }
-                        cached.visual_transform = next_transform;
+                        if !has_active_animation {
+                            cached.visual_transform = next_transform;
+                        }
                         cached.static_visual_transform = next_transform;
                     }
                     let rebuild_ms = rebuild_started_at.elapsed().as_secs_f64() * 1000.0;
@@ -3445,19 +3500,16 @@ impl ShojiWM {
             // SSD layout instead of by stretching a lagging buffer. The
             // visual rect (relocate, SSD layout) still uses the animated
             // `desired_client`; only the size we hand the client deviates.
-            let active_rect_override = self
-                .managed_window_animations
-                .get(&window_id)
-                .is_some_and(|channels| {
-                    channels.values().any(|active| {
-                        active.animation.rect.as_ref().is_some_and(|rect_anim| {
-                            matches!(
-                                rect_anim.mode,
-                                ManagedWindowAnimationMode::Override
-                            )
+            let active_rect_override =
+                self.managed_window_animations
+                    .get(&window_id)
+                    .is_some_and(|channels| {
+                        channels.values().any(|active| {
+                            active.animation.rect.as_ref().is_some_and(|rect_anim| {
+                                matches!(rect_anim.mode, ManagedWindowAnimationMode::Override)
+                            })
                         })
-                    })
-                });
+                    });
 
             if desired_root == current_root && !needs_xdg_state_configure {
                 record_managed_rect_path_event(ManagedRectPathEvent::ApplyNoop);
@@ -3546,23 +3598,21 @@ impl ShojiWM {
             // size (computed via the same inset logic as the animated
             // desired_client) so we issue exactly one resize-configure and
             // the buffer doesn't have to chase intermediate sizes.
-            let configure_client_size = if active_rect_override
-                && let Some(static_root) = static_root
-            {
-                let static_client = managed_client_rect_from_current_insets(
-                    current_root,
-                    current_client,
-                    static_root,
-                );
-                (static_client.width, static_client.height)
-            } else {
-                (desired_client.width, desired_client.height)
-            };
+            let configure_client_size =
+                if active_rect_override && let Some(static_root) = static_root {
+                    let static_client = managed_client_rect_from_current_insets(
+                        current_root,
+                        current_client,
+                        static_root,
+                    );
+                    (static_client.width, static_client.height)
+                } else {
+                    (desired_client.width, desired_client.height)
+                };
             // Only push a configure when the size actually changes from what
             // the client was last told. `needs_xdg_state_configure` still
             // forces one through for non-size state updates (maximize, etc.).
-            let configure_size_changed =
-                last_configured_client_size != Some(configure_client_size);
+            let configure_size_changed = last_configured_client_size != Some(configure_client_size);
             let should_configure = configure_size_changed || needs_xdg_state_configure;
 
             if should_configure {

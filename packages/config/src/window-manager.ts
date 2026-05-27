@@ -839,7 +839,11 @@ export class Workspace {
                 window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(1);
                 continue;
             }
-            window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
+            // Same ordering rule as prepare: schedule first, then flip
+            // VISIBLE. For from-workspace this is mostly a no-op (VISIBLE was
+            // already true), but for to-workspace's second call this keeps
+            // the same invariant in case prepareWorkspaceTransition's hold
+            // animation has already completed (e.g., rapid switches).
             scheduleWorkspaceVisualAnimation(
                 window,
                 options.fromOffsetY,
@@ -849,7 +853,10 @@ export class Workspace {
                 WINDOW_MANAGEMENT_EASING,
                 WORKSPACE_SWITCH_ANIMATION_DURATION,
             );
+            window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
         }
+
+        const VISIBILITY_COMMIT_BEFORE_END_MS = 32;
 
         setTimeout(() => {
             if (this.visibilityAnimationToken !== token) {
@@ -858,7 +865,7 @@ export class Workspace {
             withManagedWindowOnlySSDRebuildSuppressed(() => {
                 this.setVisible(options.visibleAfter);
             });
-        }, WORKSPACE_SWITCH_ANIMATION_DURATION + 32);
+        }, Math.max(0, WORKSPACE_SWITCH_ANIMATION_DURATION - VISIBILITY_COMMIT_BEFORE_END_MS));
     }
 
     public setTiled(tiled: boolean) {
