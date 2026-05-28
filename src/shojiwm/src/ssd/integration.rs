@@ -1633,6 +1633,15 @@ impl ShojiWM {
                 .get(&window_id)
                 .is_some_and(|channels| !channels.is_empty());
 
+            // Rect animations for closing snapshots do not have a live
+            // `WindowDecorationState` entry anymore, so the live-window branch
+            // below cannot mark them dirty. Mark the id here at the animation
+            // level; `apply_managed_window_rects` has a closing-snapshot pass
+            // that consumes the same dirty id set.
+            if rect_changed {
+                dirty_rect_window_ids.insert(window_id.clone());
+            }
+
             for (_, decoration) in self.window_decorations.iter_mut() {
                 if decoration.snapshot.id != window_id {
                     continue;
@@ -2772,11 +2781,18 @@ impl ShojiWM {
                 pending_process_actions.extend(evaluation.process_actions.clone());
                 pre_advance_actions.extend(std::mem::take(&mut evaluation.actions));
                 if evaluation.managed_window_only {
-                    closing.decoration.managed_window = evaluation.managed_window.clone();
-                    closing.decoration.static_managed_window = evaluation.managed_window;
+                    let has_active_animation = closing.decoration.managed_window_animation_active;
+                    let next_managed_window = evaluation.managed_window;
+                    let next_transform = evaluation.transform;
+
+                    closing.decoration.static_managed_window = next_managed_window.clone();
+                    closing.decoration.static_visual_transform = next_transform;
                     closing.decoration.window_effects = evaluation.window_effects;
-                    closing.decoration.visual_transform = evaluation.transform;
-                    closing.decoration.static_visual_transform = evaluation.transform;
+                    if !has_active_animation {
+                        closing.decoration.managed_window = next_managed_window;
+                        closing.decoration.visual_transform = next_transform;
+                        closing.transform = next_transform;
+                    }
                     if closing.decoration.managed_window.managed
                         && let Some(desired_root) = closing.decoration.managed_window.rect
                     {
@@ -2854,7 +2870,9 @@ impl ShojiWM {
                             }
                         }
                     }
-                    closing.transform = evaluation.transform;
+                    if !has_active_animation {
+                        closing.transform = next_transform;
+                    }
                     let next_root = transformed_root_rect(
                         closing.decoration.layout.root.rect,
                         closing.transform,
@@ -2887,14 +2905,21 @@ impl ShojiWM {
                     ));
                 };
                 let next_tree = DecorationTree::new(evaluation_node);
-                closing.decoration.managed_window = evaluation.managed_window.clone();
-                closing.decoration.static_managed_window = evaluation.managed_window;
+                let has_active_animation = closing.decoration.managed_window_animation_active;
+                let next_managed_window = evaluation.managed_window;
+                let next_transform = evaluation.transform;
+                closing.decoration.static_managed_window = next_managed_window.clone();
                 closing.decoration.window_effects = evaluation.window_effects;
+                if !has_active_animation {
+                    closing.decoration.managed_window = next_managed_window;
+                }
                 let dirty_node_ids = evaluation.dirty_node_ids;
                 let tree_changed = next_tree != closing.decoration.tree;
                 if !tree_changed {
-                    closing.decoration.visual_transform = evaluation.transform;
-                    closing.decoration.static_visual_transform = evaluation.transform;
+                    if !has_active_animation {
+                        closing.decoration.visual_transform = next_transform;
+                    }
+                    closing.decoration.static_visual_transform = next_transform;
                 } else {
                     let layout_equivalent = closing
                         .decoration
@@ -3028,8 +3053,10 @@ impl ShojiWM {
                         self.suggested_window_offset =
                             suggested_window_offset(&closing.decoration.layout);
                     }
-                    closing.decoration.visual_transform = evaluation.transform;
-                    closing.decoration.static_visual_transform = evaluation.transform;
+                    if !has_active_animation {
+                        closing.decoration.visual_transform = next_transform;
+                    }
+                    closing.decoration.static_visual_transform = next_transform;
                 }
                 if closing.decoration.managed_window.managed
                     && let Some(desired_root) = closing.decoration.managed_window.rect
@@ -3107,9 +3134,11 @@ impl ShojiWM {
                         }
                     }
                 }
-                closing.decoration.visual_transform = evaluation.transform;
-                closing.decoration.static_visual_transform = evaluation.transform;
-                closing.transform = evaluation.transform;
+                if !has_active_animation {
+                    closing.decoration.visual_transform = next_transform;
+                    closing.transform = next_transform;
+                }
+                closing.decoration.static_visual_transform = next_transform;
                 let next_root =
                     transformed_root_rect(closing.decoration.layout.root.rect, closing.transform);
                 if previous_transform != closing.transform || previous_root != next_root {
@@ -3730,6 +3759,13 @@ impl ShojiWM {
             self.schedule_redraw();
         }
 
+        // Closing snapshots are not present in `window_decorations`, but
+        // managed rect animations can still target them after `startClose`.
+        // Apply those animated rects to the frozen client snapshot and the
+        // cloned decoration cache so close animations can move/resize the
+        // whole closing window, not just opacity/transform it.
+        self.apply_managed_window_rects_to_closing_snapshots(dirty_window_ids);
+
         // Do not refresh pointer focus synchronously from apply_managed_window_rects.
         // This can be called from inside pointer grab motion handling.
         /*
@@ -3737,6 +3773,160 @@ impl ShojiWM {
             let now_msec = std::time::Duration::from(self.clock.now()).as_millis() as u32;
             self.refresh_pointer_focus(now_msec);
         }*/
+    }
+
+    fn apply_managed_window_rects_to_closing_snapshots(
+        &mut self,
+        dirty_window_ids: &std::collections::HashSet<String>,
+    ) {
+        let closing_ids = self
+            .closing_window_snapshots
+            .keys()
+            .filter(|window_id| dirty_window_ids.contains(*window_id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for window_id in closing_ids {
+            let closing_raster_scale = self
+                .closing_window_snapshots
+                .get(&window_id)
+                .map(|closing| self.decoration_raster_scale_for_rect(closing.live.rect))
+                .unwrap_or(1);
+
+            let Some(closing) = self.closing_window_snapshots.get_mut(&window_id) else {
+                continue;
+            };
+            let managed = &closing.decoration.managed_window;
+            if !managed.managed {
+                continue;
+            }
+            let Some(desired_root_raw) = managed.rect else {
+                continue;
+            };
+            let desired_root = managed_rect_snapshot_to_logical_rect(desired_root_raw);
+            if desired_root.width <= 0 || desired_root.height <= 0 {
+                continue;
+            }
+
+            let current_root = closing.decoration.layout.root.rect;
+            let current_client = closing.decoration.client_rect;
+            if desired_root == current_root {
+                continue;
+            }
+
+            let desired_client = if desired_root.width != current_root.width
+                || desired_root.height != current_root.height
+            {
+                managed_client_rect_from_current_insets(current_root, current_client, desired_root)
+            } else {
+                let dx = desired_root.x - current_root.x;
+                let dy = desired_root.y - current_root.y;
+                LogicalRect::new(
+                    current_client.x + dx,
+                    current_client.y + dy,
+                    current_client.width,
+                    current_client.height,
+                )
+            };
+            if desired_client == current_client {
+                continue;
+            }
+
+            let previous_root =
+                transformed_root_rect(closing.decoration.layout.root.rect, closing.transform);
+            let position_changed =
+                desired_client.x != current_client.x || desired_client.y != current_client.y;
+            let size_changed = desired_client.width != current_client.width
+                || desired_client.height != current_client.height;
+
+            if size_changed {
+                let previous_shader_buffers = closing.decoration.shader_buffers.clone();
+                let previous_text_buffers = closing.decoration.text_buffers.clone();
+                let layout = match closing
+                    .decoration
+                    .tree
+                    .layout_for_client_with_scale(desired_client, closing.decoration.layout_scale)
+                {
+                    Ok(layout) => layout,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            window_id = %window_id,
+                            desired_client = %format_rect(desired_client),
+                            "failed to apply animated managed rect to closing snapshot"
+                        );
+                        continue;
+                    }
+                };
+                let shared_edges = build_shared_edge_geometry_map(&layout);
+                let content_clip =
+                    content_clip_for_layout(&closing.decoration.tree, &layout, &shared_edges);
+                let order_map = build_render_order_map(&layout);
+                let mut shader_buffers = build_shader_buffers(&layout, &order_map);
+                freeze_manual_shader_buffers(&previous_shader_buffers, &mut shader_buffers);
+                let text_buffers = build_text_buffers_with_fallback(
+                    &layout,
+                    &order_map,
+                    closing_raster_scale,
+                    &mut self.text_rasterizer,
+                    &previous_text_buffers,
+                );
+                let icon_buffers = build_icon_buffers(
+                    &layout,
+                    &order_map,
+                    closing_raster_scale,
+                    &closing.decoration.snapshot,
+                    &mut self.icon_rasterizer,
+                );
+
+                closing.decoration.layout = layout;
+                closing.decoration.content_clip = content_clip;
+                closing.decoration.client_rect = desired_client;
+                closing.decoration.snapshot.position = WindowPositionSnapshot {
+                    x: desired_client.x,
+                    y: desired_client.y,
+                    width: desired_client.width,
+                    height: desired_client.height,
+                };
+                closing.decoration.buffers =
+                    build_cached_buffers(&closing.decoration.layout, &order_map);
+                closing.decoration.shader_buffers = shader_buffers;
+                closing.decoration.text_buffers = text_buffers;
+                closing.decoration.icon_buffers = icon_buffers;
+                closing.live.rect = desired_client;
+            } else if position_changed {
+                let dx = desired_client.x - current_client.x;
+                let dy = desired_client.y - current_client.y;
+                translate_cached_decoration_position(
+                    &mut closing.decoration,
+                    dx,
+                    dy,
+                    desired_client,
+                );
+                closing.live.rect = desired_client;
+            }
+
+            let next_root =
+                transformed_root_rect(closing.decoration.layout.root.rect, closing.transform);
+            push_damage_pair(
+                &mut self.pending_decoration_damage,
+                Some(previous_root),
+                next_root,
+            );
+            self.window_scene_generation = self.window_scene_generation.wrapping_add(1);
+            self.schedule_redraw();
+
+            if managed_rect_debug_enabled() {
+                info!(
+                    window_id = %window_id,
+                    desired_root = %format_rect(desired_root),
+                    desired_client = %format_rect(desired_client),
+                    position_changed,
+                    size_changed,
+                    "managed rect debug: applied closing snapshot rect"
+                );
+            }
+        }
     }
 }
 
