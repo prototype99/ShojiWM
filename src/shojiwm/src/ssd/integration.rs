@@ -4107,46 +4107,61 @@ fn sample_easing(easing: ManagedWindowAnimationEasingSnapshot, progress: f64) ->
 }
 
 fn sample_cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, progress: f64) -> f64 {
-    if progress <= 0.0 || progress >= 1.0 {
-        return progress.clamp(0.0, 1.0);
+    if progress <= 0.0 {
+        return 0.0;
     }
+    if progress >= 1.0 {
+        return 1.0;
+    }
+
     let cx = 3.0 * x1;
     let bx = 3.0 * (x2 - x1) - cx;
     let ax = 1.0 - cx - bx;
+
     let cy = 3.0 * y1;
     let by = 3.0 * (y2 - y1) - cy;
     let ay = 1.0 - cy - by;
+
     let sample_x = |t: f64| ((ax * t + bx) * t + cx) * t;
     let sample_y = |t: f64| ((ay * t + by) * t + cy) * t;
     let sample_dx = |t: f64| (3.0 * ax * t + 2.0 * bx) * t + cx;
+
     let mut t = progress;
+
     for _ in 0..8 {
         let estimate = sample_x(t) - progress;
         if estimate.abs() < 1e-6 {
-            return sample_y(t).clamp(0.0, 1.0);
+            return sample_y(t);
         }
+
         let derivative = sample_dx(t);
         if derivative.abs() < 1e-6 {
             break;
         }
+
         t -= estimate / derivative;
     }
+
     let mut lower = 0.0;
     let mut upper = 1.0;
     t = progress;
+
     for _ in 0..12 {
         let estimate = sample_x(t);
         if (estimate - progress).abs() < 1e-7 {
             break;
         }
+
         if progress > estimate {
             lower = t;
         } else {
             upper = t;
         }
+
         t = (upper + lower) * 0.5;
     }
-    sample_y(t).clamp(0.0, 1.0)
+
+    sample_y(t)
 }
 
 fn lerp(from: f64, to: f64, progress: f64) -> f64 {

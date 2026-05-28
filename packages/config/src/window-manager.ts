@@ -36,7 +36,8 @@ export const WINDOW_STATE_FLOATING_RECT = createWindowState<ManagedWindowRect | 
 const OPEN_CLOSE_ANIMATION_DURATION = seconds(0.5);
 const WINDOW_MANAGEMENT_ANIMATION_DURATION = seconds(0.3);
 const UNMAXIMIZE_GRAB_ANIMATION_DURATION = 90;
-const WINDOW_MANAGEMENT_EASING = cubicBezier(0.1, 0.9, 0.2, 1.0);//cubicBezier(0.1, 1.1, 0.1, 1.1);
+const WINDOW_MANAGEMENT_EASING = cubicBezier(0.1, 0.9, 0.2, 1.0);
+const WINDOW_OPEN_EASING = cubicBezier(0.1, 1.1, 0.1, 1.1);
 const WINDOW_CLOSE_EASING = cubicBezier(0.3, -0.3, 0, 1);
 export const TILE_ANIMATION_DURATION = seconds(0.5);
 const WORKSPACE_SWITCH_ANIMATION_DURATION = seconds(0.5);
@@ -55,23 +56,6 @@ const MANAGED_WINDOW_ONLY_ANIMATION = {
 } as const;
 interface LayoutOptions {
     suppressSSDRebuild?: boolean;
-}
-
-function debugSSD(message: string, details: Record<string, unknown> = {}) {
-    const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
-    if (!env?.SHOJI_SSD_SUPPRESSION_DEBUG) {
-        return;
-    }
-    console.info(`ssd-suppression ${message}`, JSON.stringify(details));
-}
-
-function rectForDebug(rect: ManagedWindowRect) {
-    return {
-        x: read(rect.x),
-        y: read(rect.y),
-        width: read(rect.width),
-        height: read(rect.height),
-    };
 }
 
 const OPEN_ANIMATION_CHANNEL = "window.open";
@@ -113,13 +97,6 @@ export class HybridWindowManager {
     }
 
     public onOpen(window: WaylandWindow) {
-        debugSSD("wm-on-open", {
-            windowId: window.id,
-            title: window.title.peek(),
-            appId: window.appId.peek(),
-            rect: rectForDebug(window.rect),
-            position: { ...window.position },
-        });
         window.focus();
         this.windowStack.add(window);
 
@@ -128,15 +105,6 @@ export class HybridWindowManager {
 
     public onFirstCommit(window: WaylandWindow) {
         const workspace = this.getCurrentWorkspace();
-        debugSSD("wm-on-first-commit", {
-            windowId: window.id,
-            title: window.title.peek(),
-            appId: window.appId.peek(),
-            workspace: workspace ? `${workspace.monitor}:${workspace.index}` : null,
-            tiled: workspace?.isTiled ?? false,
-            rect: rectForDebug(window.rect),
-            position: { ...window.position },
-        });
         if (workspace) {
             workspace.addWindow(window);
             this.syncWorkspaceVisibility();
@@ -713,16 +681,6 @@ export class Workspace {
         if (this.windows.map(window => window.id).includes(window.id)) {
             return;
         }
-        debugSSD("workspace-add-window", {
-            windowId: window.id,
-            monitor: this.monitor,
-            workspace: this.index,
-            tiled: this.isTiled,
-            beforeCount: this.windows.length,
-            openRunning: false,
-            rect: rectForDebug(window.rect),
-            position: { ...window.position },
-        });
         this.windows.push(window);
         this.activeWindowId = window.id;
         const visible = this.isActive();
@@ -737,13 +695,6 @@ export class Workspace {
 
         if (this.isTiled) {
             const initialRect = this.centeredFloatingRect(window);
-            debugSSD("workspace-add-window-tiled-initial-layout", {
-                windowId: window.id,
-                monitor: this.monitor,
-                workspace: this.index,
-                initialRect: rectForDebug(initialRect),
-                suppressSSDRebuild: false,
-            });
             window.state[WINDOW_STATE_FLOATING_RECT].set(initialRect);
             this.setTileWidthFromRect(window, initialRect, true);
             this.scrollToWindow(window);
@@ -940,18 +891,6 @@ export class Workspace {
         const animationOptions = suppressSSDRebuild && canSuppress
             ? MANAGED_WINDOW_ONLY_ANIMATION
             : undefined;
-        debugSSD("workspace-apply-layout", {
-            monitor: this.monitor,
-            workspace: this.index,
-            windowIds: tileable.map((window) => window.id),
-            activeWindowId: this.activeWindowId,
-            draggingWindowId: this.draggingWindowId,
-            scrollOffset: this.scrollOffset,
-            requestedSuppress: suppressSSDRebuild,
-            canSuppress,
-            usingSuppression: animationOptions !== undefined,
-            viewportRect: rectForDebug(viewportRect),
-        });
         let nextX = read(viewportRect.x) - this.scrollOffset;
 
         tileable.forEach((window, index) => {
@@ -965,16 +904,6 @@ export class Workspace {
                     height: tileHeight,
                 };
             if (window.id !== this.draggingWindowId) {
-                debugSSD("workspace-apply-layout-window", {
-                    windowId: window.id,
-                    monitor: this.monitor,
-                    workspace: this.index,
-                    index,
-                    openRunning: false,
-                    maximized: window.state[WINDOW_STATE_MAXIMIZED](),
-                    targetRect: rectForDebug(rect),
-                    usingSuppression: animationOptions !== undefined,
-                });
                 playRectAnimation(
                     window,
                     WINDOW_STATE_RECT,
@@ -1400,14 +1329,14 @@ function scheduleOpenAnimation(window: WaylandWindow): void {
             from: { x: 0, y: 200, width: 0, height: 0 },
             to: { x: 0, y: 0, width: 0, height: 0 },
             duration: OPEN_CLOSE_ANIMATION_DURATION,
-            easing: WINDOW_MANAGEMENT_EASING,
+            easing: WINDOW_OPEN_EASING,
             mode: "add",
         },
         opacity: {
             from: 0,
             to: 1,
             duration: OPEN_CLOSE_ANIMATION_DURATION,
-            easing: WINDOW_MANAGEMENT_EASING,
+            easing: WINDOW_OPEN_EASING,
             mode: "multiply",
         },
     });
