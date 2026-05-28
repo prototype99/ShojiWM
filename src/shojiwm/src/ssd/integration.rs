@@ -3414,7 +3414,6 @@ impl ShojiWM {
     }
 
     fn apply_managed_window_rects(&mut self, dirty_window_ids: &std::collections::HashSet<String>) {
-        let mut applied_any_rect = false;
         let windows = self
             .window_decorations
             .iter()
@@ -3729,13 +3728,15 @@ impl ShojiWM {
             self.snapshot_dirty_window_ids.insert(window_id);
             self.window_scene_generation = self.window_scene_generation.wrapping_add(1);
             self.schedule_redraw();
-            applied_any_rect = true;
         }
 
+        // Do not refresh pointer focus synchronously from apply_managed_window_rects.
+        // This can be called from inside pointer grab motion handling.
+        /*
         if applied_any_rect {
             let now_msec = std::time::Duration::from(self.clock.now()).as_millis() as u32;
             self.refresh_pointer_focus(now_msec);
-        }
+        }*/
     }
 }
 
