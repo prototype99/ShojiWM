@@ -743,8 +743,102 @@ pub fn render_if_needed(
     }
 
     if !processed_outputs.is_empty() {
-        state.pending_decoration_damage.clear();
-        state.clear_source_damage();
+        // In multi-monitor configurations the outputs run at independent
+        // refresh rates (eg. 66 Hz built-in + 120 Hz external). schedule_redraw
+        // unconditionally queues every output, so the faster / idle output
+        // (DP-4 with no app on it) can transition Queued → Processed before
+        // the output that actually contains the source window (eDP-1, here)
+        // has had a chance to consume the damage — eDP-1 is still in
+        // WaitingForVBlank from its previous render.
+        //
+        // The old behaviour was: as soon as ANY output is Processed, every
+        // `window_source_damage` entry is wiped. That dropped Chrome's
+        // partial-rect damage on the floor before kitty's backdrop on eDP-1
+        // could see it, which manifested as the backdrop reusing the cached
+        // texture and the "no propagation on multi-monitor" symptom (per
+        // window backdrop call rate fell from ~60 Hz to ~5 Hz).
+        //
+        // Fix: keep a damage entry alive while any output that the source
+        // window is visible on is still pending to render in the very near
+        // future (Queued, or WaitingForVBlank with redraw_needed=true — both
+        // mean the next vblank will queue another render that should observe
+        // this damage). Layer-shell damage uses the same rule but keyed by
+        // every output the layer is mapped on.
+        let pending_output_names: std::collections::HashSet<String> = state
+            .tty_backends
+            .values()
+            .flat_map(|backend| backend.surfaces.values())
+            .filter(|surface| {
+                matches!(
+                    surface.redraw_state,
+                    TtyRedrawState::Queued
+                        | TtyRedrawState::WaitingForVBlank { redraw_needed: true }
+                        | TtyRedrawState::WaitingForEstimatedVBlank { queued: true, .. }
+                )
+            })
+            .map(|surface| surface.output.name())
+            .collect();
+
+        if !pending_output_names.is_empty() {
+            // Build a snapshot of which outputs each owner window appears on
+            // so the retention filter doesn't need a `&mut self` reborrow per
+            // entry.
+            let window_outputs: std::collections::HashMap<String, Vec<String>> = state
+                .space
+                .elements()
+                .filter_map(|window| {
+                    let id = state
+                        .window_decorations
+                        .get(window)
+                        .map(|decoration| decoration.snapshot.id.clone())?;
+                    let outputs = state
+                        .space
+                        .outputs_for_element(window)
+                        .into_iter()
+                        .map(|output| output.name())
+                        .collect();
+                    Some((id, outputs))
+                })
+                .collect();
+            let mut layer_outputs: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for output in state.space.outputs() {
+                let output_name = output.name();
+                let map = smithay::desktop::layer_map_for_output(output);
+                for layer in map.layers() {
+                    layer_outputs
+                        .entry(layer.wl_surface().id().protocol_id().to_string())
+                        .or_default()
+                        .push(output_name.clone());
+                }
+            }
+
+            let owner_still_needed = |owner: &str,
+                                      visibility: &std::collections::HashMap<
+                String,
+                Vec<String>,
+            >|
+             -> bool {
+                visibility
+                    .get(owner)
+                    .map(|outputs| outputs.iter().any(|name| pending_output_names.contains(name)))
+                    .unwrap_or(false)
+            };
+
+            state
+                .window_source_damage
+                .retain(|entry| owner_still_needed(&entry.owner, &window_outputs));
+            state
+                .lower_layer_source_damage
+                .retain(|entry| owner_still_needed(&entry.owner, &layer_outputs));
+            state
+                .upper_layer_source_damage
+                .retain(|entry| owner_still_needed(&entry.owner, &layer_outputs));
+            state.pending_decoration_damage.clear();
+        } else {
+            state.pending_decoration_damage.clear();
+            state.clear_source_damage();
+        }
         state.finish_damage_blink_for_outputs(processed_outputs.iter().map(String::as_str));
     }
 
@@ -1340,6 +1434,26 @@ fn render_surface(
             .len();
             window_timing.direct_surface_lookup_ms =
                 direct_surface_lookup_started_at.elapsed().as_secs_f64() * 1000.0;
+            if std::env::var_os("SHOJI_SOURCE_DAMAGE_DEBUG").is_some() {
+                let title = window_decorations
+                    .get(window)
+                    .map(|d| d.snapshot.title.clone())
+                    .unwrap_or_default();
+                let has_backdrop_source_probe = direct_surface_count > 0
+                    || live_window_snapshots.contains_key(&window_id)
+                    || complete_window_snapshots.contains_key(&window_id);
+                let decoration_ready_probe = windows_ready_for_decoration.contains(&window_id);
+                tracing::info!(
+                    output = %output.name(),
+                    window_id = %window_id,
+                    title = %title,
+                    direct_surface_count,
+                    skipping = direct_surface_count == 0,
+                    has_backdrop_source = has_backdrop_source_probe,
+                    decoration_ready = decoration_ready_probe,
+                    "per-window loop direct_surface_count probe"
+                );
+            }
             if direct_surface_count == 0 {
                 if close_debug {
                     tracing::info!(

@@ -134,8 +134,22 @@ pub fn handle_commit(state: &mut ShojiWM, surface: &WlSurface) {
             .output_geometry(&output)
             .map(|geo| geo.loc)
             .unwrap_or_default();
-        let layer_rect = layer_geo
-            .map(|geo| crate::ssd::LogicalRect::new(geo.loc.x, geo.loc.y, geo.size.w, geo.size.h));
+        // `layer_geometry` returns coordinates relative to the output's layer
+        // map (output-local). `window_source_damage`, the effect-rect we
+        // intersect against in `source_damage_intersects_rect`, and every
+        // other consumer of these rects operate in **global** logical space.
+        // Translate by the output origin here so multi-monitor setups don't
+        // silently drop backdrop invalidation on non-primary outputs (where
+        // output_loc.x/y > 0 means the local-coord rect never intersects the
+        // global effect rect).
+        let layer_rect = layer_geo.map(|geo| {
+            crate::ssd::LogicalRect::new(
+                output_loc.x + geo.loc.x,
+                output_loc.y + geo.loc.y,
+                geo.size.w,
+                geo.size.h,
+            )
+        });
         let owner = format!("{}", layer_surface_id(&root));
         if layer_popup_root_debug_enabled() {
             info!(
@@ -158,7 +172,7 @@ pub fn handle_commit(state: &mut ShojiWM, surface: &WlSurface) {
                     output_loc = ?output_loc,
                     global_loc_x = output_loc.x + geo.loc.x,
                     global_loc_y = output_loc.y + geo.loc.y,
-                    "layer source damage stored (output-local coords, NOT global)"
+                    "layer source damage stored (global coords)"
                 );
             }
         }

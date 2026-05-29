@@ -2740,7 +2740,7 @@ impl ShojiWM {
         }
 
         let mapped = damage_rects
-            .into_iter()
+            .iter()
             .map(|rect| {
                 transformed_rect(
                     LogicalRect::new(
@@ -2754,6 +2754,25 @@ impl ShojiWM {
                 )
             })
             .collect::<Vec<_>>();
+
+        if std::env::var_os("SHOJI_SOURCE_DAMAGE_DEBUG").is_some() {
+            let element_location = self.space.element_location(window);
+            let geometry = window.geometry();
+            tracing::info!(
+                window_id = %decoration.snapshot.id,
+                title = %decoration.snapshot.title,
+                app_id = ?decoration.snapshot.app_id,
+                is_xwayland = decoration.snapshot.is_xwayland,
+                element_location = ?element_location,
+                window_geometry = ?geometry,
+                client_rect = ?decoration.client_rect,
+                layout_root_rect = ?decoration.layout.root.rect,
+                visual_transform = ?decoration.visual_transform,
+                raw_damage_rects = ?damage_rects,
+                mapped_damage_rects = ?mapped,
+                "source damage debug: window damage extracted (inputs + mapping)"
+            );
+        }
 
         mapped
     }
