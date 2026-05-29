@@ -1045,6 +1045,7 @@ pub fn init_winit(
                                     &output,
                                     &state.cursor_status,
                                     &render_output_result.states,
+                                    &state.window_decorations,
                                 );
 
                                 let frame_time = Duration::from(state.clock.now())

@@ -69,10 +69,43 @@ fn prefer_next_primary_scanout_compare<'a>(
     next_output
 }
 
-fn stable_primary_output_for_window(space: &Space<Window>, window: &Window) -> Option<Output> {
+fn stable_primary_output_for_window(
+    space: &Space<Window>,
+    window: &Window,
+    visible_outputs: Option<&[String]>,
+) -> Option<Output> {
     let rect = space.element_bbox(window)?;
+
+    // Filter candidate outputs by `visibleOutputs` when the window declared
+    // one. Workspace horizontal scroll positions tile windows far outside the
+    // visible viewport — and that scrolled-out bbox happily intersects an
+    // adjacent monitor's logical area. Without this filter the primary
+    // scanout output flips to the unrelated monitor mid-scroll, which then
+    // pushes the other monitor's scale to the client via
+    // `wp_fractional_scale.preferred_scale`. The xdg client reconfigures,
+    // SSD relayouts, buffers re-raster — visible frame drops even on a
+    // gaming-class GPU. Pinning candidacy to the visibleOutputs set keeps
+    // the primary anchored to the workspace's home monitor regardless of
+    // where the scrolled-off rect happens to land.
+    let candidate_outputs: Vec<&Output> = if let Some(allowed) = visible_outputs {
+        let filtered: Vec<&Output> = space
+            .outputs()
+            .filter(|output| allowed.iter().any(|name| name == &output.name()))
+            .collect();
+        if filtered.is_empty() {
+            // visibleOutputs referenced names that no longer match any
+            // connected output (eg. monitor unplugged). Fall through to
+            // the full set rather than dropping primary assignment entirely.
+            space.outputs().collect()
+        } else {
+            filtered
+        }
+    } else {
+        space.outputs().collect()
+    };
+
     let mut overlaps = Vec::new();
-    for output in space.outputs() {
+    for output in &candidate_outputs {
         let Some(geometry) = space.output_geometry(output) else {
             continue;
         };
@@ -81,12 +114,18 @@ fn stable_primary_output_for_window(space: &Space<Window>, window: &Window) -> O
             .map(|overlap| i64::from(overlap.size.w) * i64::from(overlap.size.h))
             .unwrap_or(0);
         if area > 0 {
-            overlaps.push((output.clone(), area));
+            overlaps.push(((*output).clone(), area));
         }
     }
 
     if overlaps.is_empty() {
-        return None;
+        // Window's bbox doesn't intersect any candidate output (scrolled
+        // entirely off-screen of its home monitor). Pick the first
+        // candidate as a deterministic fallback so we keep emitting
+        // preferred_scale = home-monitor scale rather than dropping the
+        // primary assignment and letting smithay's default selection take
+        // over.
+        return candidate_outputs.first().map(|output| (*output).clone());
     }
 
     let mut current_primary = None;
@@ -195,6 +234,7 @@ pub fn update_primary_scanout_output(
     output: &Output,
     cursor_status: &smithay::input::pointer::CursorImageStatus,
     render_element_states: &RenderElementStates,
+    window_decorations: &HashMap<Window, crate::ssd::WindowDecorationState>,
 ) {
     // Keep smithay's primary-scanout bookkeeping in sync with the surfaces we actually rendered.
     //
@@ -203,7 +243,12 @@ pub fn update_primary_scanout_output(
     // output cadence was only ~60 Hz even when the monitor was actually running at 66 Hz.
     let throttle_debug = frame_throttle_debug_enabled();
     space.elements().for_each(|window| {
-        let Some(selected_primary_output) = stable_primary_output_for_window(space, window) else {
+        let visible_outputs = window_decorations
+            .get(window)
+            .and_then(|decoration| decoration.managed_window.visible_outputs.clone());
+        let Some(selected_primary_output) =
+            stable_primary_output_for_window(space, window, visible_outputs.as_deref())
+        else {
             return;
         };
 

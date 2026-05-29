@@ -654,57 +654,127 @@ impl DecorationRuntimeEvaluator {
 
 impl ShojiWM {
     fn decoration_layout_scale_for_window(&self, window: &Window) -> f64 {
-        self.space
-            .outputs_for_element(window)
-            .into_iter()
-            .map(|output| output.current_scale().fractional_scale())
-            .fold(1.0f64, f64::max)
-            .max(1.0)
+        let visible_outputs = self.visible_outputs_for_window(window);
+        let rect = self
+            .window_decorations
+            .get(window)
+            .map(|decoration| decoration.layout.root.rect);
+        self.layout_scale_for_rect_with_visible(rect, visible_outputs.as_deref())
     }
 
     fn decoration_layout_scale_for_rect(&self, rect: LogicalRect) -> f64 {
-        let logical = smithay::utils::Rectangle::new(
-            smithay::utils::Point::from((rect.x, rect.y)),
-            (rect.width, rect.height).into(),
-        );
-        self.space
-            .outputs()
-            .filter_map(|output| {
-                let geometry = self.space.output_geometry(output)?;
-                logical
-                    .intersection(geometry)
-                    .map(|_| output.current_scale().fractional_scale())
-            })
-            .fold(1.0f64, f64::max)
-            .max(1.0)
+        self.layout_scale_for_rect_with_visible(Some(rect), None)
     }
 
     fn decoration_raster_scale_for_window(&self, window: &Window) -> i32 {
-        self.space
-            .outputs_for_element(window)
-            .into_iter()
-            .map(|output| output.current_scale().fractional_scale().ceil() as i32)
-            .max()
-            .unwrap_or(1)
-            .max(1)
+        let visible_outputs = self.visible_outputs_for_window(window);
+        let rect = self
+            .window_decorations
+            .get(window)
+            .map(|decoration| decoration.layout.root.rect);
+        self.raster_scale_for_rect_with_visible(rect, visible_outputs.as_deref())
     }
 
     fn decoration_raster_scale_for_rect(&self, rect: LogicalRect) -> i32 {
-        let logical = smithay::utils::Rectangle::new(
-            smithay::utils::Point::from((rect.x, rect.y)),
-            (rect.width, rect.height).into(),
-        );
-        self.space
+        self.raster_scale_for_rect_with_visible(Some(rect), None)
+    }
+
+    fn visible_outputs_for_window(&self, window: &Window) -> Option<Vec<String>> {
+        self.window_decorations
+            .get(window)
+            .and_then(|decoration| decoration.managed_window.visible_outputs.clone())
+    }
+
+    /// Scale selection that honours the window's `visibleOutputs`.
+    ///
+    /// Workspace scroll positions windows far outside the active viewport;
+    /// without a filter, `space.outputs()` happily reports any output whose
+    /// logical geometry happens to intersect that scrolled-out rect, and the
+    /// computed scale flips to that unrelated monitor's value mid-scroll. The
+    /// SSD layout / raster scale then mutates, which forces a full layout +
+    /// buffer rebuild every frame the rect crosses a monitor boundary. On
+    /// multi-monitor setups with mixed fractional scales this shows up as
+    /// visible scroll frame drops even on high-end hardware.
+    ///
+    /// Strategy:
+    /// 1. If the caller provided `visible_outputs`, restrict candidates to
+    ///    that set; otherwise fall back to every output (the `_for_rect`
+    ///    flavour preserves the previous behaviour for callers that don't
+    ///    have a window context).
+    /// 2. Prefer the max fractional scale among candidates whose geometry
+    ///    intersects `rect`. This is the visually-correct value the moment
+    ///    the window is on-screen.
+    /// 3. If none intersect (scrolled completely off-screen of every visible
+    ///    output, or `rect` is None), fall back to the max scale across the
+    ///    candidate set itself. This keeps the SSD layout / raster scale
+    ///    pinned to the workspace's "home" output rather than swinging to
+    ///    whichever other monitor the rect happens to drift into.
+    fn layout_scale_for_rect_with_visible(
+        &self,
+        rect: Option<LogicalRect>,
+        visible_outputs: Option<&[String]>,
+    ) -> f64 {
+        self.fold_candidate_scales(rect, visible_outputs, 1.0, f64::max)
+    }
+
+    fn raster_scale_for_rect_with_visible(
+        &self,
+        rect: Option<LogicalRect>,
+        visible_outputs: Option<&[String]>,
+    ) -> i32 {
+        self.fold_candidate_scales(rect, visible_outputs, 1, |acc, scale| {
+            acc.max(scale.ceil() as i32)
+        })
+    }
+
+    fn fold_candidate_scales<T, F>(
+        &self,
+        rect: Option<LogicalRect>,
+        visible_outputs: Option<&[String]>,
+        initial: T,
+        mut combine: F,
+    ) -> T
+    where
+        T: Copy,
+        F: FnMut(T, f64) -> T,
+    {
+        let candidates: Vec<_> = self
+            .space
             .outputs()
-            .filter_map(|output| {
-                let geometry = self.space.output_geometry(output)?;
-                logical
-                    .intersection(geometry)
-                    .map(|_| output.current_scale().fractional_scale().ceil() as i32)
+            .filter(|output| match visible_outputs {
+                Some(allowed) => allowed.iter().any(|name| name == &output.name()),
+                None => true,
             })
-            .max()
-            .unwrap_or(1)
-            .max(1)
+            .collect();
+
+        let mut matched_any_intersection = false;
+        let mut intersecting_acc = initial;
+        if let Some(rect) = rect {
+            let logical = smithay::utils::Rectangle::new(
+                smithay::utils::Point::from((rect.x, rect.y)),
+                (rect.width, rect.height).into(),
+            );
+            for output in &candidates {
+                let Some(geometry) = self.space.output_geometry(output) else {
+                    continue;
+                };
+                if logical.intersection(geometry).is_none() {
+                    continue;
+                }
+                matched_any_intersection = true;
+                intersecting_acc =
+                    combine(intersecting_acc, output.current_scale().fractional_scale());
+            }
+        }
+        if matched_any_intersection {
+            return intersecting_acc;
+        }
+
+        let mut fallback_acc = initial;
+        for output in &candidates {
+            fallback_acc = combine(fallback_acc, output.current_scale().fractional_scale());
+        }
+        fallback_acc
     }
 
     pub fn apply_runtime_handler_invocation(

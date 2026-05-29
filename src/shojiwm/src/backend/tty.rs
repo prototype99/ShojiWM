@@ -3917,6 +3917,7 @@ fn render_surface(
             &output,
             &cursor_status_for_log,
             &result.states,
+            window_decorations,
         );
         if !result.is_empty {
             restore_presented_window_surface_primary_outputs(&state.space, &output, &result.states);
