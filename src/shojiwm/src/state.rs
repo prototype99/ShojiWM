@@ -250,6 +250,8 @@ pub struct ShojiWM {
     pub windows_ready_for_decoration: HashSet<String>,
     pub pending_xdg_state_configure_window_ids: HashSet<String>,
     pub live_window_snapshots: HashMap<String, LiveWindowSnapshot>,
+    pub live_window_snapshot_trackers:
+        HashMap<String, smithay::backend::renderer::damage::OutputDamageTracker>,
     pub complete_window_snapshots: HashMap<String, LiveWindowSnapshot>,
     pub complete_window_snapshot_trackers:
         HashMap<String, smithay::backend::renderer::damage::OutputDamageTracker>,
@@ -736,6 +738,7 @@ impl ShojiWM {
             windows_ready_for_decoration: HashSet::new(),
             pending_xdg_state_configure_window_ids: HashSet::new(),
             live_window_snapshots: HashMap::new(),
+            live_window_snapshot_trackers: HashMap::new(),
             complete_window_snapshots: HashMap::new(),
             complete_window_snapshot_trackers: HashMap::new(),
             closing_window_snapshots: HashMap::new(),

@@ -793,6 +793,25 @@ impl CompiledEffect {
             })
     }
 
+    pub fn uses_window_source_input(&self) -> bool {
+        matches!(self.input, EffectInput::WindowSource(_))
+            || self.pipeline.iter().any(|stage| match stage {
+                EffectStage::Blend { input, .. } => {
+                    matches!(input, EffectInput::WindowSource(_))
+                }
+                EffectStage::Unit(effect) => effect.uses_window_source_input(),
+                _ => false,
+            })
+    }
+
+    /// Whether this effect can resolve all of its dynamic inputs from the
+    /// framebuffer immediately behind the element.
+    pub fn supports_framebuffer_backdrop(&self) -> bool {
+        self.uses_backdrop_input()
+            && !self.uses_xray_backdrop_input()
+            && !self.uses_window_source_input()
+    }
+
     pub fn blur_stage(&self) -> Option<BackdropBlur> {
         self.pipeline.iter().find_map(|stage| match stage {
             EffectStage::DualKawaseBlur(blur) => Some(*blur),
@@ -4658,5 +4677,48 @@ mod tests {
         assert_eq!(slot, client_rect);
         assert_eq!(layout.root.rect.x, client_rect.x - 2);
         assert_eq!(layout.root.rect.width, client_rect.width + 5);
+    }
+
+    #[test]
+    fn framebuffer_backdrop_support_depends_on_inputs_not_pipeline_shape() {
+        let backdrop = CompiledEffect {
+            input: EffectInput::Backdrop,
+            invalidate: EffectInvalidationPolicy::Always,
+            pipeline: vec![
+                EffectStage::Noise(NoiseStage {
+                    kind: NoiseKind::Salt,
+                    amount: 0.1,
+                }),
+                EffectStage::Save("noisy".into()),
+                EffectStage::Blend {
+                    input: EffectInput::Named("noisy".into()),
+                    mode: BlendMode::Screen,
+                    alpha: 0.5,
+                },
+            ],
+        };
+        assert!(backdrop.supports_framebuffer_backdrop());
+
+        let xray = CompiledEffect {
+            input: EffectInput::Backdrop,
+            invalidate: EffectInvalidationPolicy::Always,
+            pipeline: vec![EffectStage::Unit(Box::new(CompiledEffect {
+                input: EffectInput::XrayBackdrop,
+                invalidate: EffectInvalidationPolicy::Always,
+                pipeline: Vec::new(),
+            }))],
+        };
+        assert!(!xray.supports_framebuffer_backdrop());
+
+        let window_source = CompiledEffect {
+            input: EffectInput::Backdrop,
+            invalidate: EffectInvalidationPolicy::Always,
+            pipeline: vec![EffectStage::Blend {
+                input: EffectInput::WindowSource(WindowSourceInclude::Full),
+                mode: BlendMode::Normal,
+                alpha: 1.0,
+            }],
+        };
+        assert!(!window_source.supports_framebuffer_backdrop());
     }
 }

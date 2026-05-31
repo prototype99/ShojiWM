@@ -107,6 +107,7 @@ fn capture_snapshot_from_output_elements(
     rect: crate::ssd::LogicalRect,
     scale: smithay::utils::Scale<f64>,
     existing: Option<crate::backend::snapshot::LiveWindowSnapshot>,
+    tracker: &mut smithay::backend::renderer::damage::OutputDamageTracker,
     elements: &[WinitRenderElements],
 ) -> Result<
     Option<crate::backend::snapshot::LiveWindowSnapshot>,
@@ -126,20 +127,8 @@ fn capture_snapshot_from_output_elements(
             )
         })
         .collect::<Vec<_>>();
-    let mut tracker = smithay::backend::renderer::damage::OutputDamageTracker::new(
-        (0, 0),
-        1.0,
-        smithay::utils::Transform::Normal,
-    );
     snapshot::capture_snapshot(
-        renderer,
-        existing,
-        &mut tracker,
-        rect,
-        0,
-        true,
-        scale,
-        &relocated,
+        renderer, existing, tracker, rect, 0, true, scale, &relocated,
     )
 }
 
@@ -376,14 +365,11 @@ pub fn init_winit(
                                 .window_decorations
                                 .get(window)
                                 .map(|decoration| decoration.snapshot.id.clone());
-                            let window_has_snapshot_damage =
-                                snapshot_id.as_ref().is_some_and(|snapshot_id| {
+                            let window_has_snapshot_damage = snapshot_id.as_ref().is_some_and(
+                                |snapshot_id| {
                                     state.snapshot_dirty_window_ids.contains(snapshot_id)
-                                        || state
-                                            .window_source_damage
-                                            .iter()
-                                            .any(|damage| damage.owner == *snapshot_id)
-                                });
+                                },
+                            );
                             if ((use_full_window_snapshot != used_transform_snapshot_last_frame)
                                 || (use_full_window_snapshot && window_has_snapshot_damage))
                                 && let Some(decoration) = state.window_decorations.get(window)
@@ -399,6 +385,7 @@ pub fn init_winit(
                                     .insert(window_id.clone());
                             } else {
                                 state.transform_snapshot_window_ids.remove(&window_id);
+                                state.complete_window_snapshot_trackers.remove(&window_id);
                             }
                             let composition_visual = if use_full_window_snapshot {
                                 WindowVisualState {
@@ -434,27 +421,37 @@ pub fn init_winit(
                                     },
                                     decoration_ready,
                                     false,
+                                    !use_full_window_snapshot,
                                 );
-                                backdrop_items.extend(
-                                    configured_background_effect_elements_for_window(
-                                        renderer,
-                                        state,
-                                        &output,
-                                        output_geo,
-                                        scale,
-                                        &windows_top_to_bottom,
-                                        _window_index,
-                                        window,
-                                        if use_full_window_snapshot {
-                                            1.0
-                                        } else {
-                                            visual_state.opacity
-                                        },
-                                        false,
-                                    )
-                                    .into_iter()
-                                    .map(|(order, element)| (order, element, true)),
-                                );
+                                let use_configured_framebuffer_backdrop = !use_full_window_snapshot
+                                    && state
+                                        .configured_background_effect
+                                        .as_ref()
+                                        .is_some_and(|config| {
+                                            config.effect.supports_framebuffer_backdrop()
+                                        });
+                                if !use_configured_framebuffer_backdrop {
+                                    backdrop_items.extend(
+                                        configured_background_effect_elements_for_window(
+                                            renderer,
+                                            state,
+                                            &output,
+                                            output_geo,
+                                            scale,
+                                            &windows_top_to_bottom,
+                                            _window_index,
+                                            window,
+                                            if use_full_window_snapshot {
+                                                1.0
+                                            } else {
+                                                visual_state.opacity
+                                            },
+                                            false,
+                                        )
+                                        .into_iter()
+                                        .map(|(order, element)| (order, element, true)),
+                                    );
+                                }
                                 for (order, element, render_as_backdrop) in backdrop_items.drain(..) {
                                     if let Some(root_origin) = root_origin {
                                         let transformed = transform_backdrop_elements(
@@ -471,10 +468,34 @@ pub fn init_winit(
                                         }
                                     }
                                 }
+                                if use_configured_framebuffer_backdrop {
+                                    for (order, element) in
+                                        configured_background_framebuffer_effect_elements_for_window(
+                                            renderer,
+                                            state,
+                                            window,
+                                            output_geo,
+                                            scale,
+                                            visual_state.opacity,
+                                        )
+                                    {
+                                        if let Some(root_origin) = root_origin {
+                                            ordered_backdrop_elements.extend(
+                                                transform_decoration_elements(
+                                                    vec![decoration::DecorationSceneElements::Backdrop(element)],
+                                                    root_origin,
+                                                    composition_visual,
+                                                )
+                                                .into_iter()
+                                                .map(|item| (order, item)),
+                                            );
+                                        }
+                                    }
+                                }
                                 if let Some(decoration_state) =
                                     state.window_decorations.get_mut(window)
                                 {
-                                    let mut background_items = decoration::ordered_background_elements_for_window(
+                                    let mut background_items = decoration::ordered_background_elements_for_window_with_framebuffer_backdrops(
                                         renderer,
                                         decoration_state,
                                         output_geo,
@@ -484,6 +505,7 @@ pub fn init_winit(
                                         } else {
                                             visual_state.opacity
                                         },
+                                        !use_full_window_snapshot,
                                     )
                                     .inspect_err(|error| {
                                         warn!(?error, "failed to build decoration background elements");
@@ -492,11 +514,19 @@ pub fn init_winit(
                                     background_items.sort_by_key(|(order, _)| *order);
                                     for (order, element) in background_items {
                                         if let Some(root_origin) = root_origin {
-                                            ordered_ui_elements.extend(
+                                            let render_as_backdrop = matches!(
+                                                element,
+                                                decoration::DecorationSceneElements::Backdrop(_)
+                                            );
+                                            let transformed =
                                                 transform_decoration_elements(vec![element], root_origin, composition_visual)
                                                     .into_iter()
-                                                    .map(|item| (order, item)),
-                                            );
+                                                    .map(|item| (order, item));
+                                            if render_as_backdrop {
+                                                ordered_backdrop_elements.extend(transformed);
+                                            } else {
+                                                ordered_ui_elements.extend(transformed);
+                                            }
                                         }
                                     }
                                 }
@@ -849,7 +879,7 @@ pub fn init_winit(
                                 let snapshot_element = full_rect
                                     .and_then(|full_rect| {
                                         if !window_has_snapshot_damage {
-                                            if let Some(existing) = state
+                                            if let Some(mut existing) = state
                                                 .complete_window_snapshots
                                                 .get(&window_id)
                                                 .cloned()
@@ -858,17 +888,33 @@ pub fn init_winit(
                                                         == snapshot_scene_signature
                                                 })
                                             {
+                                                existing.rect = full_rect;
+                                                state.complete_window_snapshots.insert(
+                                                    window_id.clone(),
+                                                    existing.clone(),
+                                                );
                                                 return Some(existing);
                                             }
                                         }
                                         let existing_complete =
                                             state.complete_window_snapshots.remove(&window_id);
+                                        let tracker = state
+                                            .complete_window_snapshot_trackers
+                                            .entry(window_id.clone())
+                                            .or_insert_with(|| {
+                                                OutputDamageTracker::new(
+                                                    (0, 0),
+                                                    1.0,
+                                                    smithay::utils::Transform::Normal,
+                                                )
+                                            });
                                         capture_snapshot_from_output_elements(
                                             renderer,
                                             output_geo,
                                             full_rect,
                                             scale,
                                             existing_complete,
+                                            tracker,
                                             &snapshot_scene,
                                         )
                                         .ok()
@@ -913,16 +959,29 @@ pub fn init_winit(
                                 .windows_ready_for_decoration
                                 .insert(window_id.clone());
 
+                            if let Some(decoration) = state.window_decorations.get(window)
+                                && let Some(live_snapshot) = state
+                                    .live_window_snapshots
+                                    .get_mut(&decoration.snapshot.id)
+                            {
+                                snapshot::retarget_snapshot_rect(
+                                    live_snapshot,
+                                    decoration.client_rect,
+                                );
+                            }
                             let should_refresh_snapshot = state
                                 .window_decorations
                                 .get(window)
                                 .map(|decoration| {
-                                    window_has_snapshot_damage
-                                        || state
-                                            .live_window_snapshots
-                                            .get(&decoration.snapshot.id)
-                                            .map(|snapshot| snapshot.rect != decoration.client_rect)
-                                            .unwrap_or(true)
+                                    state
+                                        .live_window_snapshots
+                                        .get(&decoration.snapshot.id)
+                                        .map(|snapshot| {
+                                            snapshot.rect.width != decoration.client_rect.width
+                                                || snapshot.rect.height
+                                                    != decoration.client_rect.height
+                                        })
+                                        .unwrap_or(true)
                                 })
                                 .unwrap_or(false);
                             if should_refresh_snapshot {
@@ -945,6 +1004,9 @@ pub fn init_winit(
                                         state.snapshot_dirty_window_ids.remove(&window_id);
                                     }
                                 }
+                            }
+                            if let Some(snapshot_id) = snapshot_id.as_ref() {
+                                state.snapshot_dirty_window_ids.remove(snapshot_id);
                             }
 
                         }
@@ -1451,6 +1513,7 @@ fn backdrop_shader_elements_for_window(
     alpha: f32,
     has_backdrop_source: bool,
     apply_visual_transform: bool,
+    prefer_framebuffer_backdrops: bool,
 ) -> Vec<(
     usize,
     crate::backend::shader_effect::StableBackdropTextureElement,
@@ -1460,11 +1523,10 @@ fn backdrop_shader_elements_for_window(
         let Some(decoration) = state.window_decorations.get(window) else {
             return Vec::new();
         };
-        if !decoration
-            .shader_buffers
-            .iter()
-            .any(|cached| cached.shader.is_texture_backed())
-        {
+        if !decoration.shader_buffers.iter().any(|cached| {
+            cached.shader.is_texture_backed()
+                && (!prefer_framebuffer_backdrops || !cached.shader.supports_framebuffer_backdrop())
+        }) {
             return Vec::new();
         }
     }
@@ -1482,7 +1544,11 @@ fn backdrop_shader_elements_for_window(
         .shader_buffers
         .clone()
         .iter()
-        .filter(|cached| cached.shader.is_texture_backed())
+        .filter(|cached| {
+            cached.shader.is_texture_backed()
+                && (!prefer_framebuffer_backdrops
+                    || !cached.shader.supports_framebuffer_backdrop())
+        })
         .filter_map(|cached| {
             let uses_backdrop = cached.shader.uses_backdrop_input();
             let uses_xray = cached.shader.uses_xray_backdrop_input();
@@ -3075,6 +3141,45 @@ fn upper_layer_scene_elements(
     elements
 }
 
+fn configured_background_framebuffer_effect_elements_for_window(
+    renderer: &mut GlesRenderer,
+    state: &mut ShojiWM,
+    window: &smithay::desktop::Window,
+    output_geo: Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    alpha: f32,
+) -> Vec<(
+    usize,
+    crate::backend::shader_effect::StableBackdropFramebufferElement,
+)> {
+    let Some(config) = state.configured_background_effect.clone() else {
+        return Vec::new();
+    };
+    let rects = protocol_background_effect_rects_for_window(state, window);
+    let Some(decoration) = state.window_decorations.get_mut(window) else {
+        return Vec::new();
+    };
+    rects
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, rect)| {
+            crate::backend::decoration::framebuffer_backdrop_element_for_window_rect(
+                renderer,
+                decoration,
+                format!("__protocol_background_effect_framebuffer_{}", index),
+                rect,
+                config.effect.clone(),
+                output_geo,
+                scale,
+                alpha,
+            )
+            .ok()
+            .flatten()
+            .map(|element| (index, element))
+        })
+        .collect()
+}
+
 fn configured_background_effect_elements_for_window(
     renderer: &mut GlesRenderer,
     state: &mut ShojiWM,
@@ -3686,10 +3791,11 @@ fn capture_live_snapshot_for_window(
     scale: smithay::utils::Scale<f64>,
     z_index: usize,
 ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
-    let Some(decoration) = state.window_decorations.get_mut(window) else {
+    let Some(decoration) = state.window_decorations.get(window) else {
         return Ok(());
     };
     let client_rect = decoration.client_rect;
+    let snapshot_id = decoration.snapshot.id.clone();
     let snapshot_geo = Rectangle::new(
         smithay::utils::Point::from((client_rect.x, client_rect.y)),
         (client_rect.width, client_rect.height).into(),
@@ -3699,6 +3805,9 @@ fn capture_live_snapshot_for_window(
     let mut elements: Vec<WinitRenderElements> = Vec::new();
     let surface_elements =
         window_render::surface_elements(window, renderer, physical_location, scale, 1.0);
+    if surface_elements.is_empty() {
+        return Ok(());
+    }
     let has_client_content = !surface_elements.is_empty();
     elements.extend(
         surface_elements
@@ -3706,16 +3815,21 @@ fn capture_live_snapshot_for_window(
             .map(WinitRenderElements::Window),
     );
 
-    let existing = state.live_window_snapshots.remove(&decoration.snapshot.id);
-    let mut live_tracker = smithay::backend::renderer::damage::OutputDamageTracker::new(
-        (0, 0),
-        1.0,
-        smithay::utils::Transform::Normal,
-    );
+    let existing = state.live_window_snapshots.remove(&snapshot_id);
+    let live_tracker = state
+        .live_window_snapshot_trackers
+        .entry(snapshot_id.clone())
+        .or_insert_with(|| {
+            smithay::backend::renderer::damage::OutputDamageTracker::new(
+                (0, 0),
+                1.0,
+                smithay::utils::Transform::Normal,
+            )
+        });
     if let Some(snapshot) = snapshot::capture_snapshot(
         renderer,
         existing,
-        &mut live_tracker,
+        live_tracker,
         client_rect,
         z_index,
         has_client_content,
@@ -3724,13 +3838,13 @@ fn capture_live_snapshot_for_window(
     )? {
         state
             .live_window_snapshots
-            .insert(decoration.snapshot.id.clone(), snapshot);
+            .insert(snapshot_id.clone(), snapshot);
         if has_client_content {
-            if let Some(snapshot) = state.live_window_snapshots.get(&decoration.snapshot.id) {
+            if let Some(snapshot) = state.live_window_snapshots.get(&snapshot_id) {
                 if let Ok(complete_snapshot) = snapshot::duplicate_snapshot(renderer, snapshot) {
                     state
                         .complete_window_snapshots
-                        .insert(decoration.snapshot.id.clone(), complete_snapshot);
+                        .insert(snapshot_id, complete_snapshot);
                 }
             }
         }

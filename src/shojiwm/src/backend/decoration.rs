@@ -10,7 +10,10 @@ use tracing::trace;
 
 use crate::{
     backend::rounded::{RoundedClip, RoundedRectSpec, RoundedShapeKind, StableRoundedElement},
-    backend::shader_effect::{ShaderEffectError, ShaderEffectSpec, StableShaderEffectElement},
+    backend::shader_effect::{
+        ShaderEffectError, ShaderEffectSpec, StableBackdropFramebufferElement,
+        StableShaderEffectElement,
+    },
     backend::text,
     backend::visual::{
         RectSnapMode, relative_physical_rect_from_root, relative_physical_rect_from_root_precise,
@@ -671,6 +674,19 @@ pub fn ordered_background_elements_for_window(
     scale: Scale<f64>,
     alpha: f32,
 ) -> Result<Vec<(usize, DecorationSceneElements)>, DecorationSceneError> {
+    ordered_background_elements_for_window_with_framebuffer_backdrops(
+        renderer, decoration, output_geo, scale, alpha, false,
+    )
+}
+
+pub fn ordered_background_elements_for_window_with_framebuffer_backdrops(
+    renderer: &mut GlesRenderer,
+    decoration: &mut WindowDecorationState,
+    output_geo: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    alpha: f32,
+    include_framebuffer_backdrops: bool,
+) -> Result<Vec<(usize, DecorationSceneElements)>, DecorationSceneError> {
     let mut items = Vec::new();
 
     for cached in decoration.buffers.clone() {
@@ -682,6 +698,14 @@ pub fn ordered_background_elements_for_window(
     }
 
     for cached in decoration.shader_buffers.clone() {
+        if include_framebuffer_backdrops && cached.shader.supports_framebuffer_backdrop() {
+            if let Some(element) = backdrop_shader_effect_element(
+                renderer, decoration, &cached, output_geo, scale, alpha,
+            )? {
+                items.push((cached.order, DecorationSceneElements::Backdrop(element)));
+            }
+            continue;
+        }
         if cached.shader.is_texture_backed() {
             continue;
         }
@@ -694,6 +718,31 @@ pub fn ordered_background_elements_for_window(
 
     items.sort_by_key(|(order, _)| *order);
     Ok(items)
+}
+
+pub fn framebuffer_backdrop_element_for_window_rect(
+    renderer: &mut GlesRenderer,
+    decoration: &mut WindowDecorationState,
+    stable_key: String,
+    rect: LogicalRect,
+    effect: crate::ssd::CompiledEffect,
+    output_geo: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    alpha: f32,
+) -> Result<Option<StableBackdropFramebufferElement>, ShaderEffectError> {
+    let cached = crate::backend::shader_effect::CachedShaderEffect {
+        owner_node_id: None,
+        stable_key,
+        order: 0,
+        rect,
+        rect_precise: None,
+        shader: effect,
+        clip_rect: None,
+        clip_radius: 0,
+        clip_rect_precise: None,
+        clip_radius_precise: None,
+    };
+    backdrop_shader_effect_element(renderer, decoration, &cached, output_geo, scale, alpha)
 }
 
 pub fn text_elements_for_window(
@@ -1751,19 +1800,35 @@ mod tests {
     }
 }
 
-fn shader_effect_element(
+fn backdrop_shader_effect_element(
     renderer: &mut GlesRenderer,
     decoration: &mut crate::ssd::WindowDecorationState,
     cached: &crate::backend::shader_effect::CachedShaderEffect,
     output_geo: Rectangle<i32, Logical>,
     scale: Scale<f64>,
     alpha: f32,
-) -> Result<Option<StableShaderEffectElement>, ShaderEffectError> {
-    if gap_show_border_shell_only_enabled() {
+) -> Result<Option<StableBackdropFramebufferElement>, ShaderEffectError> {
+    let Some(spec) = shader_effect_spec(decoration, cached, output_geo, scale, alpha) else {
         return Ok(None);
-    }
-    if intersect_logical_rect(cached.rect, output_geo).is_none() {
-        return Ok(None);
+    };
+    let state = decoration
+        .shader_cache
+        .entry(cached.stable_key.clone())
+        .or_default();
+    Ok(Some(state.backdrop_element(renderer, spec)?))
+}
+
+fn shader_effect_spec(
+    decoration: &crate::ssd::WindowDecorationState,
+    cached: &crate::backend::shader_effect::CachedShaderEffect,
+    output_geo: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    alpha: f32,
+) -> Option<ShaderEffectSpec> {
+    if gap_show_border_shell_only_enabled()
+        || intersect_logical_rect(cached.rect, output_geo).is_none()
+    {
+        return None;
     }
 
     let local_rect = Rectangle::new(
@@ -1773,7 +1838,6 @@ fn shader_effect_element(
         )),
         (cached.rect.width, cached.rect.height).into(),
     );
-    let window_snap_origin = output_geo.loc;
     let geometry = cached
         .rect_precise
         .map(|rect| {
@@ -1792,13 +1856,8 @@ fn shader_effect_element(
                 scale,
             )
         });
-
-    let state = decoration
-        .shader_cache
-        .entry(cached.stable_key.clone())
-        .or_default();
     let render_scale = geometry.size.w.max(1) as f32 / local_rect.size.w.max(1) as f32;
-    let spec = ShaderEffectSpec {
+    Some(ShaderEffectSpec {
         rect: local_rect,
         geometry,
         shader: cached.shader.clone(),
@@ -1842,7 +1901,27 @@ fn shader_effect_element(
                 .clip_radius_precise
                 .unwrap_or(cached.clip_radius as f32)
         },
+    })
+}
+
+fn shader_effect_element(
+    renderer: &mut GlesRenderer,
+    decoration: &mut crate::ssd::WindowDecorationState,
+    cached: &crate::backend::shader_effect::CachedShaderEffect,
+    output_geo: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    alpha: f32,
+) -> Result<Option<StableShaderEffectElement>, ShaderEffectError> {
+    let Some(spec) = shader_effect_spec(decoration, cached, output_geo, scale, alpha) else {
+        return Ok(None);
     };
+    let local_rect = spec.rect;
+    let window_snap_origin = output_geo.loc;
+
+    let state = decoration
+        .shader_cache
+        .entry(cached.stable_key.clone())
+        .or_default();
     if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
         tracing::info!(
             stable_key = %cached.stable_key,

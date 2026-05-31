@@ -257,6 +257,16 @@ impl XdgShellHandler for ShojiWM {
             .as_ref()
             .map(|decoration| decoration.snapshot.id.clone());
         if let (Some(window_id), Some(decoration)) = (window_id.as_deref(), decoration.as_ref()) {
+            if let Err(error) = crate::backend::tty::capture_live_snapshot_for_close(self, &window)
+            {
+                warn!(
+                    window_id,
+                    title = decoration.snapshot.title,
+                    app_id = decoration.snapshot.app_id,
+                    ?error,
+                    "failed to capture destroyed xdg toplevel before closing animation"
+                );
+            }
             let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
             if let Err(error) =
                 self.promote_window_to_closing_snapshot(window_id, decoration, now_ms)

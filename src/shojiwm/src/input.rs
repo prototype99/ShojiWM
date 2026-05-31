@@ -12,7 +12,7 @@ use smithay::{
     utils::{SERIAL_COUNTER, Serial},
 };
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     backend::visual::{inverse_transform_point, transformed_root_rect},
@@ -526,6 +526,16 @@ impl ShojiWM {
                                         time: event.time_msec(),
                                     },
                                 );
+                                if let Err(error) =
+                                    crate::backend::tty::capture_live_snapshot_for_close(
+                                        self, &window,
+                                    )
+                                {
+                                    warn!(
+                                        ?error,
+                                        "failed to capture decorated window before close request"
+                                    );
+                                }
                                 if let Some(toplevel) = window.toplevel() {
                                     toplevel.send_close();
                                 }
@@ -876,7 +886,11 @@ impl ShojiWM {
                 self.closing_window_snapshots
                     .remove(&runtime_action.window_id);
                 self.live_window_snapshots.remove(&runtime_action.window_id);
+                self.live_window_snapshot_trackers
+                    .remove(&runtime_action.window_id);
                 self.complete_window_snapshots
+                    .remove(&runtime_action.window_id);
+                self.complete_window_snapshot_trackers
                     .remove(&runtime_action.window_id);
                 self.windows_ready_for_decoration
                     .remove(&runtime_action.window_id);
@@ -922,6 +936,15 @@ impl ShojiWM {
 
             match runtime_action.action {
                 crate::ssd::WaylandWindowAction::Close => {
+                    if let Err(error) =
+                        crate::backend::tty::capture_live_snapshot_for_close(self, &window)
+                    {
+                        warn!(
+                            window_id = runtime_action.window_id,
+                            ?error,
+                            "failed to capture runtime window before close request"
+                        );
+                    }
                     if let Some(toplevel) = window.toplevel() {
                         toplevel.send_close();
                     }

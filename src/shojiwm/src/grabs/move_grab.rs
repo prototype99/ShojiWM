@@ -201,7 +201,6 @@ impl PointerGrab<ShojiWM> for MoveSurfaceGrab {
                     owner: window_id.clone(),
                     rect: new_source_rect,
                 });
-            data.snapshot_dirty_window_ids.insert(window_id);
             data.window_scene_generation = data.window_scene_generation.wrapping_add(1);
             data.schedule_redraw();
         }

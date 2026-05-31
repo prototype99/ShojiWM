@@ -117,6 +117,12 @@ impl XwmHandler for ShojiWM {
 
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
         if let Some(elem) = self.find_x11_window(&window) {
+            if let Err(error) = crate::backend::tty::capture_live_snapshot_for_close(self, &elem) {
+                warn!(
+                    ?error,
+                    "failed to capture unmapped X11 window before closing animation"
+                );
+            }
             self.remove_foreign_toplevel(&elem);
             self.space.unmap_elem(&elem);
         }
@@ -125,6 +131,7 @@ impl XwmHandler for ShojiWM {
                 warn!(?err, "failed to mark X11 surface as unmapped");
             }
         }
+        self.request_tty_maintenance("x11-window-unmapped");
         self.schedule_redraw();
     }
 

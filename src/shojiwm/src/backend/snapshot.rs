@@ -41,6 +41,14 @@ pub struct ClosingWindowSnapshot {
     pub transform: WindowTransform,
 }
 
+pub fn retarget_snapshot_rect(snapshot: &mut LiveWindowSnapshot, rect: LogicalRect) -> bool {
+    if snapshot.rect.width != rect.width || snapshot.rect.height != rect.height {
+        return false;
+    }
+    snapshot.rect = rect;
+    true
+}
+
 pub fn capture_snapshot<E: RenderElement<GlesRenderer>>(
     renderer: &mut GlesRenderer,
     existing: Option<LiveWindowSnapshot>,

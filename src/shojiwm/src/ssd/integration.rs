@@ -1100,10 +1100,16 @@ impl ShojiWM {
         // would cause decorations to appear twice (once in the texture, once from separate
         // decoration elements). Clean it up but don't use it.
         self.complete_window_snapshots.remove(window_id);
+        self.complete_window_snapshot_trackers.remove(window_id);
         let live_snapshot = self.live_window_snapshots.remove(window_id);
-        let Some(live_snapshot) = live_snapshot else {
+        let Some(mut live_snapshot) = live_snapshot else {
+            self.live_window_snapshot_trackers.remove(window_id);
             return Ok(false);
         };
+        crate::backend::snapshot::retarget_snapshot_rect(
+            &mut live_snapshot,
+            decoration.client_rect,
+        );
 
         self.sync_runtime_display_state();
         let invocation = self.decoration_evaluator.start_close(window_id, now_ms)?;
@@ -1120,6 +1126,7 @@ impl ShojiWM {
                 .insert(window_id.to_string(), live_snapshot);
             return Ok(false);
         }
+        self.live_window_snapshot_trackers.remove(window_id);
 
         self.closing_window_snapshots.insert(
             window_id.to_string(),
@@ -1276,7 +1283,7 @@ impl ShojiWM {
         managed_client_rect_for_root(&tree, desired_root, layout_scale).map(Some)
     }
 
-    fn primary_output_name_for_window(&self, window: &Window) -> Option<String> {
+    pub(crate) fn primary_output_name_for_window(&self, window: &Window) -> Option<String> {
         // Always use space.element_location (via window_client_rect) as the source of truth for
         // the window's current position. decoration.layout.root.rect lags behind because it is
         // only updated inside refresh_window_decorations_for_output — which itself calls this
@@ -1944,6 +1951,8 @@ impl ShojiWM {
                 self.runtime_dirty_window_ids.remove(window_id);
                 self.runtime_managed_only_window_ids.remove(window_id);
                 self.snapshot_dirty_window_ids.remove(window_id);
+                self.live_window_snapshots.remove(window_id);
+                self.live_window_snapshot_trackers.remove(window_id);
                 self.pending_decoration_damage.push(*root_rect);
             } else {
                 promoted_closing = promoted_closing.saturating_add(1);
@@ -3824,7 +3833,9 @@ impl ShojiWM {
                 desired_root.width,
                 desired_root.height,
             ));
-            self.snapshot_dirty_window_ids.insert(window_id);
+            if size_changed {
+                self.snapshot_dirty_window_ids.insert(window_id);
+            }
             self.window_scene_generation = self.window_scene_generation.wrapping_add(1);
             self.schedule_redraw();
         }

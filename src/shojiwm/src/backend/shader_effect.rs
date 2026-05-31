@@ -201,22 +201,61 @@ unsafe fn ensure_blur_scratch_fbo(gl: &smithay::backend::renderer::gles::ffi::Gl
 #[derive(Debug, Default)]
 struct BackdropFramebufferCache {
     framebuffer: Option<GlesTexture>,
-    /// Persistent dual-kawase blur texture pyramid. Index 0 is the output
-    /// (same size as `framebuffer`); indices 1..passes+1 are progressively
-    /// halved intermediates used as the down/upsample ping-pong targets.
-    /// Reused across frames; only recreated when `framebuffer` is resized.
-    ///
-    /// This replaces the previous "allocate a fresh `GlesTexture` for every
-    /// down/upsample step" pattern, which was the dominant remaining
-    /// performance issue on NVIDIA proprietary — every `glTexImage2D` /
-    /// `glGenTextures` against this driver triggers device-memory
-    /// allocator activity plus a pipeline sync, and we were issuing
-    /// `passes * 2 = 4` of them per backdrop per frame. niri's `Blur`
-    /// avoids this by keeping the pyramid alive across frames (see
-    /// `misc/niri/src/render_helpers/blur.rs` `prepare_textures`).
-    blur_pyramid: Vec<GlesTexture>,
-    blurred: Option<GlesTexture>,
+    rendered: Option<GlesTexture>,
     sample_src: Option<Rectangle<f64, Buffer>>,
+    pipeline: EffectPipelineCache,
+}
+
+/// Per-element render targets for a compiled effect pipeline. Slots are
+/// consumed in execution order and reused on subsequent frames. This keeps
+/// the cache independent of JSX shape while avoiding per-frame texture
+/// allocation for shader, blend, crop, finish, and blur stages.
+#[derive(Debug, Default)]
+struct EffectPipelineCache {
+    targets: Vec<GlesTexture>,
+    next_target: usize,
+    blur_pyramids: Vec<Vec<GlesTexture>>,
+    next_blur_pyramid: usize,
+}
+
+impl EffectPipelineCache {
+    fn begin_frame(&mut self) {
+        self.next_target = 0;
+        self.next_blur_pyramid = 0;
+    }
+
+    fn target(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        size: (i32, i32),
+    ) -> Result<GlesTexture, ShaderEffectError> {
+        let index = self.next_target;
+        self.next_target += 1;
+        let expected = Size::<i32, Buffer>::from(size);
+        if self
+            .targets
+            .get(index)
+            .is_none_or(|target| target.size() != expected)
+        {
+            let target =
+                Offscreen::<GlesTexture>::create_buffer(renderer, Fourcc::Abgr8888, expected)?;
+            if index == self.targets.len() {
+                self.targets.push(target);
+            } else {
+                self.targets[index] = target;
+            }
+        }
+        Ok(self.targets[index].clone())
+    }
+
+    fn blur_pyramid(&mut self) -> &mut Vec<GlesTexture> {
+        let index = self.next_blur_pyramid;
+        self.next_blur_pyramid += 1;
+        if index == self.blur_pyramids.len() {
+            self.blur_pyramids.push(Vec::new());
+        }
+        &mut self.blur_pyramids[index]
+    }
 }
 
 #[derive(Debug, Default)]
@@ -451,7 +490,7 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
             return Ok(());
         };
         let inner = inner.borrow();
-        let Some(texture) = inner.blurred.as_ref().or(inner.framebuffer.as_ref()) else {
+        let Some(texture) = inner.rendered.as_ref().or(inner.framebuffer.as_ref()) else {
             return Ok(());
         };
         let sample_src = inner
@@ -533,7 +572,13 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
             Some(clamped) => clamped,
             None => return Ok(()),
         };
-        let size = Size::<i32, Buffer>::from((clamped_dst.size.w, clamped_dst.size.h));
+        // Keep the capture target stable while the element moves near output
+        // edges. Only the valid framebuffer intersection is copied into it.
+        let size = Size::<i32, Buffer>::from((expanded_dst.size.w, expanded_dst.size.h));
+        let copy_offset = (
+            clamped_dst.loc.x - expanded_dst.loc.x,
+            clamped_dst.loc.y - expanded_dst.loc.y,
+        );
 
         {
             let mut guard = frame.renderer();
@@ -545,11 +590,11 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
             if recreate {
                 inner.framebuffer = Some(renderer.create_buffer(Fourcc::Abgr8888, size)?);
             }
-            inner.blurred = None;
+            inner.rendered = None;
             inner.sample_src = Some(Rectangle::new(
                 (
-                    (dst.loc.x - clamped_dst.loc.x) as f64,
-                    (dst.loc.y - clamped_dst.loc.y) as f64,
+                    (dst.loc.x - expanded_dst.loc.x) as f64,
+                    (dst.loc.y - expanded_dst.loc.y) as f64,
                 )
                     .into(),
                 (dst.size.w as f64, dst.size.h as f64).into(),
@@ -572,6 +617,8 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
 
             let mut current_fbo = 0i32;
             gl.GetIntegerv(ffi::DRAW_FRAMEBUFFER_BINDING, &mut current_fbo as *mut _);
+            let mut clear_color = [0.0f32; 4];
+            gl.GetFloatv(ffi::COLOR_CLEAR_VALUE, clear_color.as_mut_ptr());
             gl.Disable(ffi::SCISSOR_TEST);
 
             let fbo = ensure_blur_scratch_fbo(gl);
@@ -583,35 +630,54 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
                 target_tex_id,
                 0,
             );
+            gl.Viewport(0, 0, size.w, size.h);
+            gl.ClearColor(0.0, 0.0, 0.0, 0.0);
+            gl.Clear(ffi::COLOR_BUFFER_BIT);
             gl.BlitFramebuffer(
                 clamped_dst.loc.x,
                 clamped_dst.loc.y,
                 clamped_dst.loc.x + clamped_dst.size.w,
                 clamped_dst.loc.y + clamped_dst.size.h,
-                0,
-                0,
-                size.w,
-                size.h,
+                copy_offset.0,
+                copy_offset.1,
+                copy_offset.0 + clamped_dst.size.w,
+                copy_offset.1 + clamped_dst.size.h,
                 ffi::COLOR_BUFFER_BIT,
                 ffi::LINEAR,
             );
             gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, current_fbo as u32);
+            gl.ClearColor(
+                clear_color[0],
+                clear_color[1],
+                clear_color[2],
+                clear_color[3],
+            );
             gl.Enable(ffi::SCISSOR_TEST);
         })?;
 
-        if let Some(blur) = self.shader.blur_stage() {
-            let mut guard = frame.renderer();
-            let renderer = guard.as_mut();
-            match preblur_backdrop_texture(
-                renderer,
-                framebuffer_texture,
-                (size.w, size.h),
-                blur.radius,
-                blur.passes,
-                Some(&mut inner.blur_pyramid),
-            ) {
-                Ok(texture) => inner.blurred = Some(texture),
-                Err(err) => warn!(?err, "failed to preblur backdrop framebuffer"),
+        let sample_src = inner.sample_src;
+        inner.pipeline.begin_frame();
+        let mut guard = frame.renderer();
+        let renderer = guard.as_mut();
+        match apply_effect_pipeline_cached(
+            renderer,
+            framebuffer_texture,
+            None,
+            (size.w, size.h),
+            sample_src,
+            Some((dst.size.w, dst.size.h)),
+            &self.shader,
+            &mut inner.pipeline,
+        ) {
+            Ok(texture) => {
+                inner.sample_src = Some(Rectangle::from_size(texture.size().to_f64()));
+                inner.rendered = Some(texture);
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "failed to render backdrop framebuffer effect pipeline"
+                );
             }
         }
 
@@ -1557,13 +1623,64 @@ pub fn apply_effect_pipeline(
     output_size: Option<(i32, i32)>,
     effect: &CompiledEffect,
 ) -> Result<GlesTexture, ShaderEffectError> {
+    apply_effect_pipeline_with_cache(
+        renderer,
+        texture,
+        xray_texture,
+        size,
+        sample_region,
+        output_size,
+        effect,
+        None,
+    )
+}
+
+fn apply_effect_pipeline_cached(
+    renderer: &mut GlesRenderer,
+    texture: GlesTexture,
+    xray_texture: Option<GlesTexture>,
+    size: (i32, i32),
+    sample_region: Option<Rectangle<f64, Buffer>>,
+    output_size: Option<(i32, i32)>,
+    effect: &CompiledEffect,
+    cache: &mut EffectPipelineCache,
+) -> Result<GlesTexture, ShaderEffectError> {
+    apply_effect_pipeline_with_cache(
+        renderer,
+        texture,
+        xray_texture,
+        size,
+        sample_region,
+        output_size,
+        effect,
+        Some(cache),
+    )
+}
+
+fn apply_effect_pipeline_with_cache(
+    renderer: &mut GlesRenderer,
+    texture: GlesTexture,
+    xray_texture: Option<GlesTexture>,
+    size: (i32, i32),
+    sample_region: Option<Rectangle<f64, Buffer>>,
+    output_size: Option<(i32, i32)>,
+    effect: &CompiledEffect,
+    cache: Option<&mut EffectPipelineCache>,
+) -> Result<GlesTexture, ShaderEffectError> {
     let mut ctx = EffectExecutionContext {
         backdrop: texture,
         xray_backdrop: xray_texture,
         size,
         named: HashMap::new(),
     };
-    run_effect_pipeline(renderer, effect, &mut ctx, sample_region, output_size)
+    run_effect_pipeline(
+        renderer,
+        effect,
+        &mut ctx,
+        sample_region,
+        output_size,
+        cache,
+    )
 }
 
 pub fn log_gap_texture_region_readback(
@@ -1865,6 +1982,7 @@ fn run_effect_pipeline(
     ctx: &mut EffectExecutionContext,
     sample_region: Option<Rectangle<f64, Buffer>>,
     output_size: Option<(i32, i32)>,
+    mut cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
     let requested_output_size = requested_effect_output_size(sample_region, output_size);
     let input_uses_requested_size = effect_input_renders_directly_to_requested_size(&effect.input);
@@ -1873,7 +1991,13 @@ fn run_effect_pipeline(
     } else {
         ctx.size
     };
-    let mut current = resolve_effect_input(renderer, &effect.input, ctx, initial_input_size)?;
+    let mut current = resolve_effect_input(
+        renderer,
+        &effect.input,
+        ctx,
+        initial_input_size,
+        cache.as_deref_mut(),
+    )?;
     let mut current_size = initial_input_size;
     let mut pending_sample_region = if input_uses_requested_size {
         None
@@ -1895,29 +2019,45 @@ fn run_effect_pipeline(
 
     for stage in &effect.pipeline {
         current = match stage {
-            EffectStage::Noise(noise) => {
-                apply_noise_stage(renderer, current, current_size, noise.clone())?
-            }
-            EffectStage::DualKawaseBlur(blur) => preblur_backdrop_texture(
+            EffectStage::Noise(noise) => apply_noise_stage(
                 renderer,
                 current,
                 current_size,
-                blur.radius,
-                blur.passes,
-                // No persistent cache available from the generic pipeline path; falls
-                // back to per-pass texture allocation. Hot per-window backdrops use
-                // BackdropFramebufferCache::blur_pyramid via capture_framebuffer.
-                None,
+                noise.clone(),
+                cache.as_deref_mut(),
             )?,
+            EffectStage::DualKawaseBlur(blur) => {
+                let pyramid = cache.as_deref_mut().map(EffectPipelineCache::blur_pyramid);
+                preblur_backdrop_texture(
+                    renderer,
+                    current,
+                    current_size,
+                    blur.radius,
+                    blur.passes,
+                    pyramid,
+                )?
+            }
             EffectStage::Shader(shader) => {
                 if let Some(region) = pending_sample_region.take() {
                     let target_size = output_size
                         .unwrap_or((region.size.w.round() as i32, region.size.h.round() as i32));
-                    current =
-                        crop_texture_region(renderer, current, current_size, region, target_size)?;
+                    current = crop_texture_region(
+                        renderer,
+                        current,
+                        current_size,
+                        region,
+                        target_size,
+                        cache.as_deref_mut(),
+                    )?;
                     current_size = target_size;
                 }
-                apply_texture_shader_stage(renderer, current, current_size, shader)?
+                apply_texture_shader_stage(
+                    renderer,
+                    current,
+                    current_size,
+                    shader,
+                    cache.as_deref_mut(),
+                )?
             }
             EffectStage::Save(name) => {
                 ctx.named.insert(name.clone(), current.clone());
@@ -1927,16 +2067,37 @@ fn run_effect_pipeline(
                 if let Some(region) = pending_sample_region.take() {
                     let target_size = output_size
                         .unwrap_or((region.size.w.round() as i32, region.size.h.round() as i32));
-                    current =
-                        crop_texture_region(renderer, current, current_size, region, target_size)?;
+                    current = crop_texture_region(
+                        renderer,
+                        current,
+                        current_size,
+                        region,
+                        target_size,
+                        cache.as_deref_mut(),
+                    )?;
                     current_size = target_size;
                 }
-                let other = resolve_effect_input(renderer, input, ctx, current_size)?;
-                apply_blend_stage(renderer, current, other, current_size, *mode, *alpha)?
+                let other =
+                    resolve_effect_input(renderer, input, ctx, current_size, cache.as_deref_mut())?;
+                apply_blend_stage(
+                    renderer,
+                    current,
+                    other,
+                    current_size,
+                    *mode,
+                    *alpha,
+                    cache.as_deref_mut(),
+                )?
             }
             EffectStage::Unit(effect) => {
-                let _ =
-                    run_effect_pipeline(renderer, effect, ctx, pending_sample_region, output_size)?;
+                let _ = run_effect_pipeline(
+                    renderer,
+                    effect,
+                    ctx,
+                    pending_sample_region,
+                    output_size,
+                    cache.as_deref_mut(),
+                )?;
                 current
             }
         };
@@ -1946,7 +2107,14 @@ fn run_effect_pipeline(
         if let Some(region) = pending_sample_region.take() {
             let target_size =
                 output_size.unwrap_or((region.size.w.round() as i32, region.size.h.round() as i32));
-            current = crop_texture_region(renderer, current, current_size, region, target_size)?;
+            current = crop_texture_region(
+                renderer,
+                current,
+                current_size,
+                region,
+                target_size,
+                cache.as_deref_mut(),
+            )?;
             current_size = target_size;
         }
         let program = compile_opaque_finish_program(renderer)?;
@@ -1959,6 +2127,7 @@ fn run_effect_pipeline(
                 "rect_size",
                 [current_size.0 as f32, current_size.1 as f32],
             )],
+            cache.as_deref_mut(),
         )?;
     }
 
@@ -1970,6 +2139,7 @@ fn resolve_effect_input(
     input: &EffectInput,
     ctx: &mut EffectExecutionContext,
     requested_size: (i32, i32),
+    cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
     match input {
         EffectInput::Backdrop | EffectInput::WindowSource(_) => Ok(ctx.backdrop.clone()),
@@ -1977,7 +2147,9 @@ fn resolve_effect_input(
             .xray_backdrop
             .clone()
             .ok_or(ShaderEffectError::Gles(GlesError::FramebufferBindingError)),
-        EffectInput::Shader(stage) => apply_shader_input_stage(renderer, requested_size, stage),
+        EffectInput::Shader(stage) => {
+            apply_shader_input_stage(renderer, requested_size, stage, cache)
+        }
         EffectInput::Named(name) => ctx
             .named
             .get(name)
@@ -2005,6 +2177,7 @@ fn apply_texture_shader_stage(
     texture: GlesTexture,
     size: (i32, i32),
     stage: &ShaderStage,
+    cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
     let program = compile_texture_stage_program(renderer, stage)?;
     let mut uniforms = vec![Uniform::new("rect_size", [size.0 as f32, size.1 as f32])];
@@ -2017,13 +2190,14 @@ fn apply_texture_shader_stage(
         };
         uniforms.push(uniform);
     }
-    apply_texture_program(renderer, texture, size, program, uniforms)
+    apply_texture_program(renderer, texture, size, program, uniforms, cache)
 }
 
 fn apply_shader_input_stage(
     renderer: &mut GlesRenderer,
     size: (i32, i32),
     stage: &ShaderStage,
+    cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
     let effect = CompiledEffect {
         input: EffectInput::Shader(stage.clone()),
@@ -2041,8 +2215,7 @@ fn apply_shader_input_stage(
     };
     let mut state = ShaderEffectElementState::default();
     let element = state.element(renderer, spec)?;
-    let mut target =
-        Offscreen::<GlesTexture>::create_buffer(renderer, Fourcc::Abgr8888, size.into())?;
+    let mut target = effect_pipeline_target(renderer, size, cache)?;
     let mut framebuffer = renderer.bind(&mut target)?;
     let mut damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
     let _ = damage_tracker
@@ -2063,6 +2236,7 @@ fn apply_noise_stage(
     texture: GlesTexture,
     size: (i32, i32),
     noise: NoiseStage,
+    cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
     match noise.kind {
         NoiseKind::Salt => {
@@ -2076,6 +2250,7 @@ fn apply_noise_stage(
                     Uniform::new("rect_size", [size.0 as f32, size.1 as f32]),
                     Uniform::new("noise_amount", noise.amount),
                 ],
+                cache,
             )
         }
     }
@@ -2088,13 +2263,14 @@ fn apply_blend_stage(
     size: (i32, i32),
     mode: BlendMode,
     alpha: f32,
+    cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
     let programs = blend_shader_programs(renderer)?;
     if programs.renderer_context_id != renderer.context_id() {
         return Err(ShaderEffectError::Gles(GlesError::FramebufferBindingError));
     }
 
-    let target = Offscreen::<GlesTexture>::create_buffer(renderer, Fourcc::Abgr8888, size.into())?;
+    let target = effect_pipeline_target(renderer, size, cache)?;
     renderer.with_context(|gl| unsafe {
         while gl.GetError() != ffi::NO_ERROR {}
 
@@ -2171,9 +2347,9 @@ fn crop_texture_region(
     _size: (i32, i32),
     region: Rectangle<f64, Buffer>,
     output_size: (i32, i32),
+    cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
-    let mut target =
-        Offscreen::<GlesTexture>::create_buffer(renderer, Fourcc::Abgr8888, output_size.into())?;
+    let mut target = effect_pipeline_target(renderer, output_size, cache)?;
     let element = TextureRenderElement::from_static_texture(
         Id::new(),
         renderer.context_id(),
@@ -2211,9 +2387,9 @@ fn apply_texture_program(
     size: (i32, i32),
     program: GlesTexProgram,
     uniforms: Vec<Uniform<'static>>,
+    cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
-    let mut target =
-        Offscreen::<GlesTexture>::create_buffer(renderer, Fourcc::Abgr8888, size.into())?;
+    let mut target = effect_pipeline_target(renderer, size, cache)?;
     let inner = TextureRenderElement::from_static_texture(
         Id::new(),
         renderer.context_id(),
@@ -2241,6 +2417,21 @@ fn apply_texture_program(
         .map_err(|_| GlesError::FramebufferBindingError)?;
     drop(framebuffer);
     Ok(target)
+}
+
+fn effect_pipeline_target(
+    renderer: &mut GlesRenderer,
+    size: (i32, i32),
+    cache: Option<&mut EffectPipelineCache>,
+) -> Result<GlesTexture, ShaderEffectError> {
+    match cache {
+        Some(cache) => cache.target(renderer, size),
+        None => Ok(Offscreen::<GlesTexture>::create_buffer(
+            renderer,
+            Fourcc::Abgr8888,
+            size.into(),
+        )?),
+    }
 }
 
 pub fn solid_white_texture(renderer: &mut GlesRenderer) -> Result<GlesTexture, ShaderEffectError> {
@@ -2437,10 +2628,8 @@ pub fn preblur_backdrop_texture(
         return preblur_using_pyramid(renderer, texture, size, &programs, passes, offset, pyramid);
     }
 
-    // Legacy path: fresh per-pass `GlesTexture` allocation. Reserved for the
-    // generic effect pipeline (`run_effect_pipeline`) which has no place to
-    // park a persistent pyramid. Per-window backdrops go through the cached
-    // pyramid path above.
+    // Uncached fallback for callers that do not own persistent pipeline
+    // state. Live framebuffer backdrops use the cached pyramid path above.
     let mut levels = Vec::with_capacity(passes + 1);
     let mut current = texture;
     let mut current_size = size;
@@ -2654,8 +2843,7 @@ fn blur_texture_pass(
     half_pixel: [f32; 2],
     offset: f32,
 ) -> Result<GlesTexture, ShaderEffectError> {
-    // Legacy allocate-then-draw path used by the generic effect pipeline.
-    // The hot per-window backdrop path reuses textures via
+    // Uncached fallback. Live framebuffer backdrops reuse textures via
     // `blur_texture_pass_into` directly.
     let target =
         Offscreen::<GlesTexture>::create_buffer(renderer, Fourcc::Abgr8888, output_size.into())?;
