@@ -2401,32 +2401,37 @@ fn run_effect_pipeline(
     }
 
     if effect.is_backdrop() {
+        let program = compile_opaque_finish_program(renderer)?;
         if let Some(region) = pending_sample_region.take() {
             let target_size =
                 output_size.unwrap_or((region.size.w.round() as i32, region.size.h.round() as i32));
-            current = crop_texture_region(
+            current = apply_texture_program_region(
+                renderer,
+                current,
+                target_size,
+                Some(region),
+                program,
+                vec![Uniform::new(
+                    "rect_size",
+                    [target_size.0 as f32, target_size.1 as f32],
+                )],
+                cache.as_deref_mut(),
+                "effect-crop-finish",
+            )?;
+        } else {
+            current = apply_texture_program(
                 renderer,
                 current,
                 current_size,
-                region,
-                target_size,
+                program,
+                vec![Uniform::new(
+                    "rect_size",
+                    [current_size.0 as f32, current_size.1 as f32],
+                )],
                 cache.as_deref_mut(),
+                "effect-finish",
             )?;
-            current_size = target_size;
         }
-        let program = compile_opaque_finish_program(renderer)?;
-        current = apply_texture_program(
-            renderer,
-            current,
-            current_size,
-            program,
-            vec![Uniform::new(
-                "rect_size",
-                [current_size.0 as f32, current_size.1 as f32],
-            )],
-            cache.as_deref_mut(),
-            "effect-finish",
-        )?;
     }
 
     Ok(current)
@@ -2712,8 +2717,36 @@ fn apply_texture_program(
     cache: Option<&mut EffectPipelineCache>,
     timing_label: &'static str,
 ) -> Result<GlesTexture, ShaderEffectError> {
-    with_gpu_timing_renderer_span(renderer, timing_label, size, |renderer| {
-        let mut target = effect_pipeline_target(renderer, size, cache)?;
+    apply_texture_program_region(
+        renderer,
+        texture,
+        size,
+        None,
+        program,
+        uniforms,
+        cache,
+        timing_label,
+    )
+}
+
+fn apply_texture_program_region(
+    renderer: &mut GlesRenderer,
+    texture: GlesTexture,
+    output_size: (i32, i32),
+    source_region: Option<Rectangle<f64, Buffer>>,
+    program: GlesTexProgram,
+    uniforms: Vec<Uniform<'static>>,
+    cache: Option<&mut EffectPipelineCache>,
+    timing_label: &'static str,
+) -> Result<GlesTexture, ShaderEffectError> {
+    with_gpu_timing_renderer_span(renderer, timing_label, output_size, |renderer| {
+        let mut target = effect_pipeline_target(renderer, output_size, cache)?;
+        let source_region = source_region.map(|region| {
+            Rectangle::<f64, Logical>::new(
+                Point::from((region.loc.x, region.loc.y)),
+                (region.size.w, region.size.h).into(),
+            )
+        });
         let inner = TextureRenderElement::from_static_texture(
             Id::new(),
             renderer.context_id(),
@@ -2722,14 +2755,14 @@ fn apply_texture_program(
             1,
             Transform::Normal,
             Some(1.0),
-            None,
-            Some((size.0, size.1).into()),
+            source_region,
+            Some(output_size.into()),
             None,
             Kind::Unspecified,
         );
         let element = TextureShaderElement::new(inner, program, uniforms);
         let mut framebuffer = renderer.bind(&mut target)?;
-        let mut damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
+        let mut damage_tracker = OutputDamageTracker::new(output_size, 1.0, Transform::Normal);
         let _ = damage_tracker
             .render_output(
                 renderer,
