@@ -1,5 +1,13 @@
 use std::cell::{Cell, RefCell};
-use std::{cmp::max, collections::HashMap, fs, io::Cursor, sync::Mutex};
+use std::{
+    cmp::max,
+    collections::{HashMap, VecDeque},
+    ffi::CStr,
+    fs,
+    io::Cursor,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use png::ColorType;
 use resvg::{tiny_skia, usvg};
@@ -23,7 +31,7 @@ use smithay::{
         Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform, user_data::UserDataMap,
     },
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::backend::visual::{PreciseLogicalRect, SnappedLogicalRect};
 use crate::ssd::{
@@ -177,6 +185,227 @@ thread_local! {
     /// reusable scratch FBO with `glFramebufferTexture2D` re-attachment
     /// avoids the churn entirely.
     static BLUR_SCRATCH_FBO: Cell<u32> = const { Cell::new(0) };
+    static GPU_TIMING_STATE: RefCell<GpuTimingState> = RefCell::new(GpuTimingState::default());
+    static SHARED_EFFECT_PIPELINE_CACHES: RefCell<SharedEffectPipelineCaches> =
+        RefCell::new(SharedEffectPipelineCaches::default());
+}
+
+const GPU_TIMING_QUERY_COUNT: usize = 2048;
+const GPU_TIMING_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+const SHARED_EFFECT_PIPELINE_CACHE_LIMIT: usize = 128;
+
+#[derive(Debug)]
+struct PendingGpuTiming {
+    label: &'static str,
+    start_query: u32,
+    end_query: u32,
+    pixels: u64,
+}
+
+#[derive(Debug, Default)]
+struct GpuTimingAggregate {
+    samples: u64,
+    total_ns: u64,
+    max_ns: u64,
+    total_pixels: u64,
+}
+
+#[derive(Debug)]
+struct GpuTimingState {
+    initialized: bool,
+    supported: bool,
+    free_queries: Vec<u32>,
+    pending: VecDeque<PendingGpuTiming>,
+    aggregates: HashMap<&'static str, GpuTimingAggregate>,
+    last_report: Instant,
+}
+
+impl Default for GpuTimingState {
+    fn default() -> Self {
+        Self {
+            initialized: false,
+            supported: false,
+            free_queries: Vec::new(),
+            pending: VecDeque::new(),
+            aggregates: HashMap::new(),
+            last_report: Instant::now(),
+        }
+    }
+}
+
+impl GpuTimingState {
+    fn ensure_initialized(&mut self, gl: &ffi::Gles2) {
+        if self.initialized {
+            return;
+        }
+        self.initialized = true;
+
+        let extensions = unsafe {
+            let ptr = gl.GetString(ffi::EXTENSIONS);
+            (!ptr.is_null()).then(|| CStr::from_ptr(ptr.cast()).to_string_lossy())
+        };
+        self.supported = extensions.as_deref().is_some_and(|extensions| {
+            extensions
+                .split_ascii_whitespace()
+                .any(|extension| extension == "GL_EXT_disjoint_timer_query")
+        });
+        if !self.supported {
+            warn!("GPU timing debug requested but GL_EXT_disjoint_timer_query is unavailable");
+            return;
+        }
+
+        self.free_queries.resize(GPU_TIMING_QUERY_COUNT, 0);
+        unsafe {
+            gl.GenQueriesEXT(
+                self.free_queries.len() as ffi::types::GLsizei,
+                self.free_queries.as_mut_ptr(),
+            );
+        }
+        info!(
+            query_count = self.free_queries.len(),
+            "GPU timing debug initialized"
+        );
+    }
+
+    fn collect(&mut self, gl: &ffi::Gles2) {
+        while let Some(front) = self.pending.front() {
+            let mut available = 0;
+            unsafe {
+                gl.GetQueryObjectuivEXT(
+                    front.end_query,
+                    ffi::QUERY_RESULT_AVAILABLE,
+                    &mut available,
+                );
+            }
+            if available == 0 {
+                break;
+            }
+
+            let pending = self.pending.pop_front().expect("front should exist");
+            let mut start_ns = 0;
+            let mut end_ns = 0;
+            unsafe {
+                gl.GetQueryObjecti64vEXT(pending.start_query, ffi::QUERY_RESULT, &mut start_ns);
+                gl.GetQueryObjecti64vEXT(pending.end_query, ffi::QUERY_RESULT, &mut end_ns);
+            }
+            self.free_queries.push(pending.start_query);
+            self.free_queries.push(pending.end_query);
+
+            let elapsed_ns = end_ns.saturating_sub(start_ns) as u64;
+            let aggregate = self.aggregates.entry(pending.label).or_default();
+            aggregate.samples += 1;
+            aggregate.total_ns = aggregate.total_ns.saturating_add(elapsed_ns);
+            aggregate.max_ns = aggregate.max_ns.max(elapsed_ns);
+            aggregate.total_pixels = aggregate.total_pixels.saturating_add(pending.pixels);
+        }
+
+        if self.last_report.elapsed() < GPU_TIMING_REPORT_INTERVAL || self.aggregates.is_empty() {
+            return;
+        }
+        self.last_report = Instant::now();
+
+        for (label, aggregate) in self.aggregates.drain() {
+            info!(
+                label,
+                samples = aggregate.samples,
+                total_gpu_ms = aggregate.total_ns as f64 / 1_000_000.0,
+                average_gpu_ms =
+                    aggregate.total_ns as f64 / aggregate.samples.max(1) as f64 / 1_000_000.0,
+                max_gpu_ms = aggregate.max_ns as f64 / 1_000_000.0,
+                average_megapixels =
+                    aggregate.total_pixels as f64 / aggregate.samples.max(1) as f64 / 1_000_000.0,
+                pending_spans = self.pending.len(),
+                "GPU timing aggregate"
+            );
+        }
+    }
+
+    fn begin(
+        &mut self,
+        gl: &ffi::Gles2,
+        label: &'static str,
+        size: (i32, i32),
+    ) -> Option<PendingGpuTiming> {
+        self.ensure_initialized(gl);
+        if !self.supported {
+            return None;
+        }
+        self.collect(gl);
+
+        if self.free_queries.len() < 2 {
+            return None;
+        }
+        let end_query = self
+            .free_queries
+            .pop()
+            .expect("query pool should have two entries");
+        let start_query = self.free_queries.pop()?;
+        unsafe {
+            gl.QueryCounterEXT(start_query, ffi::TIMESTAMP_EXT);
+        }
+        Some(PendingGpuTiming {
+            label,
+            start_query,
+            end_query,
+            pixels: size.0.max(0) as u64 * size.1.max(0) as u64,
+        })
+    }
+
+    fn end(&mut self, gl: &ffi::Gles2, pending: PendingGpuTiming) {
+        unsafe {
+            gl.QueryCounterEXT(pending.end_query, ffi::TIMESTAMP_EXT);
+        }
+        self.pending.push_back(pending);
+    }
+}
+
+fn gpu_timing_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("SHOJI_GPU_TIMING_DEBUG")
+            .is_some_and(|value| value != "0" && !value.is_empty())
+    })
+}
+
+fn with_gpu_timing_gl_span<R>(
+    gl: &ffi::Gles2,
+    label: &'static str,
+    size: (i32, i32),
+    func: impl FnOnce() -> R,
+) -> R {
+    if !gpu_timing_debug_enabled() {
+        return func();
+    }
+
+    let pending = GPU_TIMING_STATE.with(|state| state.borrow_mut().begin(gl, label, size));
+    let result = func();
+    if let Some(pending) = pending {
+        GPU_TIMING_STATE.with(|state| state.borrow_mut().end(gl, pending));
+    }
+    result
+}
+
+pub(crate) fn with_gpu_timing_renderer_span<R>(
+    renderer: &mut GlesRenderer,
+    label: &'static str,
+    size: (i32, i32),
+    func: impl FnOnce(&mut GlesRenderer) -> R,
+) -> R {
+    if !gpu_timing_debug_enabled() {
+        return func(renderer);
+    }
+
+    let pending = renderer
+        .with_context(|gl| GPU_TIMING_STATE.with(|state| state.borrow_mut().begin(gl, label, size)))
+        .ok()
+        .flatten();
+    let result = func(renderer);
+    if let Some(pending) = pending {
+        let _ = renderer.with_context(|gl| {
+            GPU_TIMING_STATE.with(|state| state.borrow_mut().end(gl, pending));
+        });
+    }
+    result
 }
 
 /// Ensures a thread-local scratch FBO exists and returns its id. Must be
@@ -255,6 +484,62 @@ impl EffectPipelineCache {
             self.blur_pyramids.push(Vec::new());
         }
         &mut self.blur_pyramids[index]
+    }
+}
+
+#[derive(Debug)]
+struct SharedEffectPipelineCache {
+    renderer_context_id: ContextId<GlesTexture>,
+    pipeline: EffectPipelineCache,
+    last_used: u64,
+}
+
+#[derive(Debug, Default)]
+struct SharedEffectPipelineCaches {
+    generation: u64,
+    entries: HashMap<String, SharedEffectPipelineCache>,
+}
+
+impl SharedEffectPipelineCaches {
+    fn pipeline<'a>(
+        &'a mut self,
+        renderer: &GlesRenderer,
+        cache_key: String,
+    ) -> &'a mut EffectPipelineCache {
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let renderer_context_id = renderer.context_id();
+
+        if !self.entries.contains_key(&cache_key)
+            && self.entries.len() >= SHARED_EFFECT_PIPELINE_CACHE_LIMIT
+            && let Some(oldest_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&oldest_key);
+        }
+
+        let entry = self
+            .entries
+            .entry(cache_key)
+            .or_insert_with(|| SharedEffectPipelineCache {
+                renderer_context_id: renderer_context_id.clone(),
+                pipeline: EffectPipelineCache::default(),
+                last_used: generation,
+            });
+        if entry.renderer_context_id != renderer_context_id {
+            *entry = SharedEffectPipelineCache {
+                renderer_context_id,
+                pipeline: EffectPipelineCache::default(),
+                last_used: generation,
+            };
+        } else {
+            entry.last_used = generation;
+        }
+        entry.pipeline.begin_frame();
+        &mut entry.pipeline
     }
 }
 
@@ -554,31 +839,17 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
             RefCell::new(BackdropFramebufferCache::default())
         });
         let mut inner = inner.borrow_mut();
-        let blur_padding = self
-            .shader
-            .blur_stage()
-            .map(|blur| {
-                let radius = blur.radius.max(1);
-                let passes = blur.passes.max(1);
-                (radius * passes * 24 + 32).max(32)
-            })
-            .unwrap_or(0);
         let output_rect = Rectangle::from_size(frame.output_size());
-        let expanded_dst = Rectangle::new(
-            (dst.loc.x - blur_padding, dst.loc.y - blur_padding).into(),
-            (dst.size.w + blur_padding * 2, dst.size.h + blur_padding * 2).into(),
-        );
-        let clamped_dst = match expanded_dst.intersection(output_rect) {
+        let clamped_dst = match dst.intersection(output_rect) {
             Some(clamped) => clamped,
             None => return Ok(()),
         };
-        // Keep the capture target stable while the element moves near output
-        // edges. Only the valid framebuffer intersection is copied into it.
-        let size = Size::<i32, Buffer>::from((expanded_dst.size.w, expanded_dst.size.h));
-        let copy_offset = (
-            clamped_dst.loc.x - expanded_dst.loc.x,
-            clamped_dst.loc.y - expanded_dst.loc.y,
-        );
+        // Keep this direct framebuffer path bounded to the element itself.
+        // Expanding by a blur halo multiplies the per-frame capture and blur
+        // area, especially for narrow titlebars. Texture-backed snapshot
+        // paths retain their halo because they cache and sample a wider scene.
+        let size = Size::<i32, Buffer>::from((dst.size.w, dst.size.h));
+        let copy_offset = (clamped_dst.loc.x - dst.loc.x, clamped_dst.loc.y - dst.loc.y);
 
         {
             let mut guard = frame.renderer();
@@ -592,11 +863,7 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
             }
             inner.rendered = None;
             inner.sample_src = Some(Rectangle::new(
-                (
-                    (dst.loc.x - expanded_dst.loc.x) as f64,
-                    (dst.loc.y - expanded_dst.loc.y) as f64,
-                )
-                    .into(),
+                (0.0, 0.0).into(),
                 (dst.size.w as f64, dst.size.h as f64).into(),
             ));
         }
@@ -613,46 +880,48 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
         // change for NVIDIA proprietary.
         let target_tex_id = framebuffer_texture.tex_id();
         frame.with_context(|gl| unsafe {
-            while gl.GetError() != ffi::NO_ERROR {}
+            with_gpu_timing_gl_span(gl, "backdrop-capture-blit", (size.w, size.h), || {
+                while gl.GetError() != ffi::NO_ERROR {}
 
-            let mut current_fbo = 0i32;
-            gl.GetIntegerv(ffi::DRAW_FRAMEBUFFER_BINDING, &mut current_fbo as *mut _);
-            let mut clear_color = [0.0f32; 4];
-            gl.GetFloatv(ffi::COLOR_CLEAR_VALUE, clear_color.as_mut_ptr());
-            gl.Disable(ffi::SCISSOR_TEST);
+                let mut current_fbo = 0i32;
+                gl.GetIntegerv(ffi::DRAW_FRAMEBUFFER_BINDING, &mut current_fbo as *mut _);
+                let mut clear_color = [0.0f32; 4];
+                gl.GetFloatv(ffi::COLOR_CLEAR_VALUE, clear_color.as_mut_ptr());
+                gl.Disable(ffi::SCISSOR_TEST);
 
-            let fbo = ensure_blur_scratch_fbo(gl);
-            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbo);
-            gl.FramebufferTexture2D(
-                ffi::DRAW_FRAMEBUFFER,
-                ffi::COLOR_ATTACHMENT0,
-                ffi::TEXTURE_2D,
-                target_tex_id,
-                0,
-            );
-            gl.Viewport(0, 0, size.w, size.h);
-            gl.ClearColor(0.0, 0.0, 0.0, 0.0);
-            gl.Clear(ffi::COLOR_BUFFER_BIT);
-            gl.BlitFramebuffer(
-                clamped_dst.loc.x,
-                clamped_dst.loc.y,
-                clamped_dst.loc.x + clamped_dst.size.w,
-                clamped_dst.loc.y + clamped_dst.size.h,
-                copy_offset.0,
-                copy_offset.1,
-                copy_offset.0 + clamped_dst.size.w,
-                copy_offset.1 + clamped_dst.size.h,
-                ffi::COLOR_BUFFER_BIT,
-                ffi::LINEAR,
-            );
-            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, current_fbo as u32);
-            gl.ClearColor(
-                clear_color[0],
-                clear_color[1],
-                clear_color[2],
-                clear_color[3],
-            );
-            gl.Enable(ffi::SCISSOR_TEST);
+                let fbo = ensure_blur_scratch_fbo(gl);
+                gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbo);
+                gl.FramebufferTexture2D(
+                    ffi::DRAW_FRAMEBUFFER,
+                    ffi::COLOR_ATTACHMENT0,
+                    ffi::TEXTURE_2D,
+                    target_tex_id,
+                    0,
+                );
+                gl.Viewport(0, 0, size.w, size.h);
+                gl.ClearColor(0.0, 0.0, 0.0, 0.0);
+                gl.Clear(ffi::COLOR_BUFFER_BIT);
+                gl.BlitFramebuffer(
+                    clamped_dst.loc.x,
+                    clamped_dst.loc.y,
+                    clamped_dst.loc.x + clamped_dst.size.w,
+                    clamped_dst.loc.y + clamped_dst.size.h,
+                    copy_offset.0,
+                    copy_offset.1,
+                    copy_offset.0 + clamped_dst.size.w,
+                    copy_offset.1 + clamped_dst.size.h,
+                    ffi::COLOR_BUFFER_BIT,
+                    ffi::LINEAR,
+                );
+                gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, current_fbo as u32);
+                gl.ClearColor(
+                    clear_color[0],
+                    clear_color[1],
+                    clear_color[2],
+                    clear_color[3],
+                );
+                gl.Enable(ffi::SCISSOR_TEST);
+            });
         })?;
 
         let sample_src = inner.sample_src;
@@ -1635,6 +1904,32 @@ pub fn apply_effect_pipeline(
     )
 }
 
+pub fn apply_effect_pipeline_cached_for_key(
+    renderer: &mut GlesRenderer,
+    cache_key: String,
+    texture: GlesTexture,
+    xray_texture: Option<GlesTexture>,
+    size: (i32, i32),
+    sample_region: Option<Rectangle<f64, Buffer>>,
+    output_size: Option<(i32, i32)>,
+    effect: &CompiledEffect,
+) -> Result<GlesTexture, ShaderEffectError> {
+    SHARED_EFFECT_PIPELINE_CACHES.with(|caches| {
+        let mut caches = caches.borrow_mut();
+        let cache = caches.pipeline(renderer, cache_key);
+        apply_effect_pipeline_cached(
+            renderer,
+            texture,
+            xray_texture,
+            size,
+            sample_region,
+            output_size,
+            effect,
+            cache,
+        )
+    })
+}
+
 fn apply_effect_pipeline_cached(
     renderer: &mut GlesRenderer,
     texture: GlesTexture,
@@ -1673,14 +1968,16 @@ fn apply_effect_pipeline_with_cache(
         size,
         named: HashMap::new(),
     };
-    run_effect_pipeline(
-        renderer,
-        effect,
-        &mut ctx,
-        sample_region,
-        output_size,
-        cache,
-    )
+    with_gpu_timing_renderer_span(renderer, "effect-pipeline-total", size, |renderer| {
+        run_effect_pipeline(
+            renderer,
+            effect,
+            &mut ctx,
+            sample_region,
+            output_size,
+            cache,
+        )
+    })
 }
 
 pub fn log_gap_texture_region_readback(
@@ -2128,6 +2425,7 @@ fn run_effect_pipeline(
                 [current_size.0 as f32, current_size.1 as f32],
             )],
             cache.as_deref_mut(),
+            "effect-finish",
         )?;
     }
 
@@ -2190,7 +2488,15 @@ fn apply_texture_shader_stage(
         };
         uniforms.push(uniform);
     }
-    apply_texture_program(renderer, texture, size, program, uniforms, cache)
+    apply_texture_program(
+        renderer,
+        texture,
+        size,
+        program,
+        uniforms,
+        cache,
+        "effect-texture-shader",
+    )
 }
 
 fn apply_shader_input_stage(
@@ -2215,20 +2521,22 @@ fn apply_shader_input_stage(
     };
     let mut state = ShaderEffectElementState::default();
     let element = state.element(renderer, spec)?;
-    let mut target = effect_pipeline_target(renderer, size, cache)?;
-    let mut framebuffer = renderer.bind(&mut target)?;
-    let mut damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
-    let _ = damage_tracker
-        .render_output(
-            renderer,
-            &mut framebuffer,
-            0,
-            &[element],
-            [0.0, 0.0, 0.0, 0.0],
-        )
-        .map_err(|_| GlesError::FramebufferBindingError)?;
-    drop(framebuffer);
-    Ok(target)
+    with_gpu_timing_renderer_span(renderer, "effect-shader-input", size, |renderer| {
+        let mut target = effect_pipeline_target(renderer, size, cache)?;
+        let mut framebuffer = renderer.bind(&mut target)?;
+        let mut damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
+        let _ = damage_tracker
+            .render_output(
+                renderer,
+                &mut framebuffer,
+                0,
+                &[element],
+                [0.0, 0.0, 0.0, 0.0],
+            )
+            .map_err(|_| GlesError::FramebufferBindingError)?;
+        drop(framebuffer);
+        Ok(target)
+    })
 }
 
 fn apply_noise_stage(
@@ -2251,6 +2559,7 @@ fn apply_noise_stage(
                     Uniform::new("noise_amount", noise.amount),
                 ],
                 cache,
+                "effect-noise",
             )
         }
     }
@@ -2272,60 +2581,62 @@ fn apply_blend_stage(
 
     let target = effect_pipeline_target(renderer, size, cache)?;
     renderer.with_context(|gl| unsafe {
-        while gl.GetError() != ffi::NO_ERROR {}
+        with_gpu_timing_gl_span(gl, "effect-blend", size, || {
+            while gl.GetError() != ffi::NO_ERROR {}
 
-        gl.Disable(ffi::BLEND);
-        gl.Disable(ffi::SCISSOR_TEST);
-        gl.ActiveTexture(ffi::TEXTURE0);
+            gl.Disable(ffi::BLEND);
+            gl.Disable(ffi::SCISSOR_TEST);
+            gl.ActiveTexture(ffi::TEXTURE0);
 
-        let fbo = ensure_blur_scratch_fbo(gl);
-        gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbo);
-        gl.FramebufferTexture2D(
-            ffi::DRAW_FRAMEBUFFER,
-            ffi::COLOR_ATTACHMENT0,
-            ffi::TEXTURE_2D,
-            target.tex_id(),
-            0,
-        );
+            let fbo = ensure_blur_scratch_fbo(gl);
+            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbo);
+            gl.FramebufferTexture2D(
+                ffi::DRAW_FRAMEBUFFER,
+                ffi::COLOR_ATTACHMENT0,
+                ffi::TEXTURE_2D,
+                target.tex_id(),
+                0,
+            );
 
-        gl.Viewport(0, 0, size.0, size.1);
-        gl.UseProgram(programs.program.program);
-        gl.Uniform1i(programs.program.uniform_tex, 0);
-        gl.Uniform1i(programs.program.uniform_tex2, 1);
-        gl.Uniform1f(programs.program.uniform_blend_mode, blend_mode_value(mode));
-        gl.Uniform1f(programs.program.uniform_blend_alpha, alpha.clamp(0.0, 1.0));
+            gl.Viewport(0, 0, size.0, size.1);
+            gl.UseProgram(programs.program.program);
+            gl.Uniform1i(programs.program.uniform_tex, 0);
+            gl.Uniform1i(programs.program.uniform_tex2, 1);
+            gl.Uniform1f(programs.program.uniform_blend_mode, blend_mode_value(mode));
+            gl.Uniform1f(programs.program.uniform_blend_alpha, alpha.clamp(0.0, 1.0));
 
-        let vertices: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
-        gl.EnableVertexAttribArray(programs.program.attrib_vert as u32);
-        gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-        gl.VertexAttribPointer(
-            programs.program.attrib_vert as u32,
-            2,
-            ffi::FLOAT,
-            ffi::FALSE,
-            0,
-            vertices.as_ptr().cast(),
-        );
+            let vertices: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+            gl.EnableVertexAttribArray(programs.program.attrib_vert as u32);
+            gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+            gl.VertexAttribPointer(
+                programs.program.attrib_vert as u32,
+                2,
+                ffi::FLOAT,
+                ffi::FALSE,
+                0,
+                vertices.as_ptr().cast(),
+            );
 
-        gl.ActiveTexture(ffi::TEXTURE0);
-        gl.BindTexture(ffi::TEXTURE_2D, current.tex_id());
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+            gl.ActiveTexture(ffi::TEXTURE0);
+            gl.BindTexture(ffi::TEXTURE_2D, current.tex_id());
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
 
-        gl.ActiveTexture(ffi::TEXTURE1);
-        gl.BindTexture(ffi::TEXTURE_2D, other.tex_id());
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+            gl.ActiveTexture(ffi::TEXTURE1);
+            gl.BindTexture(ffi::TEXTURE_2D, other.tex_id());
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
 
-        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+            gl.DrawArrays(ffi::TRIANGLES, 0, 6);
 
-        gl.BindTexture(ffi::TEXTURE_2D, 0);
-        gl.ActiveTexture(ffi::TEXTURE0);
-        gl.BindTexture(ffi::TEXTURE_2D, 0);
-        gl.DisableVertexAttribArray(programs.program.attrib_vert as u32);
-        gl.UseProgram(0);
-        gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
-        gl.Enable(ffi::SCISSOR_TEST);
+            gl.BindTexture(ffi::TEXTURE_2D, 0);
+            gl.ActiveTexture(ffi::TEXTURE0);
+            gl.BindTexture(ffi::TEXTURE_2D, 0);
+            gl.DisableVertexAttribArray(programs.program.attrib_vert as u32);
+            gl.UseProgram(0);
+            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+            gl.Enable(ffi::SCISSOR_TEST);
+        });
         Ok::<_, GlesError>(())
     })??;
 
@@ -2344,41 +2655,52 @@ fn blend_mode_value(mode: BlendMode) -> f32 {
 fn crop_texture_region(
     renderer: &mut GlesRenderer,
     texture: GlesTexture,
-    _size: (i32, i32),
+    size: (i32, i32),
     region: Rectangle<f64, Buffer>,
     output_size: (i32, i32),
     cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
-    let mut target = effect_pipeline_target(renderer, output_size, cache)?;
-    let element = TextureRenderElement::from_static_texture(
-        Id::new(),
-        renderer.context_id(),
-        Point::<f64, Physical>::from((0.0, 0.0)),
-        texture,
-        1,
-        Transform::Normal,
-        Some(1.0),
-        Some(Rectangle::new(
-            Point::from((region.loc.x, region.loc.y)),
-            (region.size.w, region.size.h).into(),
-        )),
-        Some(output_size.into()),
-        None,
-        Kind::Unspecified,
-    );
-    let mut framebuffer = renderer.bind(&mut target)?;
-    let mut damage_tracker = OutputDamageTracker::new(output_size, 1.0, Transform::Normal);
-    let _ = damage_tracker
-        .render_output(
-            renderer,
-            &mut framebuffer,
-            0,
-            &[element],
-            [0.0, 0.0, 0.0, 0.0],
-        )
-        .map_err(|_| GlesError::FramebufferBindingError)?;
-    drop(framebuffer);
-    Ok(target)
+    if output_size == size
+        && region.loc.x == 0.0
+        && region.loc.y == 0.0
+        && region.size.w == size.0 as f64
+        && region.size.h == size.1 as f64
+    {
+        return Ok(texture);
+    }
+
+    with_gpu_timing_renderer_span(renderer, "effect-crop", output_size, |renderer| {
+        let mut target = effect_pipeline_target(renderer, output_size, cache)?;
+        let element = TextureRenderElement::from_static_texture(
+            Id::new(),
+            renderer.context_id(),
+            Point::<f64, Physical>::from((0.0, 0.0)),
+            texture,
+            1,
+            Transform::Normal,
+            Some(1.0),
+            Some(Rectangle::new(
+                Point::from((region.loc.x, region.loc.y)),
+                (region.size.w, region.size.h).into(),
+            )),
+            Some(output_size.into()),
+            None,
+            Kind::Unspecified,
+        );
+        let mut framebuffer = renderer.bind(&mut target)?;
+        let mut damage_tracker = OutputDamageTracker::new(output_size, 1.0, Transform::Normal);
+        let _ = damage_tracker
+            .render_output(
+                renderer,
+                &mut framebuffer,
+                0,
+                &[element],
+                [0.0, 0.0, 0.0, 0.0],
+            )
+            .map_err(|_| GlesError::FramebufferBindingError)?;
+        drop(framebuffer);
+        Ok(target)
+    })
 }
 
 fn apply_texture_program(
@@ -2388,35 +2710,38 @@ fn apply_texture_program(
     program: GlesTexProgram,
     uniforms: Vec<Uniform<'static>>,
     cache: Option<&mut EffectPipelineCache>,
+    timing_label: &'static str,
 ) -> Result<GlesTexture, ShaderEffectError> {
-    let mut target = effect_pipeline_target(renderer, size, cache)?;
-    let inner = TextureRenderElement::from_static_texture(
-        Id::new(),
-        renderer.context_id(),
-        Point::<f64, Physical>::from((0.0, 0.0)),
-        texture,
-        1,
-        Transform::Normal,
-        Some(1.0),
-        None,
-        Some((size.0, size.1).into()),
-        None,
-        Kind::Unspecified,
-    );
-    let element = TextureShaderElement::new(inner, program, uniforms);
-    let mut framebuffer = renderer.bind(&mut target)?;
-    let mut damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
-    let _ = damage_tracker
-        .render_output(
-            renderer,
-            &mut framebuffer,
-            0,
-            &[element],
-            [0.0, 0.0, 0.0, 0.0],
-        )
-        .map_err(|_| GlesError::FramebufferBindingError)?;
-    drop(framebuffer);
-    Ok(target)
+    with_gpu_timing_renderer_span(renderer, timing_label, size, |renderer| {
+        let mut target = effect_pipeline_target(renderer, size, cache)?;
+        let inner = TextureRenderElement::from_static_texture(
+            Id::new(),
+            renderer.context_id(),
+            Point::<f64, Physical>::from((0.0, 0.0)),
+            texture,
+            1,
+            Transform::Normal,
+            Some(1.0),
+            None,
+            Some((size.0, size.1).into()),
+            None,
+            Kind::Unspecified,
+        );
+        let element = TextureShaderElement::new(inner, program, uniforms);
+        let mut framebuffer = renderer.bind(&mut target)?;
+        let mut damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
+        let _ = damage_tracker
+            .render_output(
+                renderer,
+                &mut framebuffer,
+                0,
+                &[element],
+                [0.0, 0.0, 0.0, 0.0],
+            )
+            .map_err(|_| GlesError::FramebufferBindingError)?;
+        drop(framebuffer);
+        Ok(target)
+    })
 }
 
 fn effect_pipeline_target(
@@ -2696,6 +3021,7 @@ fn preblur_using_pyramid(
             &current_tex,
             &dst_tex,
             dst_size,
+            "blur-downsample-pass",
             &programs.down,
             [0.5f32 / dst_size.0 as f32, 0.5f32 / dst_size.1 as f32],
             offset,
@@ -2716,6 +3042,7 @@ fn preblur_using_pyramid(
             &src_tex,
             &dst_tex,
             dst_size,
+            "blur-upsample-pass",
             &programs.up,
             [0.5f32 / src_size.0 as f32, 0.5f32 / src_size.1 as f32],
             offset,
@@ -2771,6 +3098,7 @@ fn blur_texture_pass_into(
     source: &GlesTexture,
     target: &GlesTexture,
     output_size: (i32, i32),
+    timing_label: &'static str,
     program: &BlurProgramInternal,
     half_pixel: [f32; 2],
     offset: f32,
@@ -2779,57 +3107,59 @@ fn blur_texture_pass_into(
     let target_tex_id = target.tex_id();
 
     renderer.with_context(|gl| unsafe {
-        while gl.GetError() != ffi::NO_ERROR {}
+        with_gpu_timing_gl_span(gl, timing_label, output_size, || {
+            while gl.GetError() != ffi::NO_ERROR {}
 
-        gl.Disable(ffi::BLEND);
-        gl.Disable(ffi::SCISSOR_TEST);
-        gl.ActiveTexture(ffi::TEXTURE0);
+            gl.Disable(ffi::BLEND);
+            gl.Disable(ffi::SCISSOR_TEST);
+            gl.ActiveTexture(ffi::TEXTURE0);
 
-        let fbo = ensure_blur_scratch_fbo(gl);
-        gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbo);
-        gl.FramebufferTexture2D(
-            ffi::DRAW_FRAMEBUFFER,
-            ffi::COLOR_ATTACHMENT0,
-            ffi::TEXTURE_2D,
-            target_tex_id,
-            0,
-        );
+            let fbo = ensure_blur_scratch_fbo(gl);
+            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbo);
+            gl.FramebufferTexture2D(
+                ffi::DRAW_FRAMEBUFFER,
+                ffi::COLOR_ATTACHMENT0,
+                ffi::TEXTURE_2D,
+                target_tex_id,
+                0,
+            );
 
-        gl.Viewport(0, 0, output_size.0, output_size.1);
-        gl.UseProgram(program.program);
-        gl.Uniform1i(program.uniform_tex, 0);
-        gl.Uniform2f(program.uniform_half_pixel, half_pixel[0], half_pixel[1]);
-        gl.Uniform1f(program.uniform_offset, offset);
+            gl.Viewport(0, 0, output_size.0, output_size.1);
+            gl.UseProgram(program.program);
+            gl.Uniform1i(program.uniform_tex, 0);
+            gl.Uniform2f(program.uniform_half_pixel, half_pixel[0], half_pixel[1]);
+            gl.Uniform1f(program.uniform_offset, offset);
 
-        let vertices: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
-        gl.EnableVertexAttribArray(program.attrib_vert as u32);
-        gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-        gl.VertexAttribPointer(
-            program.attrib_vert as u32,
-            2,
-            ffi::FLOAT,
-            ffi::FALSE,
-            0,
-            vertices.as_ptr().cast(),
-        );
+            let vertices: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+            gl.EnableVertexAttribArray(program.attrib_vert as u32);
+            gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+            gl.VertexAttribPointer(
+                program.attrib_vert as u32,
+                2,
+                ffi::FLOAT,
+                ffi::FALSE,
+                0,
+                vertices.as_ptr().cast(),
+            );
 
-        gl.BindTexture(ffi::TEXTURE_2D, source_tex_id);
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
-        gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
-        gl.TexParameteri(
-            ffi::TEXTURE_2D,
-            ffi::TEXTURE_WRAP_S,
-            ffi::CLAMP_TO_EDGE as i32,
-        );
-        gl.TexParameteri(
-            ffi::TEXTURE_2D,
-            ffi::TEXTURE_WRAP_T,
-            ffi::CLAMP_TO_EDGE as i32,
-        );
-        gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+            gl.BindTexture(ffi::TEXTURE_2D, source_tex_id);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_S,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_T,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            gl.DrawArrays(ffi::TRIANGLES, 0, 6);
 
-        gl.DisableVertexAttribArray(program.attrib_vert as u32);
-        gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+            gl.DisableVertexAttribArray(program.attrib_vert as u32);
+            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+        });
     })?;
 
     Ok(())
@@ -2852,6 +3182,7 @@ fn blur_texture_pass(
         &texture,
         &target,
         output_size,
+        "blur-pass",
         program,
         half_pixel,
         offset,

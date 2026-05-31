@@ -1948,8 +1948,12 @@ fn backdrop_shader_elements_for_window(
                 final_backdrop_screen_rect.size.w,
                 final_backdrop_screen_rect.size.h,
             );
-            let texture = crate::backend::shader_effect::apply_effect_pipeline(
+            let texture = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
                 renderer,
+                format!(
+                    "winit:window-backdrop:{}:{}",
+                    decoration.snapshot.id, cached.stable_key
+                ),
                 input_texture,
                 xray_texture,
                 crate::backend::visual::logical_size_to_physical_buffer_size(
@@ -2579,8 +2583,9 @@ fn lower_layer_scene_elements(
         } else {
             None
         };
-        let texture = crate::backend::shader_effect::apply_effect_pipeline(
+        let texture = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
             renderer,
+            format!("winit:layer-lower:{}", stable_key),
             backdrop_texture
                 .clone()
                 .or_else(|| xray_texture.clone())
@@ -2952,8 +2957,9 @@ fn configured_background_effect_elements_for_layer(
                 .collect();
         }
     }
-    let texture = crate::backend::shader_effect::apply_effect_pipeline(
+    let texture = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
         renderer,
+        format!("winit:layer-top:{}", stable_key),
         input_texture,
         xray_texture,
         crate::backend::visual::logical_size_to_physical_buffer_size(
@@ -3477,8 +3483,12 @@ fn configured_background_effect_elements_for_window(
                     "backdrop debug: protocol window element"
                 );
             }
-            let texture = crate::backend::shader_effect::apply_effect_pipeline(
+            let texture = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
                 renderer,
+                format!(
+                    "winit:protocol-window:{}:{}",
+                    decoration.snapshot.id, stable_key
+                ),
                 input_texture,
                 xray_texture,
                 crate::backend::visual::logical_size_to_physical_buffer_size(

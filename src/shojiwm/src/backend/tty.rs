@@ -80,10 +80,9 @@ const CLEAR_COLOR: [f32; 4] = [0.08, 0.10, 0.13, 1.0];
 // Keep hardware cursor updates on the cursor plane, but force window/layer content through
 // the compositor for now.
 //
-// Scanout flags now match niri's default: primary + overlay + cursor plane
-// scanout all enabled. The `_ANY` variant for primary scanout lets DRM pick
-// the plane regardless of pixel format match, which matches what niri does
-// (see `misc/niri/src/backend/tty.rs`).
+// Keep primary, overlay, and cursor plane scanout enabled. Unlike niri's
+// default, overlay assignment measurably improves performance on the target
+// NVIDIA system.
 //
 // The earlier worry that primary scanout would skip our SSD/decorations is
 // handled by smithay's `DrmCompositor`: plane assignment only picks the
@@ -3906,11 +3905,15 @@ fn render_surface(
         elements.extend(cursor_elements);
         elements.extend(content_for_capture);
 
-        let result = surface.drm_output.render_frame(
+        let result = crate::backend::shader_effect::with_gpu_timing_renderer_span(
             &mut backend.renderer,
-            &elements,
-            CLEAR_COLOR,
-            TTY_FRAME_FLAGS,
+            "tty-render-frame",
+            (output_geo.size.w, output_geo.size.h),
+            |renderer| {
+                surface
+                    .drm_output
+                    .render_frame(renderer, &elements, CLEAR_COLOR, TTY_FRAME_FLAGS)
+            },
         )?;
         fps_counter.record_present(output.name().as_str());
         if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some()
@@ -5544,8 +5547,14 @@ fn window_effect_elements(
             "window effect debug: source captured"
         );
     }
-    let texture = crate::backend::shader_effect::apply_effect_pipeline(
+    let texture = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
         renderer,
+        format!(
+            "tty:window-effect:{}:{}:{}",
+            output.name(),
+            window_id,
+            placement
+        ),
         source.texture,
         None,
         (texture_size.w, texture_size.h),
@@ -6204,8 +6213,12 @@ fn backdrop_shader_elements_for_window(
                     &cached.stable_key,
                 );
             }
-            let texture = crate::backend::shader_effect::apply_effect_pipeline(
+            let texture = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
                 renderer,
+                format!(
+                    "tty:window-backdrop:{}:{}",
+                    decoration.snapshot.id, cache_key
+                ),
                 input_texture,
                 xray_texture,
                 crate::backend::visual::logical_size_to_physical_buffer_size(
@@ -6841,8 +6854,15 @@ fn configured_background_effect_elements_for_layer(
     else {
         return Ok(Vec::new());
     };
-    let texture = crate::backend::shader_effect::apply_effect_pipeline(
+    let texture = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
         renderer,
+        format!(
+            "tty:layer-top:{}:{}:{}x{}",
+            output.name(),
+            layer_id,
+            effect_rect.width,
+            effect_rect.height
+        ),
         input_texture,
         xray_texture,
         crate::backend::visual::logical_size_to_physical_buffer_size(
@@ -7298,8 +7318,9 @@ fn lower_layer_scene_elements(
             } else {
                 None
             };
-            let texture = crate::backend::shader_effect::apply_effect_pipeline(
+            let texture = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
                 renderer,
+                format!("tty:layer-lower:{}", stable_key),
                 backdrop_texture
                     .clone()
                     .or_else(|| xray_texture.clone())
@@ -7835,8 +7856,12 @@ fn configured_background_effect_elements_for_window(
                     &cache_key,
                 );
             }
-            let texture = crate::backend::shader_effect::apply_effect_pipeline(
+            let texture = crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
                 renderer,
+                format!(
+                    "tty:protocol-window:{}:{}",
+                    decoration.snapshot.id, cache_key
+                ),
                 input_texture,
                 xray_texture,
                 crate::backend::visual::logical_size_to_physical_buffer_size(
