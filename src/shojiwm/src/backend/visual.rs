@@ -576,6 +576,18 @@ pub struct WindowVisualState {
     pub opacity: f32,
 }
 
+pub fn is_identity_visual_geometry(visual: WindowVisualState) -> bool {
+    // Animation values pass through runtime serialization before reaching renderer space. Use a
+    // small tolerance so a visually finished scale animation cannot leave a window on the more
+    // expensive transform path indefinitely. Opacity is deliberately excluded: normal rendering
+    // applies it directly to each element and does not require a full-window transform snapshot.
+    const VISUAL_IDENTITY_EPSILON: f64 = 1e-3;
+    visual.translation.x == 0
+        && visual.translation.y == 0
+        && (visual.scale.x - 1.0).abs() < VISUAL_IDENTITY_EPSILON
+        && (visual.scale.y - 1.0).abs() < VISUAL_IDENTITY_EPSILON
+}
+
 pub fn window_visual_state(
     rect: LogicalRect,
     transform: WindowTransform,
@@ -792,13 +804,37 @@ pub fn relative_physical_rect_from_root_global_edges_precise(
 #[cfg(test)]
 mod tests {
     use super::{
-        PreciseLogicalRect, relative_physical_rect_from_root,
-        relative_physical_rect_from_root_snapped_edges, snapped_precise_logical_rect_in_area_space,
-        snapped_precise_logical_rect_in_element_space,
+        PreciseLogicalRect, WindowVisualState, is_identity_visual_geometry,
+        relative_physical_rect_from_root, relative_physical_rect_from_root_snapped_edges,
+        snapped_precise_logical_rect_in_area_space, snapped_precise_logical_rect_in_element_space,
         snapped_precise_logical_rect_in_root_frame_area_space,
     };
     use crate::ssd::LogicalRect;
-    use smithay::utils::{Logical, Point, Rectangle, Scale};
+    use smithay::utils::{Logical, Physical, Point, Rectangle, Scale};
+
+    #[test]
+    fn opacity_only_visual_state_has_identity_geometry() {
+        let visual = WindowVisualState {
+            origin: Point::<i32, Physical>::from((10, 20)),
+            scale: Scale::from((1.0, 1.0)),
+            translation: Point::from((0, 0)),
+            opacity: 0.5,
+        };
+
+        assert!(is_identity_visual_geometry(visual));
+    }
+
+    #[test]
+    fn translated_visual_state_does_not_have_identity_geometry() {
+        let visual = WindowVisualState {
+            origin: Point::<i32, Physical>::from((10, 20)),
+            scale: Scale::from((1.0, 1.0)),
+            translation: Point::from((1, 0)),
+            opacity: 1.0,
+        };
+
+        assert!(!is_identity_visual_geometry(visual));
+    }
 
     #[test]
     fn snapped_edge_relative_rect_is_translation_stable_against_output() {

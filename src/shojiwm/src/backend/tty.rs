@@ -64,8 +64,8 @@ use crate::{
     backend::decoration,
     backend::snapshot,
     backend::visual::{
-        WindowVisualState, root_physical_origin, transformed_rect, transformed_root_rect,
-        window_visual_state,
+        WindowVisualState, is_identity_visual_geometry, root_physical_origin, transformed_rect,
+        transformed_root_rect, window_visual_state,
     },
     backend::window as window_render,
     config::DisplayModePreference,
@@ -1499,7 +1499,7 @@ fn render_surface(
             if !has_backdrop_source {
                 continue;
             }
-            let use_full_window_snapshot = !is_identity_visual(visual_state);
+            let use_full_window_snapshot = !is_identity_visual_geometry(visual_state);
             let used_transform_snapshot_last_frame =
                 transform_snapshot_window_ids.contains(&window_id);
             if use_full_window_snapshot {
@@ -4324,7 +4324,7 @@ fn transform_window_elements(
         RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>,
     ) -> TtyRenderElements,
 ) -> Vec<TtyRenderElements> {
-    if is_identity_visual(visual) {
+    if is_identity_visual_geometry(visual) {
         return elements.into_iter().map(direct).collect();
     }
 
@@ -4344,7 +4344,7 @@ fn transform_clipped_elements(
     elements: Vec<crate::backend::clipped_surface::ClippedSurfaceElement>,
     visual: WindowVisualState,
 ) -> Vec<TtyRenderElements> {
-    if is_identity_visual(visual) {
+    if is_identity_visual_geometry(visual) {
         if clipped_transform_debug_enabled() {
             for element in &elements {
                 info!(
@@ -4529,7 +4529,7 @@ fn transform_text_elements(
     root_origin: Point<i32, smithay::utils::Physical>,
     visual: WindowVisualState,
 ) -> Result<Vec<TtyRenderElements>, Box<dyn std::error::Error>> {
-    if is_identity_visual(visual) {
+    if is_identity_visual_geometry(visual) {
         return Ok(elements
             .into_iter()
             .map(|element| {
@@ -4560,7 +4560,7 @@ fn transform_snapshot_elements(
     elements: Vec<TextureRenderElement<GlesTexture>>,
     visual: WindowVisualState,
 ) -> Result<Vec<TtyRenderElements>, Box<dyn std::error::Error>> {
-    if is_identity_visual(visual) {
+    if is_identity_visual_geometry(visual) {
         return Ok(elements
             .into_iter()
             .map(TtyRenderElements::Snapshot)
@@ -4584,7 +4584,7 @@ fn transform_decoration_elements(
     root_origin: Point<i32, smithay::utils::Physical>,
     visual: WindowVisualState,
 ) -> Result<Vec<TtyRenderElements>, Box<dyn std::error::Error>> {
-    if is_identity_visual(visual) {
+    if is_identity_visual_geometry(visual) {
         return Ok(elements
             .into_iter()
             .map(|element| {
@@ -4616,7 +4616,7 @@ fn transform_backdrop_elements(
     root_origin: Point<i32, smithay::utils::Physical>,
     visual: WindowVisualState,
 ) -> Result<Vec<TtyRenderElements>, Box<dyn std::error::Error>> {
-    if is_identity_visual(visual) {
+    if is_identity_visual_geometry(visual) {
         return Ok(elements
             .into_iter()
             .map(|element| {
@@ -4887,7 +4887,7 @@ fn transform_physical_rect_for_visual(
     rect: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
     visual: WindowVisualState,
 ) -> smithay::utils::Rectangle<i32, smithay::utils::Physical> {
-    if is_identity_visual(visual) {
+    if is_identity_visual_geometry(visual) {
         return rect;
     }
 
@@ -8180,27 +8180,6 @@ fn window_scene_elements_for_capture(
     );
 
     Ok(elements)
-}
-
-fn is_identity_visual(visual: WindowVisualState) -> bool {
-    // Do not use machine epsilon here. The TS animation system intentionally snaps finished
-    // timelines to their target value, but the Rust side only sees the serialized transform after
-    // several conversions (signal -> JSON -> serde -> logical/physical transform state). In
-    // practice we can end up with values such as opacity=0.999883 even though the animation is
-    // visually finished.
-    //
-    // Treating that as "non-identity" keeps the window in transform-snapshot mode forever. Once
-    // the animation stops changing, the snapshot throttling path no longer restores
-    // primary_scanout_output, frame callbacks stop, and clients like Kitty stop producing commits
-    // until some unrelated input event wakes them up again.
-    //
-    // A small tolerance fixes the classification without affecting visually meaningful transforms.
-    const VISUAL_IDENTITY_EPSILON: f64 = 1e-3;
-    visual.translation.x == 0
-        && visual.translation.y == 0
-        && (visual.scale.x - 1.0).abs() < VISUAL_IDENTITY_EPSILON
-        && (visual.scale.y - 1.0).abs() < VISUAL_IDENTITY_EPSILON
-        && f64::from((visual.opacity - 1.0).abs()) < VISUAL_IDENTITY_EPSILON
 }
 
 fn capture_live_snapshot_for_window(

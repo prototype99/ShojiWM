@@ -28,7 +28,8 @@ use tracing::{info, trace, warn};
 use crate::{
     ShojiWM,
     backend::visual::{
-        WindowVisualState, root_physical_origin, transformed_root_rect, window_visual_state,
+        WindowVisualState, is_identity_visual_geometry, root_physical_origin,
+        transformed_root_rect, window_visual_state,
     },
     backend::{damage, damage_blink, decoration, snapshot, window as window_render},
     presentation::{take_presentation_feedback, update_primary_scanout_output},
@@ -357,7 +358,7 @@ pub fn init_winit(
                             if !has_backdrop_source {
                                 continue;
                             }
-                            let use_full_window_snapshot = !is_identity_visual(visual_state);
+                            let use_full_window_snapshot = !is_identity_visual_geometry(visual_state);
                             let used_transform_snapshot_last_frame = state
                                 .transform_snapshot_window_ids
                                 .contains(&window_id);
@@ -1251,7 +1252,7 @@ fn transform_window_elements(
         RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>,
     ) -> WinitRenderElements,
 ) -> Vec<WinitRenderElements> {
-    if is_identity_visual(visual) {
+    if is_identity_visual_geometry(visual) {
         return elements.into_iter().map(direct).collect();
     }
 
@@ -1271,7 +1272,7 @@ fn transform_clipped_elements(
     elements: Vec<crate::backend::clipped_surface::ClippedSurfaceElement>,
     visual: WindowVisualState,
 ) -> Vec<WinitRenderElements> {
-    if is_identity_visual(visual) {
+    if is_identity_visual_geometry(visual) {
         if clipped_transform_debug_enabled() {
             for element in &elements {
                 info!(
@@ -1322,7 +1323,7 @@ fn transform_text_elements(
     root_origin: Point<i32, smithay::utils::Physical>,
     visual: WindowVisualState,
 ) -> Vec<WinitRenderElements> {
-    if is_identity_visual(visual) {
+    if is_identity_visual_geometry(visual) {
         return elements
             .into_iter()
             .map(|element| {
@@ -1353,7 +1354,7 @@ fn transform_snapshot_elements(
     elements: Vec<TextureRenderElement<GlesTexture>>,
     visual: WindowVisualState,
 ) -> Vec<WinitRenderElements> {
-    if is_identity_visual(visual) {
+    if is_identity_visual_geometry(visual) {
         return elements
             .into_iter()
             .map(WinitRenderElements::Snapshot)
@@ -1377,7 +1378,7 @@ fn transform_decoration_elements(
     root_origin: Point<i32, smithay::utils::Physical>,
     visual: WindowVisualState,
 ) -> Vec<WinitRenderElements> {
-    if is_identity_visual(visual) {
+    if is_identity_visual_geometry(visual) {
         return elements
             .into_iter()
             .map(|element| {
@@ -1409,7 +1410,7 @@ fn transform_backdrop_elements(
     root_origin: Point<i32, smithay::utils::Physical>,
     visual: WindowVisualState,
 ) -> Vec<WinitRenderElements> {
-    if is_identity_visual(visual) {
+    if is_identity_visual_geometry(visual) {
         return elements
             .into_iter()
             .map(|element| {
@@ -3935,16 +3936,4 @@ fn closing_snapshot_elements(
             elements
         })
         .collect()
-}
-
-fn is_identity_visual(visual: WindowVisualState) -> bool {
-    // Keep the identity test consistent with the TTY backend. Exact float equality is too strict
-    // for animation end states once the values have gone through runtime serialization and
-    // renderer-space conversion.
-    const VISUAL_IDENTITY_EPSILON: f64 = 1e-3;
-    visual.translation.x == 0
-        && visual.translation.y == 0
-        && (visual.scale.x - 1.0).abs() < VISUAL_IDENTITY_EPSILON
-        && (visual.scale.y - 1.0).abs() < VISUAL_IDENTITY_EPSILON
-        && f64::from((visual.opacity - 1.0).abs()) < VISUAL_IDENTITY_EPSILON
 }
