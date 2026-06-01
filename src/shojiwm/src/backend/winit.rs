@@ -82,20 +82,34 @@ fn capture_scene_texture_for_effect(
         1.0,
         smithay::utils::Transform::Normal,
     );
-    snapshot::capture_snapshot(
-        renderer,
-        None,
-        &mut tracker,
-        crate::ssd::LogicalRect::new(
-            capture_geo.loc.x,
-            capture_geo.loc.y,
-            capture_geo.size.w,
-            capture_geo.size.h,
-        ),
-        0,
-        true,
+    let capture_size = crate::backend::visual::logical_size_to_physical_buffer_size(
+        capture_geo.size.w,
+        capture_geo.size.h,
         scale,
-        scene,
+    );
+    crate::backend::shader_effect::with_gpu_timing_renderer_span(
+        renderer,
+        "backdrop-scene-capture",
+        capture_size,
+        |renderer| {
+            renderer.with_deferred_frame_flushes(|renderer| {
+                snapshot::capture_snapshot(
+                    renderer,
+                    None,
+                    &mut tracker,
+                    crate::ssd::LogicalRect::new(
+                        capture_geo.loc.x,
+                        capture_geo.loc.y,
+                        capture_geo.size.w,
+                        capture_geo.size.h,
+                    ),
+                    0,
+                    true,
+                    scale,
+                    scene,
+                )
+            })
+        },
     )
     .ok()
     .flatten()
@@ -2554,20 +2568,32 @@ fn lower_layer_scene_elements(
             1.0,
             smithay::utils::Transform::Normal,
         );
-        let snapshot = snapshot::capture_snapshot(
-            renderer,
-            None,
-            &mut backdrop_tracker,
-            crate::ssd::LogicalRect::new(
-                capture_geo.loc.x,
-                capture_geo.loc.y,
-                capture_geo.size.w,
-                capture_geo.size.h,
-            ),
-            0,
-            true,
+        let capture_size = crate::backend::visual::logical_size_to_physical_buffer_size(
+            capture_geo.size.w,
+            capture_geo.size.h,
             scale,
-            &backdrop_scene,
+        );
+        let snapshot = crate::backend::shader_effect::with_gpu_timing_renderer_span(
+            renderer,
+            "backdrop-scene-capture",
+            capture_size,
+            |renderer| {
+                snapshot::capture_snapshot(
+                    renderer,
+                    None,
+                    &mut backdrop_tracker,
+                    crate::ssd::LogicalRect::new(
+                        capture_geo.loc.x,
+                        capture_geo.loc.y,
+                        capture_geo.size.w,
+                        capture_geo.size.h,
+                    ),
+                    0,
+                    true,
+                    scale,
+                    &backdrop_scene,
+                )
+            },
         )
         .ok()
         .flatten();

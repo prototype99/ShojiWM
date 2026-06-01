@@ -22,7 +22,7 @@ use smithay::{
             element::{Element, Id, Kind, RenderElement, UnderlyingStorage},
             gles::{
                 GlesError, GlesFrame, GlesPixelProgram, GlesRenderer, GlesTexProgram, GlesTexture,
-                Uniform, UniformName, element::TextureShaderElement, ffi, link_program,
+                Uniform, UniformName, ffi, link_program,
             },
             utils::{CommitCounter, OpaqueRegions},
         },
@@ -359,12 +359,51 @@ impl GpuTimingState {
     }
 }
 
-fn gpu_timing_debug_enabled() -> bool {
+pub(crate) fn gpu_timing_debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var_os("SHOJI_GPU_TIMING_DEBUG")
             .is_some_and(|value| value != "0" && !value.is_empty())
     })
+}
+
+pub(crate) fn gpu_element_timing_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        gpu_timing_debug_enabled()
+            && std::env::var_os("SHOJI_GPU_ELEMENT_TIMING_DEBUG")
+                .is_some_and(|value| value != "0" && !value.is_empty())
+    })
+}
+
+pub(crate) struct GpuTimingFrameSpan(PendingGpuTiming);
+
+pub(crate) fn begin_gpu_timing_frame_span(
+    frame: &mut GlesFrame<'_, '_>,
+    label: &'static str,
+    size: (i32, i32),
+) -> Option<GpuTimingFrameSpan> {
+    if !gpu_timing_debug_enabled() {
+        return None;
+    }
+
+    frame
+        .with_context(|gl| GPU_TIMING_STATE.with(|state| state.borrow_mut().begin(gl, label, size)))
+        .ok()
+        .flatten()
+        .map(GpuTimingFrameSpan)
+}
+
+pub(crate) fn end_gpu_timing_frame_span(
+    frame: &mut GlesFrame<'_, '_>,
+    span: Option<GpuTimingFrameSpan>,
+) {
+    let Some(GpuTimingFrameSpan(pending)) = span else {
+        return;
+    };
+    let _ = frame.with_context(|gl| {
+        GPU_TIMING_STATE.with(|state| state.borrow_mut().end(gl, pending));
+    });
 }
 
 fn with_gpu_timing_gl_span<R>(
@@ -383,6 +422,15 @@ fn with_gpu_timing_gl_span<R>(
         GPU_TIMING_STATE.with(|state| state.borrow_mut().end(gl, pending));
     }
     result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Cached captures may include a blur halo and need a cropped opaque texture for reuse. Direct
+// framebuffer captures already match the displayed rectangle, so the final display draw can force
+// opacity without materializing another full-area texture.
+enum BackdropFinishMode {
+    Materialize,
+    DeferToDisplay,
 }
 
 pub(crate) fn with_gpu_timing_renderer_span<R>(
@@ -797,7 +845,9 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
             sample_src.size.h as f32 / full_size.h.max(1) as f32,
         ];
 
-        frame.render_texture_from_to(
+        let timing =
+            begin_gpu_timing_frame_span(frame, "backdrop-display-draw", (dst.size.w, dst.size.h));
+        let result = frame.render_texture_from_to(
             texture,
             sample_src,
             dst,
@@ -825,7 +875,9 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
                 Uniform::new("clip_rect", clip_rect),
                 Uniform::new("clip_radius", [radius, radius, radius, radius]),
             ],
-        )
+        );
+        end_gpu_timing_frame_span(frame, timing);
+        result
     }
 
     fn capture_framebuffer(
@@ -928,7 +980,7 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
         inner.pipeline.begin_frame();
         let mut guard = frame.renderer();
         let renderer = guard.as_mut();
-        match apply_effect_pipeline_cached(
+        match apply_effect_pipeline_cached_with_finish_mode(
             renderer,
             framebuffer_texture,
             None,
@@ -937,6 +989,7 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
             Some((dst.size.w, dst.size.h)),
             &self.shader,
             &mut inner.pipeline,
+            BackdropFinishMode::DeferToDisplay,
         ) {
             Ok(texture) => {
                 inner.sample_src = Some(Rectangle::from_size(texture.size().to_f64()));
@@ -1005,7 +1058,9 @@ impl RenderElement<GlesRenderer> for StableBackdropTextureElement {
             .unwrap_or([0.0, 0.0, 0.0, 0.0]);
         let radius = self.clip_radius.max(0.0);
 
-        frame.render_texture_from_to(
+        let timing =
+            begin_gpu_timing_frame_span(frame, "backdrop-display-draw", (dst.size.w, dst.size.h));
+        let result = frame.render_texture_from_to(
             &self.texture,
             src,
             dst,
@@ -1033,7 +1088,9 @@ impl RenderElement<GlesRenderer> for StableBackdropTextureElement {
                 Uniform::new("clip_rect", clip_rect),
                 Uniform::new("clip_radius", [radius, radius, radius, radius]),
             ],
-        )
+        );
+        end_gpu_timing_frame_span(frame, timing);
+        result
     }
 }
 
@@ -1156,7 +1213,9 @@ fn compile_display_texture_program(
             wrap_backdrop_shader_source(
                 r#"
 vec4 shader_main(vec2 uv, vec2 rect_size) {
-    return texture2D(tex, uv);
+    vec4 color = texture2D(tex, uv);
+    color.a = 1.0;
+    return color;
 }
 "#,
             ),
@@ -1901,6 +1960,7 @@ pub fn apply_effect_pipeline(
         output_size,
         effect,
         None,
+        BackdropFinishMode::Materialize,
     )
 }
 
@@ -1940,6 +2000,30 @@ fn apply_effect_pipeline_cached(
     effect: &CompiledEffect,
     cache: &mut EffectPipelineCache,
 ) -> Result<GlesTexture, ShaderEffectError> {
+    apply_effect_pipeline_cached_with_finish_mode(
+        renderer,
+        texture,
+        xray_texture,
+        size,
+        sample_region,
+        output_size,
+        effect,
+        cache,
+        BackdropFinishMode::Materialize,
+    )
+}
+
+fn apply_effect_pipeline_cached_with_finish_mode(
+    renderer: &mut GlesRenderer,
+    texture: GlesTexture,
+    xray_texture: Option<GlesTexture>,
+    size: (i32, i32),
+    sample_region: Option<Rectangle<f64, Buffer>>,
+    output_size: Option<(i32, i32)>,
+    effect: &CompiledEffect,
+    cache: &mut EffectPipelineCache,
+    finish_mode: BackdropFinishMode,
+) -> Result<GlesTexture, ShaderEffectError> {
     apply_effect_pipeline_with_cache(
         renderer,
         texture,
@@ -1949,6 +2033,7 @@ fn apply_effect_pipeline_cached(
         output_size,
         effect,
         Some(cache),
+        finish_mode,
     )
 }
 
@@ -1961,6 +2046,7 @@ fn apply_effect_pipeline_with_cache(
     output_size: Option<(i32, i32)>,
     effect: &CompiledEffect,
     cache: Option<&mut EffectPipelineCache>,
+    finish_mode: BackdropFinishMode,
 ) -> Result<GlesTexture, ShaderEffectError> {
     let mut ctx = EffectExecutionContext {
         backdrop: texture,
@@ -1976,6 +2062,7 @@ fn apply_effect_pipeline_with_cache(
             sample_region,
             output_size,
             cache,
+            finish_mode,
         )
     })
 }
@@ -2280,6 +2367,7 @@ fn run_effect_pipeline(
     sample_region: Option<Rectangle<f64, Buffer>>,
     output_size: Option<(i32, i32)>,
     mut cache: Option<&mut EffectPipelineCache>,
+    finish_mode: BackdropFinishMode,
 ) -> Result<GlesTexture, ShaderEffectError> {
     let requested_output_size = requested_effect_output_size(sample_region, output_size);
     let input_uses_requested_size = effect_input_renders_directly_to_requested_size(&effect.input);
@@ -2394,13 +2482,14 @@ fn run_effect_pipeline(
                     pending_sample_region,
                     output_size,
                     cache.as_deref_mut(),
+                    BackdropFinishMode::Materialize,
                 )?;
                 current
             }
         };
     }
 
-    if effect.is_backdrop() {
+    if effect.is_backdrop() && finish_mode == BackdropFinishMode::Materialize {
         let program = compile_opaque_finish_program(renderer)?;
         if let Some(region) = pending_sample_region.take() {
             let target_size =
@@ -2527,20 +2616,22 @@ fn apply_shader_input_stage(
     let mut state = ShaderEffectElementState::default();
     let element = state.element(renderer, spec)?;
     with_gpu_timing_renderer_span(renderer, "effect-shader-input", size, |renderer| {
-        let mut target = effect_pipeline_target(renderer, size, cache)?;
-        let mut framebuffer = renderer.bind(&mut target)?;
-        let mut damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
-        let _ = damage_tracker
-            .render_output(
-                renderer,
-                &mut framebuffer,
-                0,
-                &[element],
-                [0.0, 0.0, 0.0, 0.0],
-            )
-            .map_err(|_| GlesError::FramebufferBindingError)?;
-        drop(framebuffer);
-        Ok(target)
+        renderer.with_deferred_frame_flushes(|renderer| {
+            let mut target = effect_pipeline_target(renderer, size, cache)?;
+            let mut framebuffer = renderer.bind(&mut target)?;
+            let mut damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
+            let _ = damage_tracker
+                .render_output(
+                    renderer,
+                    &mut framebuffer,
+                    0,
+                    &[element],
+                    [0.0, 0.0, 0.0, 0.0],
+                )
+                .map_err(|_| GlesError::FramebufferBindingError)?;
+            drop(framebuffer);
+            Ok(target)
+        })
     })
 }
 
@@ -2675,35 +2766,8 @@ fn crop_texture_region(
     }
 
     with_gpu_timing_renderer_span(renderer, "effect-crop", output_size, |renderer| {
-        let mut target = effect_pipeline_target(renderer, output_size, cache)?;
-        let element = TextureRenderElement::from_static_texture(
-            Id::new(),
-            renderer.context_id(),
-            Point::<f64, Physical>::from((0.0, 0.0)),
-            texture,
-            1,
-            Transform::Normal,
-            Some(1.0),
-            Some(Rectangle::new(
-                Point::from((region.loc.x, region.loc.y)),
-                (region.size.w, region.size.h).into(),
-            )),
-            Some(output_size.into()),
-            None,
-            Kind::Unspecified,
-        );
-        let mut framebuffer = renderer.bind(&mut target)?;
-        let mut damage_tracker = OutputDamageTracker::new(output_size, 1.0, Transform::Normal);
-        let _ = damage_tracker
-            .render_output(
-                renderer,
-                &mut framebuffer,
-                0,
-                &[element],
-                [0.0, 0.0, 0.0, 0.0],
-            )
-            .map_err(|_| GlesError::FramebufferBindingError)?;
-        drop(framebuffer);
+        let target = effect_pipeline_target(renderer, output_size, cache)?;
+        renderer.render_texture_to_texture(&texture, &target, region, None, &[])?;
         Ok(target)
     })
 }
@@ -2740,39 +2804,16 @@ fn apply_texture_program_region(
     timing_label: &'static str,
 ) -> Result<GlesTexture, ShaderEffectError> {
     with_gpu_timing_renderer_span(renderer, timing_label, output_size, |renderer| {
-        let mut target = effect_pipeline_target(renderer, output_size, cache)?;
-        let source_region = source_region.map(|region| {
-            Rectangle::<f64, Logical>::new(
-                Point::from((region.loc.x, region.loc.y)),
-                (region.size.w, region.size.h).into(),
-            )
-        });
-        let inner = TextureRenderElement::from_static_texture(
-            Id::new(),
-            renderer.context_id(),
-            Point::<f64, Physical>::from((0.0, 0.0)),
-            texture,
-            1,
-            Transform::Normal,
-            Some(1.0),
+        let target = effect_pipeline_target(renderer, output_size, cache)?;
+        let source_region =
+            source_region.unwrap_or_else(|| Rectangle::from_size(texture.size().to_f64()));
+        renderer.render_texture_to_texture(
+            &texture,
+            &target,
             source_region,
-            Some(output_size.into()),
-            None,
-            Kind::Unspecified,
-        );
-        let element = TextureShaderElement::new(inner, program, uniforms);
-        let mut framebuffer = renderer.bind(&mut target)?;
-        let mut damage_tracker = OutputDamageTracker::new(output_size, 1.0, Transform::Normal);
-        let _ = damage_tracker
-            .render_output(
-                renderer,
-                &mut framebuffer,
-                0,
-                &[element],
-                [0.0, 0.0, 0.0, 0.0],
-            )
-            .map_err(|_| GlesError::FramebufferBindingError)?;
-        drop(framebuffer);
+            Some(&program),
+            &uniforms,
+        )?;
         Ok(target)
     })
 }

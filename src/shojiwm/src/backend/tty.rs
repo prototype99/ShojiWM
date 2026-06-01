@@ -23,14 +23,16 @@ use smithay::{
             Bind, ExportMem, ImportDma, ImportEgl, ImportMemWl, Offscreen, Texture,
             damage::OutputDamageTracker,
             element::{
-                AsRenderElements, Element,
+                AsRenderElements, Element, Id, Kind, RenderElement, RenderElementStates,
+                UnderlyingStorage,
                 memory::MemoryRenderBuffer,
                 solid::SolidColorRenderElement,
                 surface::WaylandSurfaceRenderElement,
                 texture::TextureRenderElement,
                 utils::{Relocate, RelocateRenderElement, RescaleRenderElement},
             },
-            gles::{GlesRenderer, GlesTexture},
+            gles::{GlesError, GlesFrame, GlesRenderer, GlesTexture},
+            utils::{CommitCounter, DamageSet, OpaqueRegions},
         },
         session::{Session, libseat::LibSeatSession},
     },
@@ -49,7 +51,10 @@ use smithay::{
         wayland_server::Resource,
     },
     render_elements,
-    utils::{DeviceFd, IsAlive, Logical, Monotonic, Point, Rectangle, Scale, Transform},
+    utils::{
+        Buffer, DeviceFd, IsAlive, Logical, Monotonic, Physical, Point, Rectangle, Scale,
+        Transform, user_data::UserDataMap,
+    },
     wayland::{
         background_effect::BackgroundEffectSurfaceCachedState, compositor,
         dmabuf::DmabufFeedbackBuilder,
@@ -323,6 +328,11 @@ struct SurfaceData {
 enum RenderSurfaceOutcome {
     Skipped,
     Processed,
+}
+
+struct TtyRenderFrameResult {
+    is_empty: bool,
+    states: RenderElementStates,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -873,6 +883,142 @@ render_elements! {
     Cursor=PointerRenderElement<GlesRenderer>,
 }
 
+struct ProfiledTtyRenderElement<'a> {
+    inner: &'a TtyRenderElements,
+    draw_label: &'static str,
+}
+
+impl<'a> ProfiledTtyRenderElement<'a> {
+    fn new(inner: &'a TtyRenderElements) -> Self {
+        let draw_label = match inner {
+            TtyRenderElements::Window(_) | TtyRenderElements::TransformedWindow(_) => {
+                "tty-element-window-draw"
+            }
+            TtyRenderElements::Clipped(_) | TtyRenderElements::TransformedClipped(_) => {
+                "tty-element-clipped-draw"
+            }
+            TtyRenderElements::Text(_)
+            | TtyRenderElements::RelocatedText(_)
+            | TtyRenderElements::TransformedText(_) => "tty-element-text-draw",
+            TtyRenderElements::Snapshot(_) | TtyRenderElements::TransformedSnapshot(_) => {
+                "tty-element-snapshot-draw"
+            }
+            TtyRenderElements::Damage(_) => "tty-element-damage-draw",
+            TtyRenderElements::Blink(_) => "tty-element-blink-draw",
+            TtyRenderElements::Decoration(_)
+            | TtyRenderElements::RelocatedDecoration(_)
+            | TtyRenderElements::TransformedDecoration(_) => "tty-element-decoration-draw",
+            TtyRenderElements::Backdrop(_)
+            | TtyRenderElements::RelocatedBackdrop(_)
+            | TtyRenderElements::TransformedBackdrop(_) => "tty-element-backdrop-draw",
+            TtyRenderElements::Cursor(_) => "tty-element-cursor-draw",
+            _ => "tty-element-generic-draw",
+        };
+        Self { inner, draw_label }
+    }
+}
+
+impl Element for ProfiledTtyRenderElement<'_> {
+    fn id(&self) -> &Id {
+        self.inner.id()
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.inner.current_commit()
+    }
+
+    fn location(&self, scale: Scale<f64>) -> Point<i32, Physical> {
+        self.inner.location(scale)
+    }
+
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        self.inner.src()
+    }
+
+    fn transform(&self) -> Transform {
+        self.inner.transform()
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.inner.geometry(scale)
+    }
+
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        self.inner.damage_since(scale, commit)
+    }
+
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        self.inner.opaque_regions(scale)
+    }
+
+    fn alpha(&self) -> f32 {
+        self.inner.alpha()
+    }
+
+    fn kind(&self) -> Kind {
+        self.inner.kind()
+    }
+
+    fn is_framebuffer_effect(&self) -> bool {
+        self.inner.is_framebuffer_effect()
+    }
+}
+
+impl RenderElement<GlesRenderer> for ProfiledTtyRenderElement<'_> {
+    fn draw(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), GlesError> {
+        let timing = crate::backend::shader_effect::begin_gpu_timing_frame_span(
+            frame,
+            self.draw_label,
+            (dst.size.w, dst.size.h),
+        );
+        let result = RenderElement::<GlesRenderer>::draw(
+            self.inner,
+            frame,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            cache,
+        );
+        crate::backend::shader_effect::end_gpu_timing_frame_span(frame, timing);
+        result
+    }
+
+    fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
+        RenderElement::<GlesRenderer>::underlying_storage(self.inner, renderer)
+    }
+
+    fn capture_framebuffer(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        cache: &UserDataMap,
+    ) -> Result<(), GlesError> {
+        let timing = crate::backend::shader_effect::begin_gpu_timing_frame_span(
+            frame,
+            "tty-element-framebuffer-capture",
+            (dst.size.w, dst.size.h),
+        );
+        let result =
+            RenderElement::<GlesRenderer>::capture_framebuffer(self.inner, frame, src, dst, cache);
+        crate::backend::shader_effect::end_gpu_timing_frame_span(frame, timing);
+        result
+    }
+}
+
 fn capture_scene_texture_for_effect(
     renderer: &mut GlesRenderer,
     capture_geo: smithay::utils::Rectangle<i32, Logical>,
@@ -887,20 +1033,34 @@ fn capture_scene_texture_for_effect(
         1.0,
         Transform::Normal,
     );
-    crate::backend::snapshot::capture_snapshot(
-        renderer,
-        None,
-        &mut tracker,
-        crate::ssd::LogicalRect::new(
-            capture_geo.loc.x,
-            capture_geo.loc.y,
-            capture_geo.size.w,
-            capture_geo.size.h,
-        ),
-        0,
-        true,
+    let capture_size = crate::backend::visual::logical_size_to_physical_buffer_size(
+        capture_geo.size.w,
+        capture_geo.size.h,
         scale,
-        scene,
+    );
+    crate::backend::shader_effect::with_gpu_timing_renderer_span(
+        renderer,
+        "backdrop-scene-capture",
+        capture_size,
+        |renderer| {
+            renderer.with_deferred_frame_flushes(|renderer| {
+                crate::backend::snapshot::capture_snapshot(
+                    renderer,
+                    None,
+                    &mut tracker,
+                    crate::ssd::LogicalRect::new(
+                        capture_geo.loc.x,
+                        capture_geo.loc.y,
+                        capture_geo.size.w,
+                        capture_geo.size.h,
+                    ),
+                    0,
+                    true,
+                    scale,
+                    scene,
+                )
+            })
+        },
     )
     .ok()
     .flatten()
@@ -3910,9 +4070,27 @@ fn render_surface(
             "tty-render-frame",
             (output_geo.size.w, output_geo.size.h),
             |renderer| {
-                surface
-                    .drm_output
-                    .render_frame(renderer, &elements, CLEAR_COLOR, TTY_FRAME_FLAGS)
+                if crate::backend::shader_effect::gpu_element_timing_debug_enabled() {
+                    let profiled_elements = elements
+                        .iter()
+                        .map(ProfiledTtyRenderElement::new)
+                        .collect::<Vec<_>>();
+                    surface
+                        .drm_output
+                        .render_frame(renderer, &profiled_elements, CLEAR_COLOR, TTY_FRAME_FLAGS)
+                        .map(|result| TtyRenderFrameResult {
+                            is_empty: result.is_empty,
+                            states: result.states,
+                        })
+                } else {
+                    surface
+                        .drm_output
+                        .render_frame(renderer, &elements, CLEAR_COLOR, TTY_FRAME_FLAGS)
+                        .map(|result| TtyRenderFrameResult {
+                            is_empty: result.is_empty,
+                            states: result.states,
+                        })
+                }
             },
         )?;
         fps_counter.record_present(output.name().as_str());
@@ -7292,20 +7470,32 @@ fn lower_layer_scene_elements(
                 1.0,
                 Transform::Normal,
             );
-            let snapshot = crate::backend::snapshot::capture_snapshot(
-                renderer,
-                None,
-                &mut backdrop_tracker,
-                crate::ssd::LogicalRect::new(
-                    actual_capture_geo.loc.x,
-                    actual_capture_geo.loc.y,
-                    actual_capture_geo.size.w,
-                    actual_capture_geo.size.h,
-                ),
-                0,
-                true,
+            let capture_size = crate::backend::visual::logical_size_to_physical_buffer_size(
+                actual_capture_geo.size.w,
+                actual_capture_geo.size.h,
                 scale,
-                &backdrop_scene,
+            );
+            let snapshot = crate::backend::shader_effect::with_gpu_timing_renderer_span(
+                renderer,
+                "backdrop-scene-capture",
+                capture_size,
+                |renderer| {
+                    crate::backend::snapshot::capture_snapshot(
+                        renderer,
+                        None,
+                        &mut backdrop_tracker,
+                        crate::ssd::LogicalRect::new(
+                            actual_capture_geo.loc.x,
+                            actual_capture_geo.loc.y,
+                            actual_capture_geo.size.w,
+                            actual_capture_geo.size.h,
+                        ),
+                        0,
+                        true,
+                        scale,
+                        &backdrop_scene,
+                    )
+                },
             )?
             .ok_or("missing backdrop snapshot")?;
             let backdrop_texture = if effect_config.effect.uses_backdrop_input() {
