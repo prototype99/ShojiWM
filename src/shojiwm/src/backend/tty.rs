@@ -69,8 +69,8 @@ use crate::{
     backend::decoration,
     backend::snapshot,
     backend::visual::{
-        WindowVisualState, is_identity_visual_geometry, root_physical_origin, transformed_rect,
-        transformed_root_rect, window_visual_state,
+        WindowVisualState, is_identity_visual_geometry, requires_full_window_snapshot,
+        root_physical_origin, transformed_rect, transformed_root_rect, window_visual_state,
     },
     backend::window as window_render,
     config::DisplayModePreference,
@@ -1503,7 +1503,7 @@ fn render_surface(
         let mut max_window_id: Option<String> = None;
         let mut snapshot_capture_elapsed_ms = 0.0f64;
         let mut snapshot_capture_count = 0usize;
-        // Windows in snapshot mode (non-identity visual_transform) whose transform changed
+        // Windows in snapshot mode (scaled visual_transform) whose transform changed
         // since the previous frame — these are actively animating and need full-rate callbacks.
         // Windows whose transform is unchanged are stationary in snapshot mode and can be
         // throttled (see snapshot fix below).
@@ -1659,7 +1659,7 @@ fn render_surface(
             if !has_backdrop_source {
                 continue;
             }
-            let use_full_window_snapshot = !is_identity_visual_geometry(visual_state);
+            let use_full_window_snapshot = requires_full_window_snapshot(visual_state);
             let used_transform_snapshot_last_frame =
                 transform_snapshot_window_ids.contains(&window_id);
             if use_full_window_snapshot {
@@ -3331,31 +3331,74 @@ fn render_surface(
             } else {
                 snap_scale
             };
-            let root_surface_source_elements = root_surface_source_elements_for_window(
-                window,
-                &mut backend.renderer,
-                physical_location,
-                client_physical_geometry,
-                output_geo.loc,
-                scale,
-                source_clip_scale,
-                visual_state,
-                visual_state.opacity,
-                content_clip,
-            );
-            let mut full_window_source_elements = root_surface_source_elements_for_window(
-                window,
-                &mut backend.renderer,
-                physical_location,
-                client_physical_geometry,
-                output_geo.loc,
-                scale,
-                source_clip_scale,
-                visual_state,
-                visual_state.opacity,
-                content_clip,
-            );
-            if decoration_ready && let Some(root_origin) = root_origin {
+            let (needs_root_surface_source, needs_full_window_source) = window_decorations
+                .get(window)
+                .and_then(|decoration| decoration.window_effects.as_ref())
+                .map(|effects| {
+                    let slots = [
+                        effects.behind.as_ref(),
+                        effects.behind_root_surface.as_ref(),
+                        effects.in_front.as_ref(),
+                        effects.replace.as_ref(),
+                    ];
+                    let needs_full =
+                        slots.iter().flatten().any(|effect| {
+                            matches!(
+                                &effect.effect.input,
+                                EffectInput::WindowSource(WindowSourceInclude::Full)
+                            )
+                        }) || effects.behind_root_surface.as_ref().is_some_and(|effect| {
+                            !matches!(
+                                &effect.effect.input,
+                                EffectInput::WindowSource(WindowSourceInclude::RootSurface)
+                            )
+                        });
+                    let needs_root = needs_full
+                        || slots.iter().flatten().any(|effect| {
+                            matches!(
+                                &effect.effect.input,
+                                EffectInput::WindowSource(WindowSourceInclude::RootSurface)
+                            )
+                        });
+                    (needs_root, needs_full)
+                })
+                .unwrap_or_default();
+            let root_surface_source_elements = if needs_root_surface_source {
+                root_surface_source_elements_for_window(
+                    window,
+                    &mut backend.renderer,
+                    physical_location,
+                    client_physical_geometry,
+                    output_geo.loc,
+                    scale,
+                    source_clip_scale,
+                    visual_state,
+                    visual_state.opacity,
+                    content_clip,
+                )
+            } else {
+                Vec::new()
+            };
+            let mut full_window_source_elements = if needs_full_window_source {
+                root_surface_source_elements_for_window(
+                    window,
+                    &mut backend.renderer,
+                    physical_location,
+                    client_physical_geometry,
+                    output_geo.loc,
+                    scale,
+                    source_clip_scale,
+                    visual_state,
+                    visual_state.opacity,
+                    content_clip,
+                )
+            } else {
+                Vec::new()
+            };
+            if needs_full_window_source
+                && decoration_ready
+                && let Some(root_origin) = root_origin
+            {
                 let source_alpha = visual_state.opacity;
                 let mut source_ui_elements: Vec<(usize, TtyRenderElements)> = Vec::new();
                 let mut source_backdrop_elements: Vec<(usize, TtyRenderElements)> = Vec::new();

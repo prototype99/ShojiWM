@@ -28,8 +28,8 @@ use tracing::{info, trace, warn};
 use crate::{
     ShojiWM,
     backend::visual::{
-        WindowVisualState, is_identity_visual_geometry, root_physical_origin,
-        transformed_root_rect, window_visual_state,
+        WindowVisualState, is_identity_visual_geometry, requires_full_window_snapshot,
+        root_physical_origin, transformed_root_rect, window_visual_state,
     },
     backend::{damage, damage_blink, decoration, snapshot, window as window_render},
     presentation::{take_presentation_feedback, update_primary_scanout_output},
@@ -372,7 +372,8 @@ pub fn init_winit(
                             if !has_backdrop_source {
                                 continue;
                             }
-                            let use_full_window_snapshot = !is_identity_visual_geometry(visual_state);
+                            let use_full_window_snapshot =
+                                requires_full_window_snapshot(visual_state);
                             let used_transform_snapshot_last_frame = state
                                 .transform_snapshot_window_ids
                                 .contains(&window_id);
