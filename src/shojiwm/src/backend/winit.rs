@@ -3233,36 +3233,27 @@ fn configured_background_framebuffer_effect_elements_for_layer(
     effect_config: &crate::ssd::BackgroundEffectConfig,
 ) -> Vec<WinitRenderElements> {
     let layer_id = crate::ssd::layer_runtime_id(layer_surface);
-    protocol_background_effect_rects_for_layer(output, layer_surface)
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, rect)| {
-            let stable_key = format!(
-                "winit:layer-top-framebuffer:{}:{}:{}",
-                output.name(),
-                layer_id,
-                index
-            );
-            crate::backend::shader_effect::framebuffer_backdrop_element_for_output_rect(
-                renderer,
-                state
-                    .layer_framebuffer_effect_states
-                    .entry(stable_key)
-                    .or_default(),
-                rect,
-                effect_config.effect.clone(),
-                output_geo,
-                scale,
-                alpha,
-            )
-            .ok()
-            .map(|element| {
-                WinitRenderElements::Decoration(decoration::DecorationSceneElements::Backdrop(
-                    element,
-                ))
-            })
-        })
-        .collect()
+    let stable_key = format!("winit:layer-top-framebuffer:{}:{}", output.name(), layer_id);
+    crate::backend::shader_effect::framebuffer_backdrop_element_for_output_rects(
+        renderer,
+        state
+            .layer_framebuffer_effect_states
+            .entry(stable_key)
+            .or_default(),
+        &protocol_background_effect_rects_for_layer(output, layer_surface),
+        effect_config.effect.clone(),
+        output_geo,
+        scale,
+        alpha,
+    )
+    .ok()
+    .flatten()
+    .map(|element| {
+        vec![WinitRenderElements::Decoration(
+            decoration::DecorationSceneElements::Backdrop(element),
+        )]
+    })
+    .unwrap_or_default()
 }
 
 fn configured_background_framebuffer_effect_elements_for_window(

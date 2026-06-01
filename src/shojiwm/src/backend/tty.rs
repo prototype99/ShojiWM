@@ -7784,32 +7784,24 @@ fn configured_background_framebuffer_effect_elements_for_layer(
     effect_config: &crate::ssd::BackgroundEffectConfig,
 ) -> Result<Vec<TtyRenderElements>, crate::backend::shader_effect::ShaderEffectError> {
     let layer_id = crate::ssd::layer_runtime_id(layer_surface);
-    protocol_background_effect_rects_for_layer(output, layer_surface)
-        .into_iter()
-        .enumerate()
-        .map(|(index, rect)| {
-            let stable_key = format!(
-                "tty:layer-top-framebuffer:{}:{}:{}",
-                output.name(),
-                layer_id,
-                index
-            );
-            crate::backend::shader_effect::framebuffer_backdrop_element_for_output_rect(
-                renderer,
-                states.entry(stable_key).or_default(),
-                rect,
-                effect_config.effect.clone(),
-                output_geo,
-                scale,
-                alpha,
-            )
-            .map(|element| {
-                TtyRenderElements::Decoration(decoration::DecorationSceneElements::Backdrop(
-                    element,
-                ))
-            })
+    let stable_key = format!("tty:layer-top-framebuffer:{}:{}", output.name(), layer_id);
+    Ok(
+        crate::backend::shader_effect::framebuffer_backdrop_element_for_output_rects(
+            renderer,
+            states.entry(stable_key).or_default(),
+            &protocol_background_effect_rects_for_layer(output, layer_surface),
+            effect_config.effect.clone(),
+            output_geo,
+            scale,
+            alpha,
+        )?
+        .map(|element| {
+            vec![TtyRenderElements::Decoration(
+                decoration::DecorationSceneElements::Backdrop(element),
+            )]
         })
-        .collect()
+        .unwrap_or_default(),
+    )
 }
 
 fn configured_background_framebuffer_effect_elements_for_window(

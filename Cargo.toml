@@ -6,7 +6,6 @@ members = [
     "src/shojiwm_ipc",
     "src/xdg-desktop-portal-shojiwm",
 ]
-exclude = ["misc/smithay-shoji"]
 
 [profile.release]
 opt-level = 3

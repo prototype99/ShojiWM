@@ -98,11 +98,19 @@ impl Default for CachedBackdropSubElement {
 pub struct ShaderEffectSpec {
     pub rect: Rectangle<i32, Logical>,
     pub geometry: Rectangle<i32, Physical>,
+    pub framebuffer_regions: Vec<BackdropFramebufferRegion>,
+    pub framebuffer_capture_padding: i32,
     pub shader: CompiledEffect,
     pub alpha_bits: u32,
     pub render_scale: f32,
     pub clip_rect: Option<SnappedLogicalRect>,
     pub clip_radius: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackdropFramebufferRegion {
+    pub area: Rectangle<i32, Logical>,
+    pub geometry: Rectangle<i32, Physical>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +150,8 @@ pub struct StableBackdropFramebufferElement {
     commit_counter: CommitCounter,
     area: Rectangle<i32, Logical>,
     geometry: Rectangle<i32, Physical>,
+    framebuffer_regions: Vec<BackdropFramebufferRegion>,
+    framebuffer_capture_padding: i32,
     alpha: f32,
     render_scale: f32,
     clip_rect: Option<SnappedLogicalRect>,
@@ -537,31 +547,82 @@ pub fn framebuffer_backdrop_element_for_output_rect(
     scale: Scale<f64>,
     alpha: f32,
 ) -> Result<StableBackdropFramebufferElement, ShaderEffectError> {
+    framebuffer_backdrop_element_for_output_rects(
+        renderer,
+        state,
+        &[rect],
+        effect,
+        output_geo,
+        scale,
+        alpha,
+    )?
+    .ok_or(ShaderEffectError::Gles(GlesError::FramebufferBindingError))
+}
+
+pub fn framebuffer_backdrop_element_for_output_rects(
+    renderer: &mut GlesRenderer,
+    state: &mut ShaderEffectElementState,
+    rects: &[LogicalRect],
+    effect: CompiledEffect,
+    output_geo: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    alpha: f32,
+) -> Result<Option<StableBackdropFramebufferElement>, ShaderEffectError> {
+    let Some(rect) = crate::backend::window::bounding_box_for_rects(rects) else {
+        return Ok(None);
+    };
     let area = LogicalRect::new(
         rect.x - output_geo.loc.x,
         rect.y - output_geo.loc.y,
         rect.width,
         rect.height,
     );
-    state.backdrop_element(
-        renderer,
-        ShaderEffectSpec {
-            rect: Rectangle::new(
-                Point::from((area.x, area.y)),
-                (area.width, area.height).into(),
-            ),
-            geometry: crate::backend::visual::logical_rect_to_physical_rect(
-                rect,
-                output_geo.loc,
-                scale,
-            ),
-            shader: effect,
-            alpha_bits: alpha.to_bits(),
-            render_scale: scale.x as f32,
-            clip_rect: None,
-            clip_radius: 0.0,
-        },
-    )
+    let geometry =
+        crate::backend::visual::logical_rect_to_physical_rect(rect, output_geo.loc, scale);
+    let framebuffer_capture_padding = framebuffer_blur_padding(&effect, scale.x as f32);
+    let framebuffer_regions = if rects.len() == 1 && rects[0] == rect {
+        Vec::new()
+    } else {
+        rects
+            .iter()
+            .copied()
+            .map(|region| {
+                let region_area = Rectangle::new(
+                    Point::from((region.x - rect.x, region.y - rect.y)),
+                    (region.width, region.height).into(),
+                );
+                let mut region_geometry = crate::backend::visual::logical_rect_to_physical_rect(
+                    region,
+                    output_geo.loc,
+                    scale,
+                );
+                region_geometry.loc -= geometry.loc;
+                BackdropFramebufferRegion {
+                    area: region_area,
+                    geometry: region_geometry,
+                }
+            })
+            .collect()
+    };
+    state
+        .backdrop_element(
+            renderer,
+            ShaderEffectSpec {
+                rect: Rectangle::new(
+                    Point::from((area.x, area.y)),
+                    (area.width, area.height).into(),
+                ),
+                geometry,
+                framebuffer_regions,
+                framebuffer_capture_padding,
+                shader: effect,
+                alpha_bits: alpha.to_bits(),
+                render_scale: scale.x as f32,
+                clip_rect: None,
+                clip_radius: 0.0,
+            },
+        )
+        .map(Some)
 }
 
 /// Ensures a thread-local scratch FBO exists and returns its id. Must be
@@ -813,6 +874,8 @@ impl ShaderEffectElementState {
             commit_counter: self.commit_counter,
             area: spec.rect,
             geometry: spec.geometry,
+            framebuffer_regions: spec.framebuffer_regions,
+            framebuffer_capture_padding: spec.framebuffer_capture_padding.max(0),
             alpha: f32::from_bits(spec.alpha_bits).clamp(0.0, 1.0),
             render_scale: spec.render_scale,
             clip_rect: spec.clip_rect,
@@ -955,35 +1018,39 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
 
         let timing =
             begin_gpu_timing_frame_span(frame, "backdrop-display-draw", (dst.size.w, dst.size.h));
-        let result = frame.render_texture_from_to(
-            texture,
-            sample_src,
-            dst,
-            damage,
-            opaque_regions,
-            Transform::Normal,
-            self.alpha,
-            Some(&self.program),
-            &[
-                Uniform::new("uv_offset", uv_offset),
-                Uniform::new("uv_scale", uv_scale),
-                Uniform::new(
-                    "rect_size",
-                    [self.area.size.w as f32, self.area.size.h as f32],
-                ),
-                Uniform::new("render_scale", self.render_scale.max(1.0)),
-                Uniform::new(
-                    "clip_enabled",
-                    if clip_rect[2] > 0.0 && clip_rect[3] > 0.0 {
-                        1.0f32
-                    } else {
-                        0.0f32
-                    },
-                ),
-                Uniform::new("clip_rect", clip_rect),
-                Uniform::new("clip_radius", [radius, radius, radius, radius]),
-            ],
-        );
+        let result = if self.framebuffer_regions.is_empty() {
+            frame.render_texture_from_to(
+                texture,
+                sample_src,
+                dst,
+                damage,
+                opaque_regions,
+                Transform::Normal,
+                self.alpha,
+                Some(&self.program),
+                &[
+                    Uniform::new("uv_offset", uv_offset),
+                    Uniform::new("uv_scale", uv_scale),
+                    Uniform::new(
+                        "rect_size",
+                        [self.area.size.w as f32, self.area.size.h as f32],
+                    ),
+                    Uniform::new("render_scale", self.render_scale.max(1.0)),
+                    Uniform::new(
+                        "clip_enabled",
+                        if clip_rect[2] > 0.0 && clip_rect[3] > 0.0 {
+                            1.0f32
+                        } else {
+                            0.0f32
+                        },
+                    ),
+                    Uniform::new("clip_rect", clip_rect),
+                    Uniform::new("clip_radius", [radius, radius, radius, radius]),
+                ],
+            )
+        } else {
+            self.draw_framebuffer_regions(frame, texture, sample_src, dst, damage, opaque_regions)
+        };
         end_gpu_timing_frame_span(frame, timing);
         result
     }
@@ -1000,16 +1067,28 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
         });
         let mut inner = inner.borrow_mut();
         let output_rect = Rectangle::from_size(frame.output_size());
-        let clamped_dst = match dst.intersection(output_rect) {
+        let padding = self.framebuffer_capture_padding;
+        let capture_rect = Rectangle::new(
+            Point::from((dst.loc.x - padding, dst.loc.y - padding)),
+            (
+                dst.size.w.saturating_add(padding.saturating_mul(2)),
+                dst.size.h.saturating_add(padding.saturating_mul(2)),
+            )
+                .into(),
+        );
+        let actual_capture_rect = match capture_rect.intersection(output_rect) {
             Some(clamped) => clamped,
             None => return Ok(()),
         };
-        // Keep this direct framebuffer path bounded to the element itself.
-        // Expanding by a blur halo multiplies the per-frame capture and blur
-        // area, especially for narrow titlebars. Texture-backed snapshot
-        // paths retain their halo because they cache and sample a wider scene.
-        let size = Size::<i32, Buffer>::from((dst.size.w, dst.size.h));
-        let copy_offset = (clamped_dst.loc.x - dst.loc.x, clamped_dst.loc.y - dst.loc.y);
+        let size =
+            Size::<i32, Buffer>::from((actual_capture_rect.size.w, actual_capture_rect.size.h));
+        let sample_src = Rectangle::new(
+            Point::from((
+                (dst.loc.x - actual_capture_rect.loc.x) as f64,
+                (dst.loc.y - actual_capture_rect.loc.y) as f64,
+            )),
+            (dst.size.w as f64, dst.size.h as f64).into(),
+        );
 
         {
             let mut guard = frame.renderer();
@@ -1022,10 +1101,7 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
                 inner.framebuffer = Some(renderer.create_buffer(Fourcc::Abgr8888, size)?);
             }
             inner.rendered = None;
-            inner.sample_src = Some(Rectangle::new(
-                (0.0, 0.0).into(),
-                (dst.size.w as f64, dst.size.h as f64).into(),
-            ));
+            inner.sample_src = Some(sample_src);
         }
 
         let framebuffer_texture = inner
@@ -1062,14 +1138,14 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
                 gl.ClearColor(0.0, 0.0, 0.0, 0.0);
                 gl.Clear(ffi::COLOR_BUFFER_BIT);
                 gl.BlitFramebuffer(
-                    clamped_dst.loc.x,
-                    clamped_dst.loc.y,
-                    clamped_dst.loc.x + clamped_dst.size.w,
-                    clamped_dst.loc.y + clamped_dst.size.h,
-                    copy_offset.0,
-                    copy_offset.1,
-                    copy_offset.0 + clamped_dst.size.w,
-                    copy_offset.1 + clamped_dst.size.h,
+                    actual_capture_rect.loc.x,
+                    actual_capture_rect.loc.y,
+                    actual_capture_rect.loc.x + actual_capture_rect.size.w,
+                    actual_capture_rect.loc.y + actual_capture_rect.size.h,
+                    0,
+                    0,
+                    actual_capture_rect.size.w,
+                    actual_capture_rect.size.h,
                     ffi::COLOR_BUFFER_BIT,
                     ffi::LINEAR,
                 );
@@ -1100,7 +1176,11 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
             BackdropFinishMode::DeferToDisplay,
         ) {
             Ok(texture) => {
-                inner.sample_src = Some(Rectangle::from_size(texture.size().to_f64()));
+                inner.sample_src = if texture.size() == size {
+                    sample_src
+                } else {
+                    Some(Rectangle::from_size(texture.size().to_f64()))
+                };
                 inner.rendered = Some(texture);
             }
             Err(err) => {
@@ -1117,6 +1197,142 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
     fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
         None
     }
+}
+
+impl StableBackdropFramebufferElement {
+    fn draw_framebuffer_regions(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        texture: &GlesTexture,
+        sample_src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), GlesError> {
+        let full_geometry = Rectangle::from_size(self.geometry.size);
+        for region in &self.framebuffer_regions {
+            let region_geometry =
+                scale_physical_subrect(region.geometry, full_geometry.size, dst.size);
+            let Some(region_damage) = relative_intersections(damage, region_geometry) else {
+                continue;
+            };
+            let region_opaque =
+                relative_intersections(opaque_regions, region_geometry).unwrap_or_default();
+            let src = scale_buffer_subrect(sample_src, region.geometry, full_geometry.size);
+            let full_size = texture.size();
+            let uv_offset = [
+                src.loc.x as f32 / full_size.w.max(1) as f32,
+                src.loc.y as f32 / full_size.h.max(1) as f32,
+            ];
+            let uv_scale = [
+                src.size.w as f32 / full_size.w.max(1) as f32,
+                src.size.h as f32 / full_size.h.max(1) as f32,
+            ];
+            frame.render_texture_from_to(
+                texture,
+                src,
+                Rectangle::new(dst.loc + region_geometry.loc, region_geometry.size),
+                &region_damage,
+                &region_opaque,
+                Transform::Normal,
+                self.alpha,
+                Some(&self.program),
+                &[
+                    Uniform::new("uv_offset", uv_offset),
+                    Uniform::new("uv_scale", uv_scale),
+                    Uniform::new(
+                        "rect_size",
+                        [region.area.size.w as f32, region.area.size.h as f32],
+                    ),
+                    Uniform::new("render_scale", self.render_scale.max(1.0)),
+                    Uniform::new("clip_enabled", 0.0f32),
+                    Uniform::new("clip_rect", [0.0, 0.0, 0.0, 0.0]),
+                    Uniform::new("clip_radius", [0.0, 0.0, 0.0, 0.0]),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn framebuffer_blur_padding(effect: &CompiledEffect, render_scale: f32) -> i32 {
+    effect
+        .blur_stage()
+        .map(|blur| {
+            let radius = blur.radius.max(1);
+            let passes = blur.passes.max(1);
+            (((radius * passes * 24 + 32).max(32) as f32) * render_scale.max(1.0)).ceil() as i32
+        })
+        .unwrap_or(0)
+}
+
+fn scale_physical_subrect(
+    rect: Rectangle<i32, Physical>,
+    source_size: Size<i32, Physical>,
+    target_size: Size<i32, Physical>,
+) -> Rectangle<i32, Physical> {
+    let scale_edge = |value: i32, source: i32, target: i32| {
+        if source <= 0 {
+            0
+        } else {
+            ((value as f64) * target as f64 / source as f64).round() as i32
+        }
+    };
+    let left = scale_edge(rect.loc.x, source_size.w, target_size.w);
+    let top = scale_edge(rect.loc.y, source_size.h, target_size.h);
+    let right = scale_edge(rect.loc.x + rect.size.w, source_size.w, target_size.w);
+    let bottom = scale_edge(rect.loc.y + rect.size.h, source_size.h, target_size.h);
+    Rectangle::new(
+        Point::from((left, top)),
+        (right - left, bottom - top).into(),
+    )
+}
+
+fn scale_buffer_subrect(
+    source: Rectangle<f64, Buffer>,
+    rect: Rectangle<i32, Physical>,
+    full_size: Size<i32, Physical>,
+) -> Rectangle<f64, Buffer> {
+    let scale_edge = |value: i32, offset: f64, source_size: f64, target_size: i32| {
+        if target_size <= 0 {
+            offset
+        } else {
+            offset + value as f64 * source_size / target_size as f64
+        }
+    };
+    let left = scale_edge(rect.loc.x, source.loc.x, source.size.w, full_size.w);
+    let top = scale_edge(rect.loc.y, source.loc.y, source.size.h, full_size.h);
+    let right = scale_edge(
+        rect.loc.x + rect.size.w,
+        source.loc.x,
+        source.size.w,
+        full_size.w,
+    );
+    let bottom = scale_edge(
+        rect.loc.y + rect.size.h,
+        source.loc.y,
+        source.size.h,
+        full_size.h,
+    );
+    Rectangle::new(
+        Point::from((left, top)),
+        (right - left, bottom - top).into(),
+    )
+}
+
+fn relative_intersections(
+    rects: &[Rectangle<i32, Physical>],
+    region: Rectangle<i32, Physical>,
+) -> Option<Vec<Rectangle<i32, Physical>>> {
+    let intersections: Vec<_> = rects
+        .iter()
+        .filter_map(|rect| rect.intersection(region))
+        .map(|mut rect| {
+            rect.loc -= region.loc;
+            rect
+        })
+        .collect();
+    (!intersections.is_empty()).then_some(intersections)
 }
 
 impl Element for StableBackdropTextureElement {
@@ -2715,6 +2931,8 @@ fn apply_shader_input_stage(
     let spec = ShaderEffectSpec {
         rect: Rectangle::new(Point::from((0, 0)), size.into()),
         geometry: Rectangle::new(Point::from((0, 0)), size.into()),
+        framebuffer_regions: Vec::new(),
+        framebuffer_capture_padding: 0,
         shader: effect,
         alpha_bits: 1.0f32.to_bits(),
         render_scale: 1.0,

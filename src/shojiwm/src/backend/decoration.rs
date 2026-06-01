@@ -1860,6 +1860,8 @@ fn shader_effect_spec(
     Some(ShaderEffectSpec {
         rect: local_rect,
         geometry,
+        framebuffer_regions: Vec::new(),
+        framebuffer_capture_padding: 0,
         shader: cached.shader.clone(),
         alpha_bits: alpha.to_bits(),
         render_scale,
