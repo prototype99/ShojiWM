@@ -70,6 +70,7 @@ struct WinitAnimationTimingMetrics {
 
 fn capture_scene_texture_for_effect(
     renderer: &mut GlesRenderer,
+    source: &'static str,
     capture_geo: Rectangle<i32, Logical>,
     scale: smithay::utils::Scale<f64>,
     scene: &[WinitRenderElements],
@@ -87,6 +88,7 @@ fn capture_scene_texture_for_effect(
         capture_geo.size.h,
         scale,
     );
+    crate::backend::shader_effect::record_snapshot_fallback(source, capture_size, scene.len());
     crate::backend::shader_effect::with_gpu_timing_renderer_span(
         renderer,
         "backdrop-scene-capture",
@@ -1896,6 +1898,7 @@ fn backdrop_shader_elements_for_window(
                 );
                 capture_scene_texture_for_effect(
                     renderer,
+                    "winit-window-backdrop",
                     actual_capture_geo,
                     scale,
                     &backdrop_scene,
@@ -1915,7 +1918,13 @@ fn backdrop_shader_elements_for_window(
                         lower_layer,
                     ));
                 }
-                capture_scene_texture_for_effect(renderer, actual_capture_geo, scale, &xray_scene)
+                capture_scene_texture_for_effect(
+                    renderer,
+                    "winit-window-xray",
+                    actual_capture_geo,
+                    scale,
+                    &xray_scene,
+                )
             } else {
                 None
             };
@@ -2574,6 +2583,11 @@ fn lower_layer_scene_elements(
             capture_geo.size.h,
             scale,
         );
+        crate::backend::shader_effect::record_snapshot_fallback(
+            "winit-layer-lower",
+            capture_size,
+            backdrop_scene.len(),
+        );
         let snapshot = crate::backend::shader_effect::with_gpu_timing_renderer_span(
             renderer,
             "backdrop-scene-capture",
@@ -2846,7 +2860,13 @@ fn configured_background_effect_elements_for_layer(
             )
             .into_iter(),
         );
-        capture_scene_texture_for_effect(renderer, actual_capture_geo, scale, &backdrop_scene)
+        capture_scene_texture_for_effect(
+            renderer,
+            "winit-layer-top-backdrop",
+            actual_capture_geo,
+            scale,
+            &backdrop_scene,
+        )
     } else {
         None
     };
@@ -2862,7 +2882,13 @@ fn configured_background_effect_elements_for_layer(
                 lower_layer,
             ));
         }
-        capture_scene_texture_for_effect(renderer, actual_capture_geo, scale, &xray_scene)
+        capture_scene_texture_for_effect(
+            renderer,
+            "winit-layer-top-xray",
+            actual_capture_geo,
+            scale,
+            &xray_scene,
+        )
     } else {
         None
     };
@@ -3161,18 +3187,82 @@ fn upper_layer_scene_elements(
                 .into_iter()
                 .map(WinitRenderElements::Window),
         );
-        elements.extend(configured_background_effect_elements_for_layer(
-            renderer,
-            state,
-            output,
-            output_geo,
-            scale,
-            windows_top_to_bottom,
-            &layer_surface,
-            1.0,
-        ));
+        let layer_id = crate::ssd::layer_runtime_id(&layer_surface);
+        let effect_config = state
+            .configured_layer_effects
+            .get(&layer_id)
+            .cloned()
+            .or_else(|| state.configured_background_effect.clone());
+        if let Some(effect_config) =
+            effect_config.filter(|config| config.effect.supports_framebuffer_backdrop())
+        {
+            elements.extend(configured_background_framebuffer_effect_elements_for_layer(
+                renderer,
+                state,
+                output,
+                output_geo,
+                scale,
+                &layer_surface,
+                1.0,
+                &effect_config,
+            ));
+        } else {
+            elements.extend(configured_background_effect_elements_for_layer(
+                renderer,
+                state,
+                output,
+                output_geo,
+                scale,
+                windows_top_to_bottom,
+                &layer_surface,
+                1.0,
+            ));
+        }
     }
     elements
+}
+
+fn configured_background_framebuffer_effect_elements_for_layer(
+    renderer: &mut GlesRenderer,
+    state: &mut ShojiWM,
+    output: &Output,
+    output_geo: Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    layer_surface: &smithay::desktop::LayerSurface,
+    alpha: f32,
+    effect_config: &crate::ssd::BackgroundEffectConfig,
+) -> Vec<WinitRenderElements> {
+    let layer_id = crate::ssd::layer_runtime_id(layer_surface);
+    protocol_background_effect_rects_for_layer(output, layer_surface)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, rect)| {
+            let stable_key = format!(
+                "winit:layer-top-framebuffer:{}:{}:{}",
+                output.name(),
+                layer_id,
+                index
+            );
+            crate::backend::shader_effect::framebuffer_backdrop_element_for_output_rect(
+                renderer,
+                state
+                    .layer_framebuffer_effect_states
+                    .entry(stable_key)
+                    .or_default(),
+                rect,
+                effect_config.effect.clone(),
+                output_geo,
+                scale,
+                alpha,
+            )
+            .ok()
+            .map(|element| {
+                WinitRenderElements::Decoration(decoration::DecorationSceneElements::Backdrop(
+                    element,
+                ))
+            })
+        })
+        .collect()
 }
 
 fn configured_background_framebuffer_effect_elements_for_window(
@@ -3436,6 +3526,7 @@ fn configured_background_effect_elements_for_window(
                 );
                 capture_scene_texture_for_effect(
                     renderer,
+                    "winit-protocol-window-backdrop",
                     actual_capture_geo,
                     scale,
                     &backdrop_scene,
@@ -3455,7 +3546,13 @@ fn configured_background_effect_elements_for_window(
                         lower_layer,
                     ));
                 }
-                capture_scene_texture_for_effect(renderer, actual_capture_geo, scale, &xray_scene)
+                capture_scene_texture_for_effect(
+                    renderer,
+                    "winit-protocol-window-xray",
+                    actual_capture_geo,
+                    scale,
+                    &xray_scene,
+                )
             } else {
                 None
             };

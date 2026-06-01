@@ -194,6 +194,78 @@ const GPU_TIMING_QUERY_COUNT: usize = 2048;
 const GPU_TIMING_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const SHARED_EFFECT_PIPELINE_CACHE_LIMIT: usize = 128;
 
+#[derive(Debug, Default)]
+struct SnapshotFallbackAggregate {
+    samples: u64,
+    total_scene_elements: u64,
+    total_pixels: u64,
+}
+
+#[derive(Debug)]
+struct SnapshotFallbackDebugState {
+    aggregates: HashMap<&'static str, SnapshotFallbackAggregate>,
+    last_report: Instant,
+}
+
+impl Default for SnapshotFallbackDebugState {
+    fn default() -> Self {
+        Self {
+            aggregates: HashMap::new(),
+            last_report: Instant::now(),
+        }
+    }
+}
+
+fn snapshot_fallback_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        gpu_timing_debug_enabled()
+            || std::env::var_os("SHOJI_SNAPSHOT_FALLBACK_DEBUG")
+                .is_some_and(|value| value != "0" && !value.is_empty())
+    })
+}
+
+pub(crate) fn record_snapshot_fallback(
+    source: &'static str,
+    size: (i32, i32),
+    scene_elements: usize,
+) {
+    if !snapshot_fallback_debug_enabled() {
+        return;
+    }
+
+    static STATE: OnceLock<Mutex<SnapshotFallbackDebugState>> = OnceLock::new();
+    let state = STATE.get_or_init(|| Mutex::new(SnapshotFallbackDebugState::default()));
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+
+    let pixels = size.0.max(0) as u64 * size.1.max(0) as u64;
+    let aggregate = state.aggregates.entry(source).or_default();
+    aggregate.samples += 1;
+    aggregate.total_scene_elements = aggregate
+        .total_scene_elements
+        .saturating_add(scene_elements as u64);
+    aggregate.total_pixels = aggregate.total_pixels.saturating_add(pixels);
+
+    if state.last_report.elapsed() < GPU_TIMING_REPORT_INTERVAL {
+        return;
+    }
+    state.last_report = Instant::now();
+
+    for (source, aggregate) in state.aggregates.drain() {
+        info!(
+            source,
+            samples = aggregate.samples,
+            average_scene_elements =
+                aggregate.total_scene_elements as f64 / aggregate.samples.max(1) as f64,
+            average_megapixels =
+                aggregate.total_pixels as f64 / aggregate.samples.max(1) as f64 / 1_000_000.0,
+            "snapshot fallback aggregate"
+        );
+    }
+}
+
 #[derive(Debug)]
 struct PendingGpuTiming {
     label: &'static str,
@@ -454,6 +526,42 @@ pub(crate) fn with_gpu_timing_renderer_span<R>(
         });
     }
     result
+}
+
+pub fn framebuffer_backdrop_element_for_output_rect(
+    renderer: &mut GlesRenderer,
+    state: &mut ShaderEffectElementState,
+    rect: LogicalRect,
+    effect: CompiledEffect,
+    output_geo: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    alpha: f32,
+) -> Result<StableBackdropFramebufferElement, ShaderEffectError> {
+    let area = LogicalRect::new(
+        rect.x - output_geo.loc.x,
+        rect.y - output_geo.loc.y,
+        rect.width,
+        rect.height,
+    );
+    state.backdrop_element(
+        renderer,
+        ShaderEffectSpec {
+            rect: Rectangle::new(
+                Point::from((area.x, area.y)),
+                (area.width, area.height).into(),
+            ),
+            geometry: crate::backend::visual::logical_rect_to_physical_rect(
+                rect,
+                output_geo.loc,
+                scale,
+            ),
+            shader: effect,
+            alpha_bits: alpha.to_bits(),
+            render_scale: scale.x as f32,
+            clip_rect: None,
+            clip_radius: 0.0,
+        },
+    )
 }
 
 /// Ensures a thread-local scratch FBO exists and returns its id. Must be

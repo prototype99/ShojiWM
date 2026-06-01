@@ -1021,6 +1021,7 @@ impl RenderElement<GlesRenderer> for ProfiledTtyRenderElement<'_> {
 
 fn capture_scene_texture_for_effect(
     renderer: &mut GlesRenderer,
+    source: &'static str,
     capture_geo: smithay::utils::Rectangle<i32, Logical>,
     scale: smithay::utils::Scale<f64>,
     scene: &[TtyRenderElements],
@@ -1038,6 +1039,7 @@ fn capture_scene_texture_for_effect(
         capture_geo.size.h,
         scale,
     );
+    crate::backend::shader_effect::record_snapshot_fallback(source, capture_size, scene.len());
     crate::backend::shader_effect::with_gpu_timing_renderer_span(
         renderer,
         "backdrop-scene-capture",
@@ -1481,6 +1483,7 @@ fn render_surface(
             scale,
             &windows_top_to_bottom,
             &mut state.layer_backdrop_cache,
+            &mut state.layer_framebuffer_effect_states,
         )?);
         let upper_layers_elapsed_ms = upper_layers_started_at.elapsed().as_secs_f64() * 1000.0;
         timing.upper_layers_elapsed_ms = upper_layers_elapsed_ms;
@@ -6316,6 +6319,7 @@ fn backdrop_shader_elements_for_window(
                 );
                 capture_scene_texture_for_effect(
                     renderer,
+                    "tty-window-backdrop",
                     actual_capture_geo,
                     scale,
                     &backdrop_scene,
@@ -6337,7 +6341,13 @@ fn backdrop_shader_elements_for_window(
                         xray_scene.append(&mut layer_elements);
                     }
                 }
-                capture_scene_texture_for_effect(renderer, actual_capture_geo, scale, &xray_scene)
+                capture_scene_texture_for_effect(
+                    renderer,
+                    "tty-window-xray",
+                    actual_capture_geo,
+                    scale,
+                    &xray_scene,
+                )
             } else {
                 None
             };
@@ -7046,7 +7056,13 @@ fn configured_background_effect_elements_for_layer(
                 backdrop_scene.append(&mut layer_elements);
             }
         }
-        capture_scene_texture_for_effect(renderer, actual_capture_geo, scale, &backdrop_scene)
+        capture_scene_texture_for_effect(
+            renderer,
+            "tty-layer-top-backdrop",
+            actual_capture_geo,
+            scale,
+            &backdrop_scene,
+        )
     } else {
         None
     };
@@ -7064,7 +7080,13 @@ fn configured_background_effect_elements_for_layer(
                 xray_scene.append(&mut layer_elements);
             }
         }
-        capture_scene_texture_for_effect(renderer, actual_capture_geo, scale, &xray_scene)
+        capture_scene_texture_for_effect(
+            renderer,
+            "tty-layer-top-xray",
+            actual_capture_geo,
+            scale,
+            &xray_scene,
+        )
     } else {
         None
     };
@@ -7518,6 +7540,11 @@ fn lower_layer_scene_elements(
                 actual_capture_geo.size.h,
                 scale,
             );
+            crate::backend::shader_effect::record_snapshot_fallback(
+                "tty-layer-lower",
+                capture_size,
+                backdrop_scene.len(),
+            );
             let snapshot = crate::backend::shader_effect::with_gpu_timing_renderer_span(
                 renderer,
                 "backdrop-scene-capture",
@@ -7681,6 +7708,10 @@ fn upper_layer_scene_elements(
         String,
         crate::backend::shader_effect::CachedBackdropTexture,
     >,
+    layer_framebuffer_effect_states: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::ShaderEffectElementState,
+    >,
 ) -> Result<Vec<TtyRenderElements>, Box<dyn std::error::Error>> {
     let map = layer_map_for_output(output);
     let upper_layers: Vec<_> = [
@@ -7699,25 +7730,86 @@ fn upper_layer_scene_elements(
                 .into_iter()
                 .map(TtyRenderElements::Window),
         );
-        elements.extend(configured_background_effect_elements_for_layer(
-            renderer,
-            space,
-            window_decorations,
-            window_source_damage,
-            lower_layer_source_damage,
-            lower_layer_scene_generation,
-            output,
-            output_geo,
-            scale,
-            windows_top_to_bottom,
-            &layer_surface,
-            1.0,
-            layer_backdrop_cache,
-            configured_layer_effects,
-            configured_background_effect,
-        )?);
+        let layer_id = crate::ssd::layer_runtime_id(&layer_surface);
+        let effect_config = configured_layer_effects
+            .get(&layer_id)
+            .or(configured_background_effect);
+        if let Some(effect_config) =
+            effect_config.filter(|config| config.effect.supports_framebuffer_backdrop())
+        {
+            elements.extend(configured_background_framebuffer_effect_elements_for_layer(
+                renderer,
+                output,
+                output_geo,
+                scale,
+                &layer_surface,
+                1.0,
+                layer_framebuffer_effect_states,
+                effect_config,
+            )?);
+        } else {
+            elements.extend(configured_background_effect_elements_for_layer(
+                renderer,
+                space,
+                window_decorations,
+                window_source_damage,
+                lower_layer_source_damage,
+                lower_layer_scene_generation,
+                output,
+                output_geo,
+                scale,
+                windows_top_to_bottom,
+                &layer_surface,
+                1.0,
+                layer_backdrop_cache,
+                configured_layer_effects,
+                configured_background_effect,
+            )?);
+        }
     }
     Ok(elements)
+}
+
+fn configured_background_framebuffer_effect_elements_for_layer(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    layer_surface: &smithay::desktop::LayerSurface,
+    alpha: f32,
+    states: &mut std::collections::HashMap<
+        String,
+        crate::backend::shader_effect::ShaderEffectElementState,
+    >,
+    effect_config: &crate::ssd::BackgroundEffectConfig,
+) -> Result<Vec<TtyRenderElements>, crate::backend::shader_effect::ShaderEffectError> {
+    let layer_id = crate::ssd::layer_runtime_id(layer_surface);
+    protocol_background_effect_rects_for_layer(output, layer_surface)
+        .into_iter()
+        .enumerate()
+        .map(|(index, rect)| {
+            let stable_key = format!(
+                "tty:layer-top-framebuffer:{}:{}:{}",
+                output.name(),
+                layer_id,
+                index
+            );
+            crate::backend::shader_effect::framebuffer_backdrop_element_for_output_rect(
+                renderer,
+                states.entry(stable_key).or_default(),
+                rect,
+                effect_config.effect.clone(),
+                output_geo,
+                scale,
+                alpha,
+            )
+            .map(|element| {
+                TtyRenderElements::Decoration(decoration::DecorationSceneElements::Backdrop(
+                    element,
+                ))
+            })
+        })
+        .collect()
 }
 
 fn configured_background_framebuffer_effect_elements_for_window(
@@ -8000,6 +8092,7 @@ fn configured_background_effect_elements_for_window(
                 );
                 capture_scene_texture_for_effect(
                     renderer,
+                    "tty-protocol-window-backdrop",
                     actual_capture_geo,
                     scale,
                     &backdrop_scene,
@@ -8021,7 +8114,13 @@ fn configured_background_effect_elements_for_window(
                         xray_scene.append(&mut layer_elements);
                     }
                 }
-                capture_scene_texture_for_effect(renderer, actual_capture_geo, scale, &xray_scene)
+                capture_scene_texture_for_effect(
+                    renderer,
+                    "tty-protocol-window-xray",
+                    actual_capture_geo,
+                    scale,
+                    &xray_scene,
+                )
             } else {
                 None
             };
