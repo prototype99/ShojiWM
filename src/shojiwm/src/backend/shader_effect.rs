@@ -1984,7 +1984,11 @@ fn wrap_backdrop_shader_source(source: &str) -> String {
 #extension GL_OES_EGL_image_external : require
 #endif
 
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
 precision mediump float;
+#endif
 
 #if defined(EXTERNAL)
 uniform samplerExternalOES tex;
@@ -2056,7 +2060,11 @@ fn wrap_texture_stage_source(source: &str) -> String {
 #extension GL_OES_EGL_image_external : require
 #endif
 
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
 precision mediump float;
+#endif
 
 #if defined(EXTERNAL)
 uniform samplerExternalOES tex;

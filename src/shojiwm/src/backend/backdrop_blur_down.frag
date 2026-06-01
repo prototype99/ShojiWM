@@ -4,7 +4,8 @@
 #extension GL_OES_EGL_image_external : require
 #endif
 
-precision mediump float;
+// The sampling offsets can be smaller than mediump UV precision for 4K textures.
+precision highp float;
 
 #if defined(EXTERNAL)
 uniform samplerExternalOES tex;
