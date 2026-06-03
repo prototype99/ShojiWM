@@ -8509,7 +8509,7 @@ fn window_scene_elements_for_capture(
 fn capture_live_snapshot_for_window(
     renderer: &mut GlesRenderer,
     window: &smithay::desktop::Window,
-    window_location: smithay::utils::Point<i32, Logical>,
+    _window_location: smithay::utils::Point<i32, Logical>,
     scale: smithay::utils::Scale<f64>,
     z_index: usize,
     window_decorations: &mut std::collections::HashMap<
@@ -8531,11 +8531,12 @@ fn capture_live_snapshot_for_window(
     else {
         return Ok(());
     };
-    let snapshot_geo = smithay::utils::Rectangle::new(
-        smithay::utils::Point::from((client_rect.x, client_rect.y)),
-        (client_rect.width, client_rect.height).into(),
-    );
-    let physical_location = (window_location - snapshot_geo.loc).to_physical_precise_round(scale);
+    // The close snapshot texture is client-rect-local. `surface_elements`
+    // expects the same client-slot location that live rendering uses and
+    // subtracts `window.geometry().loc` internally to place the root surface.
+    // Passing `window_location - client_rect.loc` here applies that geometry
+    // offset twice for CSD/GTK windows, which shifts the frozen client image.
+    let physical_location = smithay::utils::Point::<i32, smithay::utils::Physical>::from((0, 0));
 
     let surface_elements =
         window_render::surface_elements(window, renderer, physical_location, scale, 1.0);

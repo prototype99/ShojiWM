@@ -3913,7 +3913,7 @@ fn capture_live_snapshot_for_window(
     state: &mut ShojiWM,
     _output: &Output,
     window: &smithay::desktop::Window,
-    window_location: smithay::utils::Point<i32, Logical>,
+    _window_location: smithay::utils::Point<i32, Logical>,
     scale: smithay::utils::Scale<f64>,
     z_index: usize,
 ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
@@ -3922,11 +3922,12 @@ fn capture_live_snapshot_for_window(
     };
     let client_rect = decoration.client_rect;
     let snapshot_id = decoration.snapshot.id.clone();
-    let snapshot_geo = Rectangle::new(
-        smithay::utils::Point::from((client_rect.x, client_rect.y)),
-        (client_rect.width, client_rect.height).into(),
-    );
-    let physical_location = (window_location - snapshot_geo.loc).to_physical_precise_round(scale);
+    // The close snapshot texture is client-rect-local. `surface_elements`
+    // expects the same client-slot location that live rendering uses and
+    // subtracts `window.geometry().loc` internally to place the root surface.
+    // Passing `window_location - client_rect.loc` here applies that geometry
+    // offset twice for CSD/GTK windows, which shifts the frozen client image.
+    let physical_location = smithay::utils::Point::<i32, smithay::utils::Physical>::from((0, 0));
 
     let mut elements: Vec<WinitRenderElements> = Vec::new();
     let surface_elements =
