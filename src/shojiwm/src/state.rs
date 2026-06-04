@@ -1508,6 +1508,23 @@ impl ShojiWM {
         }
     }
 
+    fn runtime_output_target_scale_value(&self, output: &Output) -> f64 {
+        self.runtime_output_configs
+            .get(&output.name())
+            .and_then(|config| config.scale)
+            .unwrap_or_else(|| output.current_scale().fractional_scale())
+            .max(0.1)
+    }
+
+    fn runtime_output_logical_width_for_mode(
+        output: &Output,
+        mode: OutputMode,
+        scale: f64,
+    ) -> i32 {
+        let physical_size = output.current_transform().transform_size(mode.size);
+        ((physical_size.w as f64) / scale.max(0.1)).round().max(1.0) as i32
+    }
+
     pub fn apply_runtime_display_config_update(&mut self, update: RuntimeDisplayConfigUpdate) {
         for (output_name, config) in update.outputs {
             match config {
@@ -1529,6 +1546,7 @@ impl ShojiWM {
         }
 
         let mut target_modes = std::collections::BTreeMap::new();
+        let mut target_scales = std::collections::BTreeMap::new();
         for output in &outputs {
             let target_mode = self
                 .runtime_output_configs
@@ -1536,6 +1554,7 @@ impl ShojiWM {
                 .and_then(|config| config.resolution.as_ref())
                 .and_then(|preference| self.resolve_runtime_output_mode(output, preference));
             target_modes.insert(output.name(), target_mode.or_else(|| output.current_mode()));
+            target_scales.insert(output.name(), self.runtime_output_target_scale_value(output));
         }
 
         let mut manual_positions = std::collections::BTreeMap::new();
@@ -1561,10 +1580,10 @@ impl ShojiWM {
         let mut auto_cursor_x = manual_positions
             .iter()
             .filter_map(|(name, (x, _))| {
-                target_modes
-                    .get(name)
-                    .and_then(|mode| *mode)
-                    .map(|mode| x + mode.size.w)
+                let output = outputs.iter().find(|output| output.name() == *name)?;
+                let mode = target_modes.get(name).and_then(|mode| *mode)?;
+                let scale = target_scales.get(name).copied().unwrap_or(1.0);
+                Some(x + Self::runtime_output_logical_width_for_mode(output, mode, scale))
             })
             .max()
             .unwrap_or(0);
@@ -1575,8 +1594,12 @@ impl ShojiWM {
         }
         for output_name in auto_outputs {
             target_positions.insert(output_name.clone(), Point::from((auto_cursor_x, 0)));
-            if let Some(mode) = target_modes.get(&output_name).and_then(|mode| *mode) {
-                auto_cursor_x += mode.size.w;
+            if let Some(output) = outputs.iter().find(|output| output.name() == output_name)
+                && let Some(mode) = target_modes.get(&output_name).and_then(|mode| *mode)
+            {
+                let scale = target_scales.get(&output_name).copied().unwrap_or(1.0);
+                auto_cursor_x +=
+                    Self::runtime_output_logical_width_for_mode(output, mode, scale);
             }
         }
 
@@ -1591,7 +1614,9 @@ impl ShojiWM {
                 .runtime_output_configs
                 .get(&name)
                 .and_then(|config| config.scale)
-                .map(|scale| OutputScale::Fractional(scale.max(0.1)));
+                .map(|_| {
+                    OutputScale::Fractional(target_scales.get(&name).copied().unwrap_or(1.0))
+                });
 
             if let Some(mode) = target_mode {
                 let current_mode = output.current_mode();
