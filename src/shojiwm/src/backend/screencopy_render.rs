@@ -11,9 +11,9 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::RenderElement;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTarget, GlesTexture};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen, Renderer};
+use smithay::backend::renderer::{Bind, Color32F, ExportMem, Offscreen};
 use smithay::output::Output;
 use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_server::protocol::wl_shm;
@@ -153,10 +153,8 @@ fn render_for_screencopy<'a>(
     elements: &[&TtyRenderElements],
     damage_tracker: &'a mut OutputDamageTracker,
     screencopy: &Screencopy,
-) -> Result<
-    (Option<SyncPoint>, Option<&'a Vec<Rectangle<i32, Physical>>>),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(Option<SyncPoint>, Option<Vec<Rectangle<i32, Physical>>>), Box<dyn std::error::Error>>
+{
     use smithay::output::OutputModeSource;
 
     let OutputModeSource::Static {
@@ -190,15 +188,13 @@ fn render_for_screencopy<'a>(
         })
         .collect::<Vec<_>>();
 
-    let damages = damage_tracker
+    let (damages, _) = damage_tracker
         .damage_output(1, &relocated_elements)
-        .map_err(|e| format!("damage_output error: {e:?}"))?
-        .0;
+        .map_err(|e| format!("damage_output error: {e:?}"))?;
+    let damages = damages.cloned();
     if screencopy.with_damage() && damages.is_none() {
         return Ok((None, None));
     }
-
-    let element_iter = relocated_elements.iter().rev();
 
     let sync = match screencopy.buffer() {
         ScreencopyBuffer::Dmabuf(dmabuf) => {
@@ -208,12 +204,19 @@ fn render_for_screencopy<'a>(
                 size,
                 scale,
                 transform,
-                element_iter,
+                &relocated_elements,
             )?;
             Some(sync)
         }
         ScreencopyBuffer::Shm(wl_buffer) => {
-            render_to_shm(renderer, wl_buffer, size, scale, transform, element_iter)?;
+            render_to_shm(
+                renderer,
+                wl_buffer,
+                size,
+                scale,
+                transform,
+                &relocated_elements,
+            )?;
             None
         }
     };
@@ -227,14 +230,23 @@ fn render_to_dmabuf(
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
+    elements: &[impl RenderElement<GlesRenderer>],
 ) -> Result<SyncPoint, Box<dyn std::error::Error>> {
     let profile = std::env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some();
     let bind_at = std::time::Instant::now();
     let mut target = renderer.bind(&mut dmabuf)?;
     let bind_ms = bind_at.elapsed().as_secs_f64() * 1000.0;
     let render_at = std::time::Instant::now();
-    let sync = render_elements_to_target(renderer, &mut target, size, scale, transform, elements)?;
+    let mut damage_tracker = OutputDamageTracker::new(size, scale, transform);
+    let sync = damage_tracker
+        .render_output(
+            renderer,
+            &mut target,
+            0,
+            elements,
+            Color32F::new(0.0, 0.0, 0.0, 1.0),
+        )?
+        .sync;
     let render_ms = render_at.elapsed().as_secs_f64() * 1000.0;
     if profile {
         tracing::info!(bind_ms, render_ms, "screencopy: dmabuf bind+render");
@@ -248,7 +260,7 @@ fn render_to_shm(
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
+    elements: &[impl RenderElement<GlesRenderer>],
 ) -> Result<(), Box<dyn std::error::Error>> {
     shm::with_buffer_contents_mut(buffer, |shm_buffer, shm_len, buffer_data| {
         if !(buffer_data.format == wl_shm::Format::Xrgb8888
@@ -276,41 +288,22 @@ fn render_and_download(
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
+    elements: &[impl RenderElement<GlesRenderer>],
 ) -> Result<smithay::backend::renderer::gles::GlesMapping, Box<dyn std::error::Error>> {
     let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
     let mut texture: GlesTexture = renderer.create_buffer(fourcc, buffer_size)?;
     {
         let mut target = renderer.bind(&mut texture)?;
-        let _ = render_elements_to_target(renderer, &mut target, size, scale, transform, elements)?;
+        let mut damage_tracker = OutputDamageTracker::new(size, scale, transform);
+        let _ = damage_tracker.render_output(
+            renderer,
+            &mut target,
+            0,
+            elements,
+            Color32F::new(0.0, 0.0, 0.0, 1.0),
+        )?;
     }
     let target = renderer.bind(&mut texture)?;
     let mapping = renderer.copy_framebuffer(&target, Rectangle::from_size(buffer_size), fourcc)?;
     Ok(mapping)
-}
-
-fn render_elements_to_target(
-    renderer: &mut GlesRenderer,
-    target: &mut GlesTarget,
-    size: Size<i32, Physical>,
-    scale: Scale<f64>,
-    transform: Transform,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
-) -> Result<SyncPoint, Box<dyn std::error::Error>> {
-    let transform = transform.invert();
-    let output_rect = Rectangle::from_size(transform.transform_size(size));
-
-    let mut frame = renderer.render(target, size, transform)?;
-    frame.clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[output_rect])?;
-
-    for element in elements {
-        let src = element.src();
-        let dst = element.geometry(scale);
-        if let Some(mut damage) = output_rect.intersection(dst) {
-            damage.loc -= dst.loc;
-            element.draw(&mut frame, src, dst, &[damage], &[], None)?;
-        }
-    }
-
-    Ok(frame.finish()?)
 }

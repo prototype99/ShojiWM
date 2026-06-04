@@ -11,14 +11,12 @@ use std::ptr;
 use std::time::Duration;
 
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{AsRenderElements, RenderElement};
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTarget, GlesTexture};
-use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::{
-    Bind, Color32F, ExportMem, Frame as _, ImportAll, ImportMem, Offscreen, Renderer,
-};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::{Bind, Color32F, ExportMem, ImportAll, ImportMem, Offscreen};
 use smithay::desktop::{Space, Window};
 use smithay::output::{Output, WeakOutput};
 use smithay::reexports::wayland_server::protocol::wl_shm;
@@ -316,14 +314,7 @@ fn render_frame_for_toplevel(
     elements.extend(window_elements);
 
     let buffer = frame.buffer();
-    render_to_shm(
-        renderer,
-        &buffer,
-        size,
-        scale,
-        Transform::Normal,
-        elements.iter().rev(),
-    )
+    render_to_shm(renderer, &buffer, size, scale, Transform::Normal, &elements)
 }
 
 fn render_frame_for_output(
@@ -342,10 +333,15 @@ fn render_frame_for_output(
         .iter()
         .map(|element| RelocateRenderElement::from_element(*element, (0, 0), Relocate::Relative))
         .collect();
-    let element_iter = relocated_elements.iter().rev();
-
     let buffer = frame.buffer();
-    render_to_shm(renderer, &buffer, size, scale, transform, element_iter)
+    render_to_shm(
+        renderer,
+        &buffer,
+        size,
+        scale,
+        transform,
+        &relocated_elements,
+    )
 }
 
 fn render_to_shm(
@@ -354,7 +350,7 @@ fn render_to_shm(
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
+    elements: &[impl RenderElement<GlesRenderer>],
 ) -> Result<(), Box<dyn std::error::Error>> {
     shm::with_buffer_contents_mut(buffer, |shm_buffer, shm_len, buffer_data| {
         if !(buffer_data.format == wl_shm::Format::Xrgb8888
@@ -382,40 +378,22 @@ fn render_and_download(
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
+    elements: &[impl RenderElement<GlesRenderer>],
 ) -> Result<smithay::backend::renderer::gles::GlesMapping, Box<dyn std::error::Error>> {
     let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
     let mut texture: GlesTexture = renderer.create_buffer(fourcc, buffer_size)?;
     {
         let mut target = renderer.bind(&mut texture)?;
-        let _ = render_elements_to_target(renderer, &mut target, size, scale, transform, elements)?;
+        let mut damage_tracker = OutputDamageTracker::new(size, scale, transform);
+        let _ = damage_tracker.render_output(
+            renderer,
+            &mut target,
+            0,
+            elements,
+            Color32F::new(0.0, 0.0, 0.0, 1.0),
+        )?;
     }
     let target = renderer.bind(&mut texture)?;
     let mapping = renderer.copy_framebuffer(&target, Rectangle::from_size(buffer_size), fourcc)?;
     Ok(mapping)
-}
-
-fn render_elements_to_target(
-    renderer: &mut GlesRenderer,
-    target: &mut GlesTarget,
-    size: Size<i32, Physical>,
-    scale: Scale<f64>,
-    transform: Transform,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
-) -> Result<SyncPoint, Box<dyn std::error::Error>> {
-    let transform = transform.invert();
-    let output_rect = Rectangle::from_size(transform.transform_size(size));
-
-    let mut gles_frame = renderer.render(target, size, transform)?;
-    gles_frame.clear(Color32F::new(0.0, 0.0, 0.0, 1.0), &[output_rect])?;
-
-    for element in elements {
-        let src = element.src();
-        let dst = element.geometry(scale);
-        if let Some(mut damage) = output_rect.intersection(dst) {
-            damage.loc -= dst.loc;
-            element.draw(&mut gles_frame, src, dst, &[damage], &[], None)?;
-        }
-    }
-    Ok(gles_frame.finish()?)
 }
