@@ -31,6 +31,8 @@ import {
   WINDOW_STATE_VISIBLE_OUTPUTS,
   WINDOW_STATE_RECT,
   WINDOW_STATE_WORKSPACE_VISIBLE,
+  WINDOW_STATE_WORKSPACE_OFFSET_Y,
+  WINDOW_STATE_WORKSPACE_OPACITY,
 } from "./window-manager";
 
 const NOCTALIA_SHELL_PATH =
@@ -218,6 +220,10 @@ WINDOW_MANAGER.event.onPointerMoveAsync((event) => {
   HYBRID_WINDOW_MANAGER.onPointerMove(event);
 });
 
+WINDOW_MANAGER.event.onGestureSwipeAsync((event) => {
+  HYBRID_WINDOW_MANAGER.onGestureSwipe(event);
+});
+
 WINDOW_MANAGER.event.onOutputChange((event) => {
   HYBRID_WINDOW_MANAGER.onOutputChange(event);
 });
@@ -268,7 +274,18 @@ function naturalRootRect(window: WaylandWindow): ManagedWindowRect {
 
 WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
   const workspaceVisible = window.state[WINDOW_STATE_WORKSPACE_VISIBLE];
+  const workspaceOffsetY = window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y];
+  const workspaceOpacity = window.state[WINDOW_STATE_WORKSPACE_OPACITY];
   const tileDragging = window.state[WINDOW_STATE_TILE_DRAGGING];
+  const managedRect = computed(() => {
+    const rect = window.state[WINDOW_STATE_RECT]();
+    return {
+      x: read(rect.x),
+      y: read(rect.y) + workspaceOffsetY(),
+      width: read(rect.width),
+      height: read(rect.height),
+    };
+  });
   const forceRectSize = computed(
     () => window.isResizable() && !window.isTransient(),
   );
@@ -375,9 +392,10 @@ WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
 
   return (
     <ManagedWindow
-      rect={window.state[WINDOW_STATE_RECT]}
+      rect={managedRect}
       zIndex={HYBRID_WINDOW_MANAGER.getWindowZIndex(window)}
       visibleOutputs={window.state[WINDOW_STATE_VISIBLE_OUTPUTS]}
+      opacity={workspaceOpacity}
       forceRectSize={forceRectSize}
       idle={inactive}
       interactive={inactive((value) => !value)}

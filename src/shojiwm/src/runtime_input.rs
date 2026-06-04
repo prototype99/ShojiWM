@@ -277,6 +277,13 @@ pub fn scroll_factor_for_backend_device<D: SmithayInputDevice>(
     }
 }
 
+pub fn snapshot_for_backend_input_device<D: SmithayInputDevice>(
+    devices: &BTreeMap<String, RuntimeInputDeviceSnapshot>,
+    device: &D,
+) -> Option<RuntimeInputDeviceSnapshot> {
+    snapshot_for_backend_device(devices, device).cloned()
+}
+
 fn snapshot_for_backend_device<'a, D: SmithayInputDevice>(
     devices: &'a BTreeMap<String, RuntimeInputDeviceSnapshot>,
     device: &D,

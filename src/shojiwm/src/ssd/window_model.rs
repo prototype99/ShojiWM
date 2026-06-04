@@ -104,6 +104,32 @@ pub struct PointerMoveEventSnapshot {
     pub timestamp: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GestureSwipeEventSnapshot {
+    pub phase: GestureSwipePhaseSnapshot,
+    pub fingers: u32,
+    pub position: Option<PointerMovePointSnapshot>,
+    pub delta_x: f64,
+    pub delta_y: f64,
+    pub total_x: f64,
+    pub total_y: f64,
+    pub velocity_x: f64,
+    pub velocity_y: f64,
+    pub output_name: Option<String>,
+    pub device: Option<crate::runtime_input::RuntimeInputDeviceSnapshot>,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GestureSwipePhaseSnapshot {
+    Begin,
+    Update,
+    End,
+    Cancel,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowResizeEdgesSnapshot {

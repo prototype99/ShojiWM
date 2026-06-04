@@ -80,6 +80,7 @@ import {
   type RuntimeWindowMinimizeRequestEvent,
   type RuntimeWindowActivateRequestEvent,
   type PointerMoveEvent,
+  type GestureSwipeEvent,
   type RuntimeEventConfig,
   type RuntimePersistedState,
   updateOutputState,
@@ -327,6 +328,15 @@ interface PointerMoveAsyncRequest {
   inputState?: Record<string, InputDeviceInfo>;
 }
 
+interface GestureSwipeAsyncRequest {
+  requestId: number;
+  kind: "gestureSwipeAsync";
+  event: GestureSwipeEvent;
+  nowMs: number;
+  displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
+}
+
 interface GetEffectConfigRequest {
   requestId: number;
   kind: "getEffectConfig";
@@ -376,6 +386,7 @@ type RuntimeRequest =
   | WindowMinimizeRequest
   | WindowActivateRequest
   | PointerMoveAsyncRequest
+  | GestureSwipeAsyncRequest
   | GetEffectConfigRequest
   | EvaluateLayerEffectsRequest
   | LifecycleEnableRequest
@@ -632,7 +643,7 @@ interface StartCloseSuccess {
 interface PointerMoveAsyncSuccess {
   requestId: number;
   ok: true;
-  kind: "pointerMoveAsync";
+  kind: "pointerMoveAsync" | "gestureSwipeAsync";
   invoked: boolean;
   dirty: boolean;
   dirtyWindowIds: string[];
@@ -644,6 +655,7 @@ interface PointerMoveAsyncSuccess {
   displayConfig?: { outputs: DisplayConfigDraft };
   keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
   pointerConfig?: RuntimePointerConfig;
+  inputConfig?: { config: InputConfigDraft };
   eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
@@ -906,6 +918,7 @@ const stats = {
   windowMinimizeRequest: 0,
   windowActivateRequest: 0,
   pointerMoveAsync: 0,
+  gestureSwipeAsync: 0,
   getEffectConfig: 0,
   evaluateLayerEffects: 0,
   evaluateLayerEffectsAnim: 0,
@@ -1059,6 +1072,9 @@ async function main() {
             break;
           case "pointerMoveAsync":
             stats.pointerMoveAsync++;
+            break;
+          case "gestureSwipeAsync":
+            stats.gestureSwipeAsync++;
             break;
           case "getEffectConfig":
             stats.getEffectConfig++;
@@ -1530,6 +1546,27 @@ async function main() {
               requestId: request.requestId,
               ok: true,
               kind: "pointerMoveAsync",
+              ...result,
+              displayConfig: pendingDisplayConfigPayload(),
+              keyBindingConfig,
+              pointerConfig,
+              inputConfig,
+              eventConfig,
+              processConfig,
+              processActions,
+            });
+          } else if (request.kind === "gestureSwipeAsync") {
+            const result = await invokeGestureSwipeAsync(events, request.event);
+            const keyBindingConfig = pendingKeyBindingConfigPayload();
+            const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
+            const eventConfig = pendingEventConfigPayload(events);
+            const processConfig = pendingProcessConfigPayload();
+            const processActions = pendingProcessActionsPayload();
+            await writeResponse(output, {
+              requestId: request.requestId,
+              ok: true,
+              kind: "gestureSwipeAsync",
               ...result,
               displayConfig: pendingDisplayConfigPayload(),
               keyBindingConfig,
@@ -2750,6 +2787,34 @@ async function invokePointerMoveAsync(
   event: PointerMoveEvent,
 ): Promise<Omit<PointerMoveAsyncSuccess, "requestId" | "ok" | "kind">> {
   const invoked = await events.emitPointerMoveAsync(event);
+  if (!invoked) {
+    return {
+      invoked: false,
+      dirty: false,
+      dirtyWindowIds: [],
+      actions: [],
+      nextPollInMs: hasActiveAnimations() ? 0 : peekNextPollDelay(),
+    };
+  }
+
+  const result = collectRuntimeMutationState();
+  return {
+    invoked: true,
+    dirty: result.dirty,
+    dirtyWindowIds: result.dirtyWindowIds,
+    dirtyManagedWindowIds: result.dirtyManagedWindowIds,
+    dirtyWindowNodeIds: result.dirtyWindowNodeIds,
+    dirtyLayerNodeIds: result.dirtyLayerNodeIds,
+    actions: result.actions,
+    nextPollInMs: hasActiveAnimations() ? 0 : result.nextPollInMs,
+  };
+}
+
+async function invokeGestureSwipeAsync(
+  events: WindowManagerEventController,
+  event: GestureSwipeEvent,
+): Promise<Omit<PointerMoveAsyncSuccess, "requestId" | "ok" | "kind">> {
+  const invoked = await events.emitGestureSwipeAsync(event);
   if (!invoked) {
     return {
       invoked: false,

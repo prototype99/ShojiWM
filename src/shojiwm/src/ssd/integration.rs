@@ -616,6 +616,12 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
         }
     }
 
+    fn gesture_swipe_async(&self, event: super::GestureSwipeEventSnapshot, now_ms: u64) {
+        if let Self::Node(evaluator) = self {
+            evaluator.gesture_swipe_async(event, now_ms);
+        }
+    }
+
     fn start_close(
         &self,
         window_id: &str,
@@ -665,7 +671,7 @@ impl DecorationRuntimeEvaluator {
     pub fn set_async_event_sender(
         &self,
         sender: smithay::reexports::calloop::channel::Sender<
-            super::DecorationPointerMoveAsyncInvocation,
+            super::DecorationRuntimeAsyncInvocation,
         >,
     ) {
         if let Self::Node(evaluator) = self {

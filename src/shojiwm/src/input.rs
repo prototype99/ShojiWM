@@ -1,7 +1,8 @@
 use smithay::{
     backend::input::{
-        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, GestureBeginEvent,
+        GestureEndEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent, KeyState,
+        KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
     },
     desktop::{Window, WindowSurfaceType},
     input::{
@@ -21,7 +22,8 @@ use crate::{
         resize_grab::{ResizeEdge, ResizeSurfaceGrab},
     },
     ssd::{
-        DecorationEvaluator, DecorationHitTestResult, LogicalPoint, PointerModifierStateSnapshot,
+        DecorationEvaluator, DecorationHitTestResult, GestureSwipeEventSnapshot,
+        GestureSwipePhaseSnapshot, LogicalPoint, PointerModifierStateSnapshot,
         PointerMoveEventSnapshot, PointerMovePointSnapshot, ResizeEdges, RuntimeWindowAction,
         WindowAction, WindowMoveSourceSnapshot, WindowResizeSourceSnapshot,
     },
@@ -83,6 +85,14 @@ impl ShojiWM {
         };
         let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
         self.decoration_evaluator.pointer_move_async(event, now_ms);
+    }
+
+    fn dispatch_gesture_swipe_async_event(&mut self, event: GestureSwipeEventSnapshot) {
+        if !self.runtime_gesture_swipe_async_enabled {
+            return;
+        }
+        let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
+        self.decoration_evaluator.gesture_swipe_async(event, now_ms);
     }
 
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
@@ -902,6 +912,148 @@ impl ShojiWM {
                 let pointer = self.seat.get_pointer().unwrap();
                 pointer.axis(self, frame);
                 pointer.frame(self);
+            }
+            InputEvent::GestureSwipeBegin { event, .. } => {
+                if !self.runtime_gesture_swipe_async_enabled {
+                    return;
+                }
+                let timestamp = u64::from(event.time_msec());
+                let device = event.device();
+                let pointer_position = self
+                    .seat
+                    .get_pointer()
+                    .map(|pointer| pointer.current_location());
+                let output_name = pointer_position
+                    .and_then(|position| self.output_at_point(position))
+                    .map(|output| output.name());
+                let position = pointer_position.map(|position| PointerMovePointSnapshot {
+                    x: position.x,
+                    y: position.y,
+                });
+                let device = crate::runtime_input::snapshot_for_backend_input_device(
+                    &self.runtime_input_devices,
+                    &device,
+                );
+                let fingers = event.fingers();
+                self.runtime_gesture_swipe = Some(crate::state::RuntimeGestureSwipeState {
+                    fingers,
+                    total_x: 0.0,
+                    total_y: 0.0,
+                    last_timestamp: timestamp,
+                    velocity_x: 0.0,
+                    velocity_y: 0.0,
+                });
+                self.dispatch_gesture_swipe_async_event(GestureSwipeEventSnapshot {
+                    phase: GestureSwipePhaseSnapshot::Begin,
+                    fingers,
+                    position,
+                    delta_x: 0.0,
+                    delta_y: 0.0,
+                    total_x: 0.0,
+                    total_y: 0.0,
+                    velocity_x: 0.0,
+                    velocity_y: 0.0,
+                    output_name,
+                    device,
+                    timestamp,
+                });
+            }
+            InputEvent::GestureSwipeUpdate { event, .. } => {
+                if !self.runtime_gesture_swipe_async_enabled {
+                    return;
+                }
+                let timestamp = u64::from(event.time_msec());
+                let delta_x = event.delta_x();
+                let delta_y = event.delta_y();
+                let device = event.device();
+                let pointer_position = self
+                    .seat
+                    .get_pointer()
+                    .map(|pointer| pointer.current_location());
+                let output_name = pointer_position
+                    .and_then(|position| self.output_at_point(position))
+                    .map(|output| output.name());
+                let position = pointer_position.map(|position| PointerMovePointSnapshot {
+                    x: position.x,
+                    y: position.y,
+                });
+                let device = crate::runtime_input::snapshot_for_backend_input_device(
+                    &self.runtime_input_devices,
+                    &device,
+                );
+                let Some(gesture) = self.runtime_gesture_swipe.as_mut() else {
+                    return;
+                };
+                let dt_seconds =
+                    timestamp.saturating_sub(gesture.last_timestamp).max(1) as f64 / 1000.0;
+                gesture.total_x += delta_x;
+                gesture.total_y += delta_y;
+                gesture.velocity_x = delta_x / dt_seconds;
+                gesture.velocity_y = delta_y / dt_seconds;
+                gesture.last_timestamp = timestamp;
+                let fingers = gesture.fingers;
+                let total_x = gesture.total_x;
+                let total_y = gesture.total_y;
+                let velocity_x = gesture.velocity_x;
+                let velocity_y = gesture.velocity_y;
+                self.dispatch_gesture_swipe_async_event(GestureSwipeEventSnapshot {
+                    phase: GestureSwipePhaseSnapshot::Update,
+                    fingers,
+                    position,
+                    delta_x,
+                    delta_y,
+                    total_x,
+                    total_y,
+                    velocity_x,
+                    velocity_y,
+                    output_name,
+                    device,
+                    timestamp,
+                });
+            }
+            InputEvent::GestureSwipeEnd { event, .. } => {
+                if !self.runtime_gesture_swipe_async_enabled {
+                    self.runtime_gesture_swipe = None;
+                    return;
+                }
+                let timestamp = u64::from(event.time_msec());
+                let device = event.device();
+                let pointer_position = self
+                    .seat
+                    .get_pointer()
+                    .map(|pointer| pointer.current_location());
+                let output_name = pointer_position
+                    .and_then(|position| self.output_at_point(position))
+                    .map(|output| output.name());
+                let position = pointer_position.map(|position| PointerMovePointSnapshot {
+                    x: position.x,
+                    y: position.y,
+                });
+                let device = crate::runtime_input::snapshot_for_backend_input_device(
+                    &self.runtime_input_devices,
+                    &device,
+                );
+                let Some(gesture) = self.runtime_gesture_swipe.take() else {
+                    return;
+                };
+                self.dispatch_gesture_swipe_async_event(GestureSwipeEventSnapshot {
+                    phase: if event.cancelled() {
+                        GestureSwipePhaseSnapshot::Cancel
+                    } else {
+                        GestureSwipePhaseSnapshot::End
+                    },
+                    fingers: gesture.fingers,
+                    position,
+                    delta_x: 0.0,
+                    delta_y: 0.0,
+                    total_x: gesture.total_x,
+                    total_y: gesture.total_y,
+                    velocity_x: gesture.velocity_x,
+                    velocity_y: gesture.velocity_y,
+                    output_name,
+                    device,
+                    timestamp,
+                });
             }
             _ => {}
         }

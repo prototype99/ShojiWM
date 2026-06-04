@@ -98,10 +98,10 @@ use crate::runtime_process::{
 use crate::ssd::{
     BackgroundEffectConfig, DecorationEvaluator, DecorationHandlerInvocation,
     DecorationInteractionSnapshot, DecorationInteractionTarget,
-    DecorationPointerMoveAsyncInvocation, DecorationRuntimeEvaluator, LogicalPoint, LogicalRect,
-    ManagedWindowAnimationSnapshot, NodeDecorationEvaluator, OutputModeSnapshot,
-    OutputPositionSnapshot, RuntimeEventConfigUpdate, WaylandOutputSnapshot, WaylandWindowSnapshot,
-    WindowDecorationState, WindowPositionSnapshot,
+    DecorationPointerMoveAsyncInvocation, DecorationRuntimeAsyncInvocation,
+    DecorationRuntimeEvaluator, LogicalPoint, LogicalRect, ManagedWindowAnimationSnapshot,
+    NodeDecorationEvaluator, OutputModeSnapshot, OutputPositionSnapshot, RuntimeEventConfigUpdate,
+    WaylandOutputSnapshot, WaylandWindowSnapshot, WindowDecorationState, WindowPositionSnapshot,
 };
 use crate::xwayland_satellite::{SatelliteInstance, satellite_requested, spawn_satellite};
 use crate::{
@@ -136,6 +136,16 @@ fn runtime_dirty_debug_enabled() -> bool {
 pub struct OwnedDamageRect {
     pub owner: String,
     pub rect: LogicalRect,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeGestureSwipeState {
+    pub fingers: u32,
+    pub total_x: f64,
+    pub total_y: f64,
+    pub last_timestamp: u64,
+    pub velocity_x: f64,
+    pub velocity_y: f64,
 }
 
 /// Per-surface marker tracking whether we have already reinterpreted the cursor
@@ -301,6 +311,8 @@ pub struct ShojiWM {
     pub runtime_input_devices: BTreeMap<String, RuntimeInputDeviceSnapshot>,
     pub runtime_libinput_devices: HashMap<String, input::Device>,
     pub runtime_pointer_move_async_enabled: bool,
+    pub runtime_gesture_swipe_async_enabled: bool,
+    pub runtime_gesture_swipe: Option<RuntimeGestureSwipeState>,
     pub current_keyboard_modifiers: ModifiersState,
     pub suggested_window_offset: Option<(i32, i32)>,
     pub async_asset_dirty: bool,
@@ -636,9 +648,12 @@ impl ShojiWM {
         event_loop
             .handle()
             .insert_source(runtime_async_event_rx, |event, _, state| match event {
-                ChannelEvent::Msg(invocation) => {
-                    state.handle_runtime_pointer_move_async_invocation(invocation);
-                }
+                ChannelEvent::Msg(invocation) => match invocation {
+                    DecorationRuntimeAsyncInvocation::PointerMove(invocation)
+                    | DecorationRuntimeAsyncInvocation::GestureSwipe(invocation) => {
+                        state.handle_runtime_pointer_move_async_invocation(invocation);
+                    }
+                },
                 ChannelEvent::Closed => {}
             })
             .expect("Failed to init runtime async event source.");
@@ -794,6 +809,8 @@ impl ShojiWM {
             runtime_input_devices: Default::default(),
             runtime_libinput_devices: Default::default(),
             runtime_pointer_move_async_enabled: false,
+            runtime_gesture_swipe_async_enabled: false,
+            runtime_gesture_swipe: None,
             current_keyboard_modifiers: ModifiersState::default(),
             suggested_window_offset: None,
             async_asset_dirty: false,
@@ -1764,6 +1781,7 @@ impl ShojiWM {
 
     pub fn apply_runtime_event_config_update(&mut self, update: RuntimeEventConfigUpdate) {
         self.runtime_pointer_move_async_enabled = update.pointer_move_async;
+        self.runtime_gesture_swipe_async_enabled = update.gesture_swipe_async;
     }
 
     pub fn consume_runtime_event_config(&mut self, update: Option<RuntimeEventConfigUpdate>) {

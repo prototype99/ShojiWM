@@ -212,8 +212,30 @@ export type PointerMoveAsyncListener = (
   event: PointerMoveEvent,
 ) => void | Promise<void>;
 
+export type GestureSwipePhase = "begin" | "update" | "end" | "cancel";
+
+export interface GestureSwipeEvent {
+  phase: GestureSwipePhase;
+  fingers: number;
+  position?: PointerMovePoint;
+  deltaX: number;
+  deltaY: number;
+  totalX: number;
+  totalY: number;
+  velocityX: number;
+  velocityY: number;
+  outputName?: string;
+  device?: InputDeviceInfo;
+  timestamp: number;
+}
+
+export type GestureSwipeAsyncListener = (
+  event: GestureSwipeEvent,
+) => void | Promise<void>;
+
 export interface RuntimeEventConfig {
   pointerMoveAsync: boolean;
+  gestureSwipeAsync: boolean;
 }
 
 export interface WindowManagerEventController {
@@ -233,6 +255,7 @@ export interface WindowManagerEventController {
   onOutputChange(listener: OutputChangeListener): () => void;
   onInputDeviceChange(listener: InputDeviceChangeListener): () => void;
   onPointerMoveAsync(listener: PointerMoveAsyncListener): () => void;
+  onGestureSwipeAsync(listener: GestureSwipeAsyncListener): () => void;
   onCreateLayer(listener: LayerCreateListener): () => void;
   onUpdateLayer(listener: LayerUpdateListener): () => void;
   onDestroyLayer(listener: LayerDestroyListener): () => void;
@@ -262,6 +285,7 @@ export interface WindowManagerEventController {
   emitOutputChange(event: OutputChangeEvent): void;
   emitInputDeviceChange(event: InputDeviceChangeEvent): void;
   emitPointerMoveAsync(event: PointerMoveEvent): Promise<boolean>;
+  emitGestureSwipeAsync(event: GestureSwipeEvent): Promise<boolean>;
   emitCreateLayer(layer: WaylandLayer): void;
   emitUpdateLayer(layer: WaylandLayer): void;
   emitDestroyLayer(layer: WaylandLayer): void;
@@ -290,6 +314,7 @@ export function createWindowManagerEventController(): WindowManagerEventControll
   const outputChangeListeners = new Set<OutputChangeListener>();
   const inputDeviceChangeListeners = new Set<InputDeviceChangeListener>();
   const pointerMoveAsyncListeners = new Set<PointerMoveAsyncListener>();
+  const gestureSwipeAsyncListeners = new Set<GestureSwipeAsyncListener>();
   const createLayerListeners = new Set<LayerCreateListener>();
   const updateLayerListeners = new Set<LayerUpdateListener>();
   const destroyLayerListeners = new Set<LayerDestroyListener>();
@@ -365,6 +390,14 @@ export function createWindowManagerEventController(): WindowManagerEventControll
       markEventConfigDirty();
       return () => {
         pointerMoveAsyncListeners.delete(listener);
+        markEventConfigDirty();
+      };
+    },
+    onGestureSwipeAsync(listener) {
+      gestureSwipeAsyncListeners.add(listener);
+      markEventConfigDirty();
+      return () => {
+        gestureSwipeAsyncListeners.delete(listener);
         markEventConfigDirty();
       };
     },
@@ -474,6 +507,15 @@ export function createWindowManagerEventController(): WindowManagerEventControll
       }
       return true;
     },
+    async emitGestureSwipeAsync(event) {
+      if (gestureSwipeAsyncListeners.size === 0) {
+        return false;
+      }
+      for (const listener of gestureSwipeAsyncListeners) {
+        await listener(event);
+      }
+      return true;
+    },
     emitCreateLayer(layer) {
       for (const listener of createLayerListeners) {
         listener(layer);
@@ -529,6 +571,7 @@ export function createWindowManagerEventController(): WindowManagerEventControll
       pendingEventConfig = false;
       return {
         pointerMoveAsync: pointerMoveAsyncListeners.size > 0,
+        gestureSwipeAsync: gestureSwipeAsyncListeners.size > 0,
       };
     },
   };

@@ -13,10 +13,11 @@ use std::{
 use tracing::{debug, error, info, warn};
 
 use super::window_model::{
-    ManagedWindowAnimationSnapshot, ManagedWindowState, PointerMoveEventSnapshot,
-    WaylandLayerSnapshot, WaylandOutputSnapshot, WaylandWindowAction, WaylandWindowSnapshot,
-    WindowActivateRequestEventSnapshot, WindowMaximizeRequestEventSnapshot,
-    WindowMinimizeRequestEventSnapshot, WindowMoveEventSnapshot, WindowResizeEventSnapshot,
+    GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot, ManagedWindowAnimationSnapshot,
+    ManagedWindowState, PointerMoveEventSnapshot, WaylandLayerSnapshot, WaylandOutputSnapshot,
+    WaylandWindowAction, WaylandWindowSnapshot, WindowActivateRequestEventSnapshot,
+    WindowMaximizeRequestEventSnapshot, WindowMinimizeRequestEventSnapshot,
+    WindowMoveEventSnapshot, WindowResizeEventSnapshot,
 };
 use super::{
     BackgroundEffectConfig, DecorationBridgeError, DecorationLayoutError, DecorationNode,
@@ -151,6 +152,8 @@ pub trait DecorationEvaluator {
     }
 
     fn pointer_move_async(&self, _event: PointerMoveEventSnapshot, _now_ms: u64) {}
+
+    fn gesture_swipe_async(&self, _event: GestureSwipeEventSnapshot, _now_ms: u64) {}
 
     fn evaluate_layer_effects(
         &self,
@@ -362,10 +365,20 @@ pub struct DecorationPointerMoveAsyncInvocation {
     pub process_actions: Vec<RuntimeProcessAction>,
 }
 
+pub type DecorationGestureSwipeAsyncInvocation = DecorationPointerMoveAsyncInvocation;
+
+#[derive(Debug, Clone)]
+pub enum DecorationRuntimeAsyncInvocation {
+    PointerMove(DecorationPointerMoveAsyncInvocation),
+    GestureSwipe(DecorationGestureSwipeAsyncInvocation),
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeEventConfigUpdate {
     pub pointer_move_async: bool,
+    #[serde(default)]
+    pub gesture_swipe_async: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -541,18 +554,24 @@ pub struct NodeDecorationEvaluator {
     display_state: Arc<Mutex<std::collections::BTreeMap<String, WaylandOutputSnapshot>>>,
     input_state: Arc<Mutex<std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>>>,
     pointer_move_async: Arc<PointerMoveAsyncDispatcher>,
-    async_event_sender: Arc<Mutex<Option<CalloopSender<DecorationPointerMoveAsyncInvocation>>>>,
+    async_event_sender: Arc<Mutex<Option<CalloopSender<DecorationRuntimeAsyncInvocation>>>>,
 }
 
 #[derive(Debug)]
-struct PointerMoveAsyncWork {
-    event: PointerMoveEventSnapshot,
-    now_ms: u64,
+enum RuntimeAsyncWork {
+    PointerMove {
+        event: PointerMoveEventSnapshot,
+        now_ms: u64,
+    },
+    GestureSwipe {
+        event: GestureSwipeEventSnapshot,
+        now_ms: u64,
+    },
 }
 
 #[derive(Debug, Default)]
 struct PointerMoveAsyncDispatcher {
-    pending: Mutex<Option<PointerMoveAsyncWork>>,
+    pending: Mutex<Option<RuntimeAsyncWork>>,
     pending_changed: Condvar,
     worker_started: AtomicBool,
 }
@@ -725,6 +744,17 @@ enum RuntimeRequest<'a> {
         #[serde(rename = "requestId")]
         request_id: u64,
         event: &'a PointerMoveEventSnapshot,
+        #[serde(rename = "nowMs")]
+        now_ms: u64,
+        #[serde(rename = "displayState")]
+        display_state: &'a std::collections::BTreeMap<String, WaylandOutputSnapshot>,
+        #[serde(rename = "inputState")]
+        input_state: &'a std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
+    },
+    GestureSwipeAsync {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        event: &'a GestureSwipeEventSnapshot,
         #[serde(rename = "nowMs")]
         now_ms: u64,
         #[serde(rename = "displayState")]
@@ -1212,6 +1242,8 @@ struct RuntimePointerMoveAsyncResponse {
     error: Option<String>,
 }
 
+type RuntimeGestureSwipeAsyncResponse = RuntimePointerMoveAsyncResponse;
+
 impl std::fmt::Debug for NodeDecorationEvaluator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeDecorationEvaluator")
@@ -1275,10 +1307,7 @@ impl NodeDecorationEvaluator {
         }
     }
 
-    pub fn set_async_event_sender(
-        &self,
-        sender: CalloopSender<DecorationPointerMoveAsyncInvocation>,
-    ) {
+    pub fn set_async_event_sender(&self, sender: CalloopSender<DecorationRuntimeAsyncInvocation>) {
         if let Ok(mut guard) = self.async_event_sender.lock() {
             *guard = Some(sender);
         }
@@ -1705,7 +1734,27 @@ impl NodeDecorationEvaluator {
     fn enqueue_pointer_move_async(&self, event: PointerMoveEventSnapshot, now_ms: u64) {
         self.ensure_pointer_move_async_worker();
         if let Ok(mut pending) = self.pointer_move_async.pending.lock() {
-            *pending = Some(PointerMoveAsyncWork { event, now_ms });
+            if matches!(
+                pending.as_ref(),
+                Some(RuntimeAsyncWork::GestureSwipe {
+                    event: GestureSwipeEventSnapshot {
+                        phase: GestureSwipePhaseSnapshot::End | GestureSwipePhaseSnapshot::Cancel,
+                        ..
+                    },
+                    ..
+                })
+            ) {
+                return;
+            }
+            *pending = Some(RuntimeAsyncWork::PointerMove { event, now_ms });
+            self.pointer_move_async.pending_changed.notify_one();
+        }
+    }
+
+    fn enqueue_gesture_swipe_async(&self, event: GestureSwipeEventSnapshot, now_ms: u64) {
+        self.ensure_pointer_move_async_worker();
+        if let Ok(mut pending) = self.pointer_move_async.pending.lock() {
+            *pending = Some(RuntimeAsyncWork::GestureSwipe { event, now_ms });
             self.pointer_move_async.pending_changed.notify_one();
         }
     }
@@ -1751,7 +1800,20 @@ impl NodeDecorationEvaluator {
                 continue;
             };
 
-            match self.dispatch_pointer_move_async(&work.event, work.now_ms) {
+            let result = match work {
+                RuntimeAsyncWork::PointerMove { event, now_ms } => self
+                    .dispatch_pointer_move_async(&event, now_ms)
+                    .map(|invocation| {
+                        invocation.map(DecorationRuntimeAsyncInvocation::PointerMove)
+                    }),
+                RuntimeAsyncWork::GestureSwipe { event, now_ms } => self
+                    .dispatch_gesture_swipe_async(&event, now_ms)
+                    .map(|invocation| {
+                        invocation.map(DecorationRuntimeAsyncInvocation::GestureSwipe)
+                    }),
+            };
+
+            match result {
                 Ok(Some(invocation)) => {
                     if let Ok(sender_guard) = self.async_event_sender.lock()
                         && let Some(sender) = sender_guard.as_ref()
@@ -1761,7 +1823,7 @@ impl NodeDecorationEvaluator {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    debug!(?error, "failed to dispatch async pointer move event");
+                    debug!(?error, "failed to dispatch runtime async event");
                 }
             }
         }
@@ -1842,6 +1904,97 @@ impl NodeDecorationEvaluator {
         }
 
         Ok(Some(DecorationPointerMoveAsyncInvocation {
+            invoked: response.invoked.unwrap_or(false),
+            dirty: response.dirty.unwrap_or(false),
+            dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
+            dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
+            dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
+            actions: response.actions.unwrap_or_default(),
+            next_poll_in_ms: response.next_poll_in_ms,
+            display_config: response.display_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            input_config: response.input_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+        }))
+    }
+
+    fn dispatch_gesture_swipe_async(
+        &self,
+        event: &GestureSwipeEventSnapshot,
+        now_ms: u64,
+    ) -> Result<Option<DecorationGestureSwipeAsyncInvocation>, DecorationEvaluationError> {
+        let Ok(mut runtime_guard) = self.runtime.try_lock() else {
+            return Ok(None);
+        };
+        let runtime = self.ensure_runtime(&mut runtime_guard)?;
+        let request_id = runtime.next_request_id;
+        runtime.next_request_id += 1;
+        let display_state = self
+            .display_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let input_state = self
+            .input_state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+
+        let request = serde_json::to_string(&RuntimeRequest::GestureSwipeAsync {
+            request_id,
+            event,
+            now_ms,
+            display_state: &display_state,
+            input_state: &input_state,
+        })
+        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
+        runtime.write_request(&request)?;
+
+        let response: RuntimeGestureSwipeAsyncResponse =
+            if let Some(response) = runtime.read_response()? {
+                response
+            } else {
+                let status = runtime
+                    .child
+                    .try_wait()?
+                    .and_then(|status| status.code())
+                    .unwrap_or(-1);
+                let stderr = runtime
+                    .stderr_log
+                    .lock()
+                    .map(|stderr| stderr.clone())
+                    .unwrap_or_default();
+                *runtime_guard = None;
+                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
+            };
+        if response.request_id != request_id {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response id: expected {request_id}, got {}",
+                response.request_id
+            )));
+        }
+        if response.kind != "gestureSwipeAsync" {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "mismatched response kind for gestureSwipeAsync: {}",
+                response.kind
+            )));
+        }
+        if !response.ok {
+            *runtime_guard = None;
+            return Err(DecorationEvaluationError::RuntimeProtocol(
+                response
+                    .error
+                    .unwrap_or_else(|| "runtime returned failure".into()),
+            ));
+        }
+
+        Ok(Some(DecorationGestureSwipeAsyncInvocation {
             invoked: response.invoked.unwrap_or(false),
             dirty: response.dirty.unwrap_or(false),
             dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
@@ -3238,6 +3391,10 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
 
     fn pointer_move_async(&self, event: PointerMoveEventSnapshot, now_ms: u64) {
         self.enqueue_pointer_move_async(event, now_ms);
+    }
+
+    fn gesture_swipe_async(&self, event: GestureSwipeEventSnapshot, now_ms: u64) {
+        self.enqueue_gesture_swipe_async(event, now_ms);
     }
 
     fn start_close(

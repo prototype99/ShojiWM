@@ -26,21 +26,21 @@ pub use bridge::{
 pub use evaluator::{
     DecorationCachedEvaluationResult, DecorationEvaluationError, DecorationEvaluationResult,
     DecorationEvaluator, DecorationHandlerInvocation, DecorationKeyBindingInvocation,
-    DecorationPointerMoveAsyncInvocation, DecorationSchedulerTick, DecorationWindowMoveInvocation,
-    DecorationWindowResizeInvocation, DecorationWindowStateRequestInvocation,
-    LayerEffectEvaluationResult, NodeDecorationEvaluator, RuntimeEventConfigUpdate,
-    RuntimeLayerEffectAssignment, RuntimeWindowAction, StaticDecorationEvaluator,
-    evaluate_dynamic_decoration,
+    DecorationPointerMoveAsyncInvocation, DecorationRuntimeAsyncInvocation,
+    DecorationSchedulerTick, DecorationWindowMoveInvocation, DecorationWindowResizeInvocation,
+    DecorationWindowStateRequestInvocation, LayerEffectEvaluationResult, NodeDecorationEvaluator,
+    RuntimeEventConfigUpdate, RuntimeLayerEffectAssignment, RuntimeWindowAction,
+    StaticDecorationEvaluator, evaluate_dynamic_decoration,
 };
 pub use integration::{
     CachedDecorationBuffer, ContentClip, DecorationRuntimeEvaluator, WindowDecorationState,
 };
 pub use interaction::DecorationInteractionSnapshot;
 pub use window_model::{
-    LayerKindSnapshot, LayerPositionSnapshot, ManagedWindowAnimationEasingSnapshot,
-    ManagedWindowAnimationMode, ManagedWindowAnimationSnapshot,
-    ManagedWindowPointAnimationSnapshot, ManagedWindowPointSnapshot,
-    ManagedWindowRectAnimationSnapshot, ManagedWindowRectSnapshot,
+    GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot, LayerKindSnapshot, LayerPositionSnapshot,
+    ManagedWindowAnimationEasingSnapshot, ManagedWindowAnimationMode,
+    ManagedWindowAnimationSnapshot, ManagedWindowPointAnimationSnapshot,
+    ManagedWindowPointSnapshot, ManagedWindowRectAnimationSnapshot, ManagedWindowRectSnapshot,
     ManagedWindowScalarAnimationSnapshot, ManagedWindowState, OutputModeSnapshot,
     OutputPositionSnapshot, PointerModifierStateSnapshot, PointerMoveEventSnapshot,
     PointerMovePointSnapshot, TransformOrigin, WaylandLayerSnapshot, WaylandOutputSnapshot,

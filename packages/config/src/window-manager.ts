@@ -6,6 +6,7 @@ import {
   seconds,
   WINDOW_MANAGER,
   type EasingFunction,
+  type GestureSwipeEvent,
   type OutputChangeEvent,
   type PointerMoveEvent,
   type ReadonlySignal,
@@ -76,6 +77,10 @@ const WINDOW_OPEN_EASING = cubicBezier(0.1, 1.1, 0.1, 1.1);
 const WINDOW_CLOSE_EASING = cubicBezier(0.3, -0.3, 0, 1);
 export const TILE_ANIMATION_DURATION = seconds(0.5);
 const WORKSPACE_SWITCH_ANIMATION_DURATION = seconds(0.5);
+const WORKSPACE_GESTURE_FINGERS = 3;
+const WORKSPACE_GESTURE_AXIS_LOCK_PX = 8;
+const WORKSPACE_GESTURE_THRESHOLD_RATIO = 0.22;
+const WORKSPACE_GESTURE_VELOCITY_THRESHOLD = 900;
 const TILE_DRAG_WORKSPACE_EDGE_PX = 80;
 const TILE_DRAG_WORKSPACE_SWITCH_INTERVAL_MS = 420;
 const TILE_GAP = 12;
@@ -118,6 +123,21 @@ interface WorkspaceWindowSnapshot {
   minimized: boolean;
   maximized: boolean;
 }
+
+interface WorkspaceGestureState {
+  monitor: string;
+  currentIndex: number;
+  direction: -1 | 1;
+  distance: number;
+  fromWorkspace: Workspace;
+  toWorkspace: Workspace | null;
+  fromOffsetY: number;
+  toOffsetY: number;
+  fromOpacity: number;
+  toOpacity: number;
+}
+
+type WorkspaceGestureMode = "workspace-switch" | "workspace-scroll";
 
 function hotReloadDebugEnabled(): boolean {
   const env = (globalThis as { process?: { env?: Record<string, string> } })
@@ -167,6 +187,9 @@ export class HybridWindowManager {
     workspace: Workspace;
     lastWorkspaceSwitchAt: number;
   } | null = null;
+  private workspaceGesture: WorkspaceGestureState | null = null;
+  private workspaceGestureMode: WorkspaceGestureMode | null = null;
+  private lastPointerPosition: PointerMoveEvent["position"] | null = null;
 
   public constructor(
     naturalRootRect: (rect: WaylandWindow) => ManagedWindowRect,
@@ -179,6 +202,52 @@ export class HybridWindowManager {
   public onPointerMove(event: PointerMoveEvent) {
     this.syncWorkspaces();
     this.currentMonitor = event.outputName ?? this.currentMonitor;
+    this.lastPointerPosition = event.position;
+    this.focusTiledWindowAtPointer(event.position, event.outputName);
+  }
+
+  public onGestureSwipe(event: GestureSwipeEvent) {
+    if (event.fingers !== WORKSPACE_GESTURE_FINGERS) {
+      return;
+    }
+
+    this.syncWorkspaces();
+    if (event.position) {
+      this.lastPointerPosition = event.position;
+    }
+
+    if (event.phase === "begin") {
+      this.workspaceGesture = null;
+      this.workspaceGestureMode = null;
+      this.currentMonitor = this.gestureMonitor(event);
+      return;
+    }
+
+    if (event.phase === "update") {
+      const mode = this.resolveWorkspaceGestureMode(event);
+      if (mode === "workspace-scroll") {
+        this.workspaceGesture = null;
+        this.updateWorkspaceScrollGesture(event);
+        return;
+      }
+      if (mode === "workspace-switch") {
+        this.updateWorkspaceGesture(event);
+      }
+      return;
+    }
+
+    if (this.workspaceGestureMode === "workspace-scroll") {
+      this.workspaceGestureMode = null;
+      this.workspaceGesture = null;
+      this.focusTiledWindowAtPointer(
+        event.position ?? this.lastPointerPosition,
+        event.outputName,
+      );
+      return;
+    }
+
+    this.workspaceGestureMode = null;
+    this.finishWorkspaceGesture(event);
   }
 
   public onOutputChange(event: OutputChangeEvent) {
@@ -701,6 +770,7 @@ export class HybridWindowManager {
   }
 
   public switchWorkspace(direction: -1 | 1) {
+    this.workspaceGesture = null;
     this.syncWorkspaces();
     const monitor = this.currentMonitor || WINDOW_MANAGER.output.list.at(0);
     if (!monitor) {
@@ -825,6 +895,218 @@ export class HybridWindowManager {
 
   private getActiveWorkspaceIndex(monitor: string): number {
     return this.activeWorkspaceByMonitor.get(monitor) ?? 1;
+  }
+
+  private gestureMonitor(event: GestureSwipeEvent): string {
+    const outputName = event.outputName;
+    if (outputName && WINDOW_MANAGER.output.list.includes(outputName)) {
+      return outputName;
+    }
+    return this.currentMonitor || WINDOW_MANAGER.output.list.at(0) || "";
+  }
+
+  private resolveWorkspaceGestureMode(
+    event: GestureSwipeEvent,
+  ): WorkspaceGestureMode | null {
+    if (this.workspaceGestureMode) {
+      return this.workspaceGestureMode;
+    }
+
+    const absX = Math.abs(event.totalX);
+    const absY = Math.abs(event.totalY);
+    if (Math.max(absX, absY) < WORKSPACE_GESTURE_AXIS_LOCK_PX) {
+      return null;
+    }
+
+    this.workspaceGestureMode =
+      absX > absY ? "workspace-scroll" : "workspace-switch";
+    return this.workspaceGestureMode;
+  }
+
+  private updateWorkspaceScrollGesture(event: GestureSwipeEvent) {
+    const monitor = this.gestureMonitor(event);
+    const workspace = this.workspaceForMonitor(monitor);
+    if (!workspace?.isTiled) {
+      return;
+    }
+
+    this.currentMonitor = monitor;
+    workspace.scrollBy(-event.deltaX);
+    this.focusTiledWindowAtPointer(
+      event.position ?? this.lastPointerPosition,
+      monitor,
+    );
+    this.raiseTiledWorkspaceFloatingWindows(workspace);
+  }
+
+  private updateWorkspaceGesture(event: GestureSwipeEvent) {
+    const monitor = this.gestureMonitor(event);
+    if (!monitor) {
+      return;
+    }
+
+    const distance = Math.max(1, this.workspaceTransitionDistance(monitor));
+    const rawOffsetY = clamp(event.totalY, -distance, distance);
+    if (Math.abs(rawOffsetY) < 1) {
+      return;
+    }
+
+    const direction: -1 | 1 = rawOffsetY < 0 ? 1 : -1;
+    const currentIndex = this.activeWorkspaceByMonitor.get(monitor) ?? 1;
+    const nextIndex = currentIndex + direction;
+    const fromWorkspace = this.ensureWorkspace(monitor, currentIndex);
+    const toWorkspace =
+      nextIndex >= 1 ? this.ensureWorkspace(monitor, nextIndex) : null;
+    const targetChanged =
+      this.workspaceGesture?.monitor !== monitor ||
+      this.workspaceGesture.currentIndex !== currentIndex ||
+      this.workspaceGesture.toWorkspace !== toWorkspace;
+
+    this.currentMonitor = monitor;
+
+    if (!toWorkspace) {
+      if (targetChanged) {
+        for (const workspace of this.workspaces.values()) {
+          if (workspace === fromWorkspace) {
+            continue;
+          }
+          workspace.setVisible(workspace.isActive());
+        }
+      }
+      const resistanceOffsetY = rawOffsetY * 0.25;
+      fromWorkspace.setWorkspaceGestureVisual(resistanceOffsetY, 1);
+      this.workspaceGesture = {
+        monitor,
+        currentIndex,
+        direction,
+        distance,
+        fromWorkspace,
+        toWorkspace: null,
+        fromOffsetY: resistanceOffsetY,
+        toOffsetY: direction * distance,
+        fromOpacity: 1,
+        toOpacity: 0,
+      };
+      return;
+    }
+
+    const progress = clamp(Math.abs(rawOffsetY) / distance, 0, 1);
+    const toOffsetY = direction * distance + rawOffsetY;
+    const fromOpacity = 1 - progress;
+    const toOpacity = progress;
+
+    if (targetChanged) {
+      for (const workspace of this.workspaces.values()) {
+        if (workspace === fromWorkspace || workspace === toWorkspace) {
+          continue;
+        }
+        workspace.setVisible(workspace.isActive());
+      }
+      toWorkspace.applyLayout();
+    }
+
+    fromWorkspace.setWorkspaceGestureVisual(rawOffsetY, fromOpacity);
+    toWorkspace.setWorkspaceGestureVisual(toOffsetY, toOpacity);
+    this.raiseTiledWorkspaceFloatingWindows(fromWorkspace);
+    this.raiseTiledWorkspaceFloatingWindows(toWorkspace);
+
+    this.workspaceGesture = {
+      monitor,
+      currentIndex,
+      direction,
+      distance,
+      fromWorkspace,
+      toWorkspace,
+      fromOffsetY: rawOffsetY,
+      toOffsetY,
+      fromOpacity,
+      toOpacity,
+    };
+  }
+
+  private finishWorkspaceGesture(event: GestureSwipeEvent) {
+    const gesture = this.workspaceGesture;
+    this.workspaceGesture = null;
+    if (!gesture) {
+      return;
+    }
+
+    const shouldCommit =
+      event.phase === "end" &&
+      gesture.toWorkspace !== null &&
+      (Math.abs(event.totalY) >=
+        gesture.distance * WORKSPACE_GESTURE_THRESHOLD_RATIO ||
+        Math.abs(event.velocityY) >= WORKSPACE_GESTURE_VELOCITY_THRESHOLD);
+
+    if (shouldCommit && gesture.toWorkspace) {
+      this.activeWorkspaceByMonitor.set(
+        gesture.monitor,
+        gesture.currentIndex + gesture.direction,
+      );
+      this.currentMonitor = gesture.monitor;
+      gesture.fromWorkspace.animateWorkspaceTransition({
+        fromOffsetY: gesture.fromOffsetY,
+        toOffsetY: -gesture.direction * gesture.distance,
+        fromOpacity: gesture.fromOpacity,
+        toOpacity: 0,
+        visibleAfter: false,
+      });
+      gesture.toWorkspace.animateWorkspaceTransition({
+        fromOffsetY: gesture.toOffsetY,
+        toOffsetY: 0,
+        fromOpacity: gesture.toOpacity,
+        toOpacity: 1,
+        visibleAfter: true,
+      });
+      gesture.toWorkspace.focusActiveWindow();
+      this.raiseTiledWorkspaceFloatingWindows(gesture.fromWorkspace);
+      this.raiseTiledWorkspaceFloatingWindows(gesture.toWorkspace);
+      return;
+    }
+
+    gesture.fromWorkspace.animateWorkspaceTransition({
+      fromOffsetY: gesture.fromOffsetY,
+      toOffsetY: 0,
+      fromOpacity: gesture.fromOpacity,
+      toOpacity: 1,
+      visibleAfter: true,
+    });
+    if (gesture.toWorkspace) {
+      gesture.toWorkspace.animateWorkspaceTransition({
+        fromOffsetY: gesture.toOffsetY,
+        toOffsetY: gesture.direction * gesture.distance,
+        fromOpacity: gesture.toOpacity,
+        toOpacity: 0,
+        visibleAfter: false,
+      });
+    }
+    this.raiseTiledWorkspaceFloatingWindows(gesture.fromWorkspace);
+  }
+
+  private focusTiledWindowAtPointer(
+    position: PointerMoveEvent["position"] | null | undefined,
+    monitorHint?: string,
+  ) {
+    if (!position) {
+      return;
+    }
+
+    const monitor =
+      monitorHint && WINDOW_MANAGER.output.list.includes(monitorHint)
+        ? monitorHint
+        : (this.outputNameAt(position.x, position.y) ?? this.currentMonitor);
+    const workspace = this.workspaceForMonitor(monitor);
+    if (!workspace?.isTiled || !workspace.isActive()) {
+      return;
+    }
+
+    const focused = workspace.focusWindowAtPoint(position.x, position.y);
+    if (!focused) {
+      return;
+    }
+
+    this.currentMonitor = monitor;
+    this.raiseTiledWorkspaceFloatingWindows(workspace);
   }
 
   private availableWorkspaceIndex(monitor: string, preferredIndex: number) {
@@ -1378,6 +1660,23 @@ export class Workspace {
     }
   }
 
+  public setWorkspaceGestureVisual(offsetY: number, opacity: number) {
+    this.visibilityAnimationToken += 1;
+    for (const window of this.windows) {
+      this.syncWindowVisibleOutputs(window);
+      cancelWorkspaceVisualAnimation(window);
+      if (window.state[WINDOW_STATE_TILE_DRAGGING]()) {
+        window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
+        window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(0);
+        window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(1);
+        continue;
+      }
+      window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
+      window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(offsetY);
+      window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(opacity);
+    }
+  }
+
   public animateWorkspaceTransition(options: {
     fromOffsetY: number;
     toOffsetY: number;
@@ -1705,6 +2004,44 @@ export class Workspace {
     this.applyLayout();
   }
 
+  public focusWindowAtPoint(x: number, y: number): WaylandWindow | undefined {
+    if (!this.isTiled) {
+      return undefined;
+    }
+
+    const window = this.tileableWindowAtPoint(x, y);
+    if (!window) {
+      return undefined;
+    }
+
+    if (this.activeWindowId === window.id && read(window.isFocused)) {
+      return undefined;
+    }
+
+    this.activeWindowId = window.id;
+    window.focus();
+    return window;
+  }
+
+  public scrollBy(deltaX: number): boolean {
+    if (!this.isTiled || deltaX === 0) {
+      return false;
+    }
+
+    const before = this.scrollOffset;
+    this.scrollOffset += deltaX;
+    this.clampScrollOffset(this.tileableWindows().length);
+    if (this.scrollOffset === before) {
+      return false;
+    }
+
+    this.applyLayout({
+      animate: false,
+      preserveMissingActive: true,
+    });
+    return true;
+  }
+
   public focusRelative(direction: -1 | 1) {
     const tileable = this.tileableWindows();
     if (tileable.length === 0) {
@@ -1817,6 +2154,21 @@ export class Workspace {
 
   private activeWindow(windows = this.windows): WaylandWindow | undefined {
     return windows.find((window) => window.id === this.activeWindowId);
+  }
+
+  private tileableWindowAtPoint(
+    x: number,
+    y: number,
+  ): WaylandWindow | undefined {
+    return this.tileableWindows().find((window) => {
+      const rect = window.state[WINDOW_STATE_RECT]();
+      const left = read(rect.x);
+      const top =
+        read(rect.y) + window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y]();
+      const right = left + read(rect.width);
+      const bottom = top + read(rect.height);
+      return x >= left && x < right && y >= top && y < bottom;
+    });
   }
 
   private tileInsertionIndexForPointer(
@@ -2274,7 +2626,7 @@ function scheduleWorkspaceVisualAnimation(
   duration: number,
 ): void {
   cancelWorkspaceVisualAnimation(window);
-  window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(toOffsetY);
+  window.state[WINDOW_STATE_WORKSPACE_OFFSET_Y].set(0);
   window.state[WINDOW_STATE_WORKSPACE_OPACITY].set(toOpacity);
 
   window.scheduleAnimation({
