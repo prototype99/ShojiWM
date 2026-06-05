@@ -142,11 +142,21 @@ interface WorkspaceWindowSnapshot {
  * (e.g. the bar) consumed over the IPC transport. Per-monitor so a per-output
  * bar can render just its own workspaces.
  */
+export interface WorkspacesViewWindow {
+  id: string;
+  appId?: string;
+  title: string;
+  focused: boolean;
+  /** epoch ms — most recent focus time for MRU ordering. 0 if never focused. */
+  lastFocusedAt: number;
+}
+
 export interface WorkspacesViewWorkspace {
   index: number;
   windowCount: number;
   isTiled: boolean;
   active: boolean;
+  windows: WorkspacesViewWindow[];
 }
 
 export interface WorkspacesViewMonitor {
@@ -260,6 +270,9 @@ export class HybridWindowManager {
   private readonly activeWorkspaceByMonitor = new Map<string, number>();
   private readonly windowStack = createWindowStack();
   private readonly naturalRootRect: (rect: WaylandWindow) => ManagedWindowRect;
+  // Tracks MRU focus time per window id so the dock can pick "the most recent
+  // window of an app" deterministically. Updated by recordFocus().
+  private readonly lastFocusedAt = new Map<string, number>();
   private currentMonitor: string;
   private isGrabbing = false;
   private tileDrag: {
@@ -846,16 +859,31 @@ export class HybridWindowManager {
 
   public onWindowActivateRequest(event: WindowActivateRequestEvent) {
     event.window.state[WINDOW_STATE_MINIMIZED].set(false);
-    event.window.focus();
     const workspace = this.findWorkspaceForWindow(event.window);
     if (workspace) {
-      this.activateWorkspace(workspace.monitor, workspace.index);
+      // 別ワークスペースのウィンドウなら、キーボード/ジェスチャと同じ
+      // スライド/フェードのアニメーションで切り替える(同一なら no-op)。
+      this.switchWorkspaceTo(workspace.monitor, workspace.index);
     }
+    // 切替後に対象ウィンドウへフォーカス(switchWorkspaceTo の focusActiveWindow を上書き)。
+    event.window.focus();
   }
 
   public toggleCurrentWorkspaceTiling() {
     withManagedWindowOnlySSDRebuildSuppressed(() => {
       const workspace = this.getCurrentWorkspace();
+      if (!workspace) {
+        return;
+      }
+      workspace.setTiled(!workspace.isTiled);
+      this.raiseTiledWorkspaceFloatingWindows(workspace);
+    });
+  }
+
+  public toggleWorkspaceTilingForMonitor(monitor: string) {
+    withManagedWindowOnlySSDRebuildSuppressed(() => {
+      this.syncWorkspaces();
+      const workspace = this.workspaceForMonitor(monitor);
       if (!workspace) {
         return;
       }
@@ -975,11 +1003,21 @@ export class HybridWindowManager {
         this.activeWorkspaceByMonitor.get(workspace.monitor) ===
         workspace.index;
       const list = byMonitor.get(workspace.monitor) ?? [];
+      const windows: WorkspacesViewWindow[] = workspace.listWindows().map(
+        (window) => ({
+          id: window.id,
+          appId: window.appId(),
+          title: window.title(),
+          focused: window.isFocused(),
+          lastFocusedAt: this.lastFocusedAt.get(window.id) ?? 0,
+        }),
+      );
       list.push({
         index: workspace.index,
         windowCount: workspace.windowCount(),
         isTiled: workspace.isTiled,
         active,
+        windows,
       });
       byMonitor.set(workspace.monitor, list);
     }
@@ -999,6 +1037,7 @@ export class HybridWindowManager {
             windowCount: 0,
             isTiled: false,
             active: true,
+            windows: [],
           });
         }
         workspaces.sort((a, b) => a.index - b.index);
@@ -1007,6 +1046,46 @@ export class HybridWindowManager {
     );
 
     return { currentMonitor: this.currentMonitor, monitors };
+  }
+
+  /**
+   * Update MRU stamp for `windowId`. The dock uses this to pick the "most
+   * recently used" window per app for left-click focus.
+   */
+  public recordFocus(windowId: string) {
+    this.lastFocusedAt.set(windowId, Date.now());
+  }
+
+  /**
+   * Find a managed window by id by scanning every workspace. Used by the
+   * `windows.activate` IPC handler to bridge bar clicks to focus + workspace
+   * switch.
+   */
+  public findWindowById(windowId: string): WaylandWindow | undefined {
+    for (const workspace of this.workspaces.values()) {
+      const found = workspace.findWindowById(windowId);
+      if (found) {
+        return found;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Activate window by id with the same animation as a real activate request
+   * (focus + workspace switch). Returns true if the window existed.
+   */
+  public activateWindowById(windowId: string): boolean {
+    const window = this.findWindowById(windowId);
+    if (!window) {
+      return false;
+    }
+    this.onWindowActivateRequest({
+      window,
+      source: "api",
+      timestamp: Date.now(),
+    });
+    return true;
   }
 
   /**
@@ -1360,16 +1439,6 @@ export class HybridWindowManager {
       index += 1;
     }
     return index;
-  }
-
-  private activateWorkspace(monitor: string, index: number) {
-    this.activeWorkspaceByMonitor.set(monitor, index);
-    const workspace = this.ensureWorkspace(monitor, index);
-    this.currentMonitor = monitor;
-    this.syncWorkspaceVisibility();
-    workspace.applyLayout();
-    workspace.focusActiveWindow();
-    this.raiseTiledWorkspaceFloatingWindows(workspace);
   }
 
   private syncWorkspaceVisibility() {
@@ -1843,6 +1912,18 @@ export class Workspace {
 
   public windowCount(): number {
     return this.windows.length;
+  }
+
+  /**
+   * Snapshot of every window currently in this workspace. The returned array
+   * is a copy; mutating it is safe and won't affect the workspace state.
+   */
+  public listWindows(): WaylandWindow[] {
+    return this.windows.slice();
+  }
+
+  public findWindowById(windowId: string): WaylandWindow | undefined {
+    return this.windows.find((window) => window.id === windowId);
   }
 
   public isRestoringWindow(windowId: string): boolean {

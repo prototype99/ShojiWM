@@ -59,10 +59,13 @@ WINDOW_MANAGER.onEnable((event) => {
 
 // ---------------------------------------------------------------------------
 // External IPC: expose the workspace layout to clients such as the bar.
-//   workspaces.get      -> WorkspacesView                     (request/response)
-//   workspaces.switch   { direction: -1 | 1 }                 (command)
-//   workspaces.activate { monitor: string, index: number }   (command)
-//   workspaces.changed  -> WorkspacesView                     (broadcast)
+//   workspaces.get           -> WorkspacesView                     (request/response)
+//   workspaces.switch        { direction: -1 | 1 }                 (command)
+//   workspaces.activate      { monitor: string, index: number }    (command)
+//   workspaces.toggleTiling  { monitor?: string }                  (command)
+//   workspaces.changed       -> WorkspacesView                     (broadcast)
+//   windows.activate         { windowId: string }                  (command)
+//   dock.proximity           { monitor: string, inside: bool }    (broadcast)
 // ---------------------------------------------------------------------------
 const WORKSPACE_IPC = createIpcServer();
 let lastWorkspacesJson = "";
@@ -105,6 +108,63 @@ WORKSPACE_IPC.handle("workspaces.activate", (params) => {
     scheduleWorkspaceBroadcast();
   }
 });
+WORKSPACE_IPC.handle("workspaces.toggleTiling", (params) => {
+  const monitor = (params as { monitor?: string } | undefined)?.monitor;
+  if (monitor) {
+    HYBRID_WINDOW_MANAGER.toggleWorkspaceTilingForMonitor(monitor);
+  } else {
+    HYBRID_WINDOW_MANAGER.toggleCurrentWorkspaceTiling();
+  }
+  scheduleWorkspaceBroadcast();
+});
+WORKSPACE_IPC.handle("windows.activate", (params) => {
+  const windowId = (params as { windowId?: string } | undefined)?.windowId;
+  if (typeof windowId === "string") {
+    HYBRID_WINDOW_MANAGER.activateWindowById(windowId);
+    scheduleWorkspaceBroadcast();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Dock proximity: watch the pointer and broadcast enter/leave for the bottom
+// strip of each monitor. The bar uses this in place of a layer-shell trigger
+// surface (which would otherwise capture clicks meant for the windows below).
+// ---------------------------------------------------------------------------
+// Dock の見える高さ(~80px) + 余裕(~40px)。ポインタが dock 本体に乗っている間も
+// "inside" になるよう、本体の最上端より十分上に境界を取る。
+const DOCK_PROXIMITY_ZONE_PX = 120;
+const dockProximityByMonitor = new Map<string, boolean>();
+
+function isPointerInsideDockZone(
+  monitor: string,
+  pointerX: number,
+  pointerY: number,
+): boolean {
+  const output = WINDOW_MANAGER.output.get(monitor);
+  if (!output || !output.resolution) {
+    return false;
+  }
+  const width = output.resolution.width / output.scale;
+  const height = output.resolution.height / output.scale;
+  const left = output.position.x;
+  const top = output.position.y;
+  const right = left + width;
+  const bottom = top + height;
+  return (
+    pointerX >= left &&
+    pointerX < right &&
+    pointerY >= bottom - DOCK_PROXIMITY_ZONE_PX &&
+    pointerY < bottom
+  );
+}
+
+function updateDockProximity(monitor: string, inside: boolean) {
+  if (dockProximityByMonitor.get(monitor) === inside) {
+    return;
+  }
+  dockProximityByMonitor.set(monitor, inside);
+  WORKSPACE_IPC.broadcast("dock.proximity", { monitor, inside });
+}
 
 WINDOW_MANAGER.onDisable(() => {
   WORKSPACE_IPC.close();
@@ -267,10 +327,25 @@ WINDOW_MANAGER.event.onClose((window) => {
 
 WINDOW_MANAGER.event.onFocus((window, focused) => {
   HYBRID_WINDOW_MANAGER.onFocus(window, focused);
+  if (focused) {
+    HYBRID_WINDOW_MANAGER.recordFocus(window.id);
+    scheduleWorkspaceBroadcast();
+  }
 });
 
 WINDOW_MANAGER.event.onPointerMoveAsync((event) => {
   HYBRID_WINDOW_MANAGER.onPointerMove(event);
+
+  // Dock proximity: update only the monitor the pointer is currently on,
+  // and emit "leave" for other monitors that were previously inside.
+  const pointerX = event.position.x;
+  const pointerY = event.position.y;
+  for (const monitor of WINDOW_MANAGER.output.list) {
+    const inside =
+      monitor === event.outputName &&
+      isPointerInsideDockZone(monitor, pointerX, pointerY);
+    updateDockProximity(monitor, inside);
+  }
 });
 
 WINDOW_MANAGER.event.onGestureSwipeAsync((event) => {
