@@ -181,7 +181,7 @@ WINDOW_MANAGER.input.configure((input, _) => {
       naturalScroll: true,
       scrollMethod: "twoFinger",
       disableWhileTyping: true,
-      scrollFactor: 0.5,
+      scrollFactor: 0.3,
     },
     pointer: {
       pointerAccel: 0.0,
