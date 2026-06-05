@@ -8,6 +8,7 @@ interface RuntimeHooks {
   markRuntimeDirty(): void;
   markWindowDirty(windowId: string): void;
   markLayerDirty(layerId: string): void;
+  wakeRuntime(): void;
 }
 
 let hooks: RuntimeHooks | null = null;
@@ -132,6 +133,7 @@ interface ActiveSSDRebuildSuppression {
 
 let nextSuppressionId = 1;
 const ssdRebuildSuppressionStack: ActiveSSDRebuildSuppression[] = [];
+let managedWindowOnlyFastPathInvalidated = false;
 
 function debugSSD(message: string, details: Record<string, unknown> = {}): void {
   const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
@@ -436,6 +438,10 @@ export function markLayerDirty(layerId: string): void {
   hooks?.markLayerDirty(layerId);
 }
 
+export function wakeRuntime(): void {
+  hooks?.wakeRuntime();
+}
+
 export function enterWindowDependencyScope(windowId: string): void {
   clearWindowDependencies(windowId);
   const ownerKey = ownerKeyForWindow(windowId);
@@ -537,6 +543,23 @@ export function takeManagedWindowOnlyDirty(windowId: string): boolean {
   }
   dirtyManagedWindowIds.delete(windowId);
   return true;
+}
+
+export function markManagedWindowDirty(windowId: string): void {
+  dirtyManagedWindowIds.add(windowId);
+  wakeRuntime();
+}
+
+export function managedWindowOnlyDirtyIds(): string[] {
+  return Array.from(dirtyManagedWindowIds).filter((windowId) =>
+    isManagedWindowOnlyDirty(windowId),
+  );
+}
+
+export function consumeManagedWindowOnlyFastPathInvalidated(): boolean {
+  const invalidated = managedWindowOnlyFastPathInvalidated;
+  managedWindowOnlyFastPathInvalidated = false;
+  return invalidated;
 }
 
 export function isManagedWindowOnlyDirty(windowId: string): boolean {
@@ -717,12 +740,15 @@ export function trackSignalWrite(signal: object): void {
     !hasWindowNodeDeps &&
     !hasLayerNodeDeps
   ) {
-    if (
-      suppression?.allowManagedWindowOnly &&
-      handleSSDRebuildSuppressionViolation("runtime", "unknown-signal") ===
-        "suppress"
-    ) {
-      return;
+    if (suppression?.allowManagedWindowOnly) {
+      const violationResult = handleSSDRebuildSuppressionViolation(
+        "runtime",
+        "unknown-signal",
+      );
+      if (violationResult === "suppress") {
+        return;
+      }
+      managedWindowOnlyFastPathInvalidated = true;
     }
     debugSSD("runtime-track-write-unknown-fallback", {
       hasSuppression: suppression !== undefined,

@@ -2,6 +2,8 @@ import {
   createWindowStack,
   createWindowState,
   cubicBezier,
+  createManagedPoll,
+  markManagedWindowDirty,
   read,
   seconds,
   WINDOW_MANAGER,
@@ -9,6 +11,7 @@ import {
   type GestureSwipeEvent,
   type OutputChangeEvent,
   type PointerMoveEvent,
+  type PollHandle,
   type ReadonlySignal,
   type WaylandWindow,
   type WindowActivateRequestEvent,
@@ -81,6 +84,11 @@ const WORKSPACE_GESTURE_FINGERS = 3;
 const WORKSPACE_GESTURE_AXIS_LOCK_PX = 8;
 const WORKSPACE_GESTURE_THRESHOLD_RATIO = 0.22;
 const WORKSPACE_GESTURE_VELOCITY_THRESHOLD = 900;
+const WORKSPACE_KINETIC_SCROLL_MIN_VELOCITY = 120;
+const WORKSPACE_KINETIC_SCROLL_MAX_VELOCITY = 5000;
+const WORKSPACE_KINETIC_SCROLL_STOP_VELOCITY = 18;
+const WORKSPACE_KINETIC_SCROLL_TIME_CONSTANT_MS = 360;
+const WORKSPACE_KINETIC_SCROLL_FALLBACK_REFRESH_RATE = 120;
 const TILE_DRAG_WORKSPACE_EDGE_PX = 80;
 const TILE_DRAG_WORKSPACE_SWITCH_INTERVAL_MS = 420;
 const TILE_GAP = 12;
@@ -91,6 +99,10 @@ const MANAGED_WINDOW_ONLY_REBUILD_SUPPRESSION = {
   allowManagedWindowOnly: true,
   onViolation: "fallback-last",
 } as const;
+const STRICT_MANAGED_WINDOW_ONLY_REBUILD_SUPPRESSION = {
+  allowManagedWindowOnly: true,
+  onViolation: "fallback",
+} as const;
 const MANAGED_WINDOW_ONLY_ANIMATION = {
   suppressSSDRebuild: true,
 } as const;
@@ -98,6 +110,7 @@ interface LayoutOptions {
   suppressSSDRebuild?: boolean;
   animate?: boolean;
   preserveMissingActive?: boolean;
+  cancelRectAnimations?: boolean;
 }
 
 interface HybridWindowManagerSnapshot {
@@ -139,6 +152,42 @@ interface WorkspaceGestureState {
 
 type WorkspaceGestureMode = "workspace-switch" | "workspace-scroll";
 
+export interface WorkspaceGestureSpeedConfig {
+  /**
+   * Horizontal three-finger swipe movement multiplier for scrolling inside a
+   * tiled workspace.
+   */
+  workspaceScrollFactor?: number;
+  /**
+   * Horizontal release velocity multiplier for kinetic workspace scrolling.
+   * Defaults to workspaceScrollFactor when omitted.
+   */
+  workspaceScrollKineticFactor?: number;
+  /**
+   * Vertical three-finger swipe movement multiplier for workspace switching.
+   */
+  workspaceSwitchFactor?: number;
+  /**
+   * Vertical release velocity multiplier for deciding whether to commit a
+   * workspace switch. Defaults to workspaceSwitchFactor when omitted.
+   */
+  workspaceSwitchVelocityFactor?: number;
+}
+
+interface ResolvedWorkspaceGestureSpeedConfig {
+  workspaceScrollFactor: number;
+  workspaceScrollKineticFactor: number;
+  workspaceSwitchFactor: number;
+  workspaceSwitchVelocityFactor: number;
+}
+
+const DEFAULT_WORKSPACE_GESTURE_SPEED: ResolvedWorkspaceGestureSpeedConfig = {
+  workspaceScrollFactor: 1,
+  workspaceScrollKineticFactor: 1,
+  workspaceSwitchFactor: 1,
+  workspaceSwitchVelocityFactor: 1,
+};
+
 function hotReloadDebugEnabled(): boolean {
   const env = (globalThis as { process?: { env?: Record<string, string> } })
     .process?.env;
@@ -154,6 +203,19 @@ function hotReloadDebug(
     return;
   }
   console.info(`hot-reload ${message}`, JSON.stringify(details));
+}
+
+function sanitizeGestureSpeedFactor(
+  value: number | undefined,
+  fallback: number,
+): number {
+  if (value === undefined) {
+    return fallback;
+  }
+  if (!Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+  return value;
 }
 
 const OPEN_ANIMATION_CHANNEL = "window.open";
@@ -189,6 +251,8 @@ export class HybridWindowManager {
   } | null = null;
   private workspaceGesture: WorkspaceGestureState | null = null;
   private workspaceGestureMode: WorkspaceGestureMode | null = null;
+  private workspaceScrollGestureRectAnimationsCancelled = false;
+  private workspaceGestureSpeed = { ...DEFAULT_WORKSPACE_GESTURE_SPEED };
   private lastPointerPosition: PointerMoveEvent["position"] | null = null;
 
   public constructor(
@@ -197,6 +261,31 @@ export class HybridWindowManager {
     this.currentMonitor = "";
     this.naturalRootRect = naturalRootRect;
     this.syncWorkspaces();
+  }
+
+  public configureWorkspaceGestureSpeed(
+    config: WorkspaceGestureSpeedConfig,
+  ): void {
+    const workspaceScrollFactor = sanitizeGestureSpeedFactor(
+      config.workspaceScrollFactor,
+      DEFAULT_WORKSPACE_GESTURE_SPEED.workspaceScrollFactor,
+    );
+    const workspaceSwitchFactor = sanitizeGestureSpeedFactor(
+      config.workspaceSwitchFactor,
+      DEFAULT_WORKSPACE_GESTURE_SPEED.workspaceSwitchFactor,
+    );
+    this.workspaceGestureSpeed = {
+      workspaceScrollFactor,
+      workspaceScrollKineticFactor: sanitizeGestureSpeedFactor(
+        config.workspaceScrollKineticFactor,
+        workspaceScrollFactor,
+      ),
+      workspaceSwitchFactor,
+      workspaceSwitchVelocityFactor: sanitizeGestureSpeedFactor(
+        config.workspaceSwitchVelocityFactor,
+        workspaceSwitchFactor,
+      ),
+    };
   }
 
   public onPointerMove(event: PointerMoveEvent) {
@@ -219,6 +308,7 @@ export class HybridWindowManager {
     if (event.phase === "begin") {
       this.workspaceGesture = null;
       this.workspaceGestureMode = null;
+      this.workspaceScrollGestureRectAnimationsCancelled = false;
       this.currentMonitor = this.gestureMonitor(event);
       return;
     }
@@ -239,6 +329,8 @@ export class HybridWindowManager {
     if (this.workspaceGestureMode === "workspace-scroll") {
       this.workspaceGestureMode = null;
       this.workspaceGesture = null;
+      this.finishWorkspaceScrollGesture(event);
+      this.workspaceScrollGestureRectAnimationsCancelled = false;
       this.focusTiledWindowAtPointer(
         event.position ?? this.lastPointerPosition,
         event.outputName,
@@ -247,6 +339,7 @@ export class HybridWindowManager {
     }
 
     this.workspaceGestureMode = null;
+    this.workspaceScrollGestureRectAnimationsCancelled = false;
     this.finishWorkspaceGesture(event);
   }
 
@@ -913,13 +1006,19 @@ export class HybridWindowManager {
     }
 
     const absX = Math.abs(event.totalX);
-    const absY = Math.abs(event.totalY);
-    if (Math.max(absX, absY) < WORKSPACE_GESTURE_AXIS_LOCK_PX) {
+    const absY = Math.abs(
+      event.totalY * this.workspaceGestureSpeed.workspaceSwitchFactor,
+    );
+    const scaledAbsX = absX * this.workspaceGestureSpeed.workspaceScrollFactor;
+    if (Math.max(scaledAbsX, absY) < WORKSPACE_GESTURE_AXIS_LOCK_PX) {
       return null;
     }
 
     this.workspaceGestureMode =
-      absX > absY ? "workspace-scroll" : "workspace-switch";
+      scaledAbsX > absY ? "workspace-scroll" : "workspace-switch";
+    if (this.workspaceGestureMode === "workspace-scroll") {
+      this.workspaceScrollGestureRectAnimationsCancelled = false;
+    }
     return this.workspaceGestureMode;
   }
 
@@ -931,12 +1030,47 @@ export class HybridWindowManager {
     }
 
     this.currentMonitor = monitor;
-    workspace.scrollBy(-event.deltaX);
+    workspace.stopKineticScroll();
+    const deltaX =
+      -event.deltaX * this.workspaceGestureSpeed.workspaceScrollFactor;
+    const shouldCancelRectAnimations =
+      !this.workspaceScrollGestureRectAnimationsCancelled;
+    const scrolled = workspace.scrollBy(deltaX, {
+      stopKinetic: false,
+      cancelRectAnimations: shouldCancelRectAnimations,
+    });
+    if (scrolled && shouldCancelRectAnimations) {
+      this.workspaceScrollGestureRectAnimationsCancelled = true;
+    }
     this.focusTiledWindowAtPointer(
       event.position ?? this.lastPointerPosition,
       monitor,
     );
     this.raiseTiledWorkspaceFloatingWindows(workspace);
+  }
+
+  private finishWorkspaceScrollGesture(event: GestureSwipeEvent) {
+    if (event.phase !== "end") {
+      return;
+    }
+
+    const monitor = this.gestureMonitor(event);
+    const workspace = this.workspaceForMonitor(monitor);
+    if (!workspace?.isTiled) {
+      return;
+    }
+
+    workspace.startKineticScroll(
+      -event.velocityX *
+        this.workspaceGestureSpeed.workspaceScrollKineticFactor,
+      () => {
+        this.focusTiledWindowAtPointer(
+          event.position ?? this.lastPointerPosition,
+          monitor,
+        );
+        this.raiseTiledWorkspaceFloatingWindows(workspace);
+      },
+    );
   }
 
   private updateWorkspaceGesture(event: GestureSwipeEvent) {
@@ -946,7 +1080,9 @@ export class HybridWindowManager {
     }
 
     const distance = Math.max(1, this.workspaceTransitionDistance(monitor));
-    const rawOffsetY = clamp(event.totalY, -distance, distance);
+    const scaledTotalY =
+      event.totalY * this.workspaceGestureSpeed.workspaceSwitchFactor;
+    const rawOffsetY = clamp(scaledTotalY, -distance, distance);
     if (Math.abs(rawOffsetY) < 1) {
       return;
     }
@@ -1034,9 +1170,14 @@ export class HybridWindowManager {
     const shouldCommit =
       event.phase === "end" &&
       gesture.toWorkspace !== null &&
-      (Math.abs(event.totalY) >=
+      (Math.abs(
+        event.totalY * this.workspaceGestureSpeed.workspaceSwitchFactor,
+      ) >=
         gesture.distance * WORKSPACE_GESTURE_THRESHOLD_RATIO ||
-        Math.abs(event.velocityY) >= WORKSPACE_GESTURE_VELOCITY_THRESHOLD);
+        Math.abs(
+          event.velocityY *
+            this.workspaceGestureSpeed.workspaceSwitchVelocityFactor,
+        ) >= WORKSPACE_GESTURE_VELOCITY_THRESHOLD);
 
     if (shouldCommit && gesture.toWorkspace) {
       this.activeWorkspaceByMonitor.set(
@@ -1424,6 +1565,8 @@ export class Workspace {
   private visibilityAnimationToken = 0;
   private draggingWindowId: string | null = null;
   private scrollOffset = 0;
+  private kineticScrollPoll: PollHandle | null = null;
+  private kineticScrollToken = 0;
   public monitor: string;
   public isTiled = false;
 
@@ -1735,6 +1878,8 @@ export class Workspace {
       return;
     }
 
+    this.stopKineticScroll();
+
     const focusedWindow = this.focusedWindow();
     const focusedTileableWindow =
       focusedWindow &&
@@ -1860,7 +2005,9 @@ export class Workspace {
             animationOptions,
           );
         } else {
-          stopRectAnimation(window, WINDOW_STATE_RECT);
+          if (options.cancelRectAnimations !== false) {
+            stopRectAnimation(window, WINDOW_STATE_RECT);
+          }
           window.state[WINDOW_STATE_RECT].set(rect);
         }
       }
@@ -1879,7 +2026,6 @@ export class Workspace {
       floatingWindowIds: this.floatingWindows().map((window) => window.id),
       appliedRects,
     });
-
     this.applyFloatingLayout(animationOptions, animate);
   }
 
@@ -2018,28 +2164,167 @@ export class Workspace {
       return undefined;
     }
 
+    const previousActiveWindowId = this.activeWindowId;
     this.activeWindowId = window.id;
     window.focus();
+    if (previousActiveWindowId !== window.id) {
+      this.reapplyStaticManagedLayout();
+    }
     return window;
   }
 
-  public scrollBy(deltaX: number): boolean {
+  private reapplyStaticManagedLayout(): void {
+    if (!this.isTiled) {
+      return;
+    }
+
+    const tileable = this.tileableWindows();
+    if (tileable.length === 0) {
+      return;
+    }
+
+    withManagedWindowOnlySSDRebuildSuppressed(
+      () => {
+        this.applyLayout({
+          animate: false,
+          preserveMissingActive: true,
+          cancelRectAnimations: false,
+        });
+      },
+      { strict: true },
+    );
+    for (const window of tileable) {
+      markManagedWindowDirty(window.id);
+    }
+  }
+
+  public scrollBy(
+    deltaX: number,
+    options: {
+      stopKinetic?: boolean;
+      suppressSSDRebuild?: boolean;
+      cancelRectAnimations?: boolean;
+    } = {},
+  ): boolean {
     if (!this.isTiled || deltaX === 0) {
       return false;
+    }
+    if (options.stopKinetic !== false) {
+      this.stopKineticScroll();
     }
 
     const before = this.scrollOffset;
     this.scrollOffset += deltaX;
-    this.clampScrollOffset(this.tileableWindows().length);
+    const tileable = this.tileableWindows();
+    this.clampScrollOffset(tileable.length);
     if (this.scrollOffset === before) {
       return false;
     }
 
-    this.applyLayout({
-      animate: false,
-      preserveMissingActive: true,
-    });
+    const cancelRectAnimations = options.cancelRectAnimations ?? true;
+    const apply = () =>
+      this.applyLayout({
+        animate: false,
+        preserveMissingActive: true,
+        cancelRectAnimations,
+      });
+    if (options.suppressSSDRebuild === false) {
+      apply();
+    } else {
+      withManagedWindowOnlySSDRebuildSuppressed(apply, { strict: true });
+    }
+    for (const window of tileable) {
+      markManagedWindowDirty(window.id);
+    }
     return true;
+  }
+
+  public startKineticScroll(
+    initialVelocityX: number,
+    onFrame?: () => void,
+  ): void {
+    this.stopKineticScroll();
+    if (
+      !this.isTiled ||
+      Math.abs(initialVelocityX) < WORKSPACE_KINETIC_SCROLL_MIN_VELOCITY
+    ) {
+      return;
+    }
+
+    let velocityX = clamp(
+      initialVelocityX,
+      -WORKSPACE_KINETIC_SCROLL_MAX_VELOCITY,
+      WORKSPACE_KINETIC_SCROLL_MAX_VELOCITY,
+    );
+    let lastTime: number | null = null;
+    const token = this.kineticScrollToken + 1;
+    this.kineticScrollToken = token;
+    const intervalMs = this.kineticScrollIntervalMs();
+    let firstStep = true;
+
+    const step = (dtMs: number): boolean => {
+      const deltaX = (velocityX * dtMs) / 1000;
+      const scrolled = this.scrollBy(deltaX, {
+        stopKinetic: false,
+        cancelRectAnimations: firstStep,
+      });
+      firstStep = false;
+      if (!scrolled) {
+        this.stopKineticScroll();
+        return false;
+      }
+
+      onFrame?.();
+
+      velocityX *= Math.exp(-dtMs / WORKSPACE_KINETIC_SCROLL_TIME_CONSTANT_MS);
+      if (Math.abs(velocityX) < WORKSPACE_KINETIC_SCROLL_STOP_VELOCITY) {
+        this.stopKineticScroll();
+        return false;
+      }
+
+      return true;
+    };
+
+    if (!step(intervalMs)) {
+      return;
+    }
+
+    this.kineticScrollPoll = createManagedPoll(
+      intervalMs,
+      (handle) => {
+        if (this.kineticScrollToken !== token || !this.isTiled) {
+          handle.cancel();
+          if (this.kineticScrollPoll === handle) {
+            this.kineticScrollPoll = null;
+          }
+          return;
+        }
+
+        const now = handle.nowMs;
+        const dtMs = Math.max(
+          1,
+          lastTime === null ? intervalMs : now - lastTime,
+        );
+        lastTime = now;
+        step(dtMs);
+      },
+      "none",
+    );
+  }
+
+  public stopKineticScroll(): void {
+    this.kineticScrollToken += 1;
+    if (this.kineticScrollPoll) {
+      this.kineticScrollPoll.cancel();
+      this.kineticScrollPoll = null;
+    }
+  }
+
+  private kineticScrollIntervalMs(): number {
+    const refreshRate =
+      WINDOW_MANAGER.output.current[this.monitor]?.resolution?.refreshRate ??
+      WORKSPACE_KINETIC_SCROLL_FALLBACK_REFRESH_RATE;
+    return 1000 / Math.max(1, refreshRate);
   }
 
   public focusRelative(direction: -1 | 1) {
@@ -2121,7 +2406,7 @@ export class Workspace {
     );
   }
 
-  private canSuppressLayoutSSDRebuild(tileable: WaylandWindow[]): boolean {
+  private canSuppressLayoutSSDRebuild(_tileable: WaylandWindow[]): boolean {
     // Opening windows may still be building decoration structure, labels,
     // icons, and shader inputs. SSD rebuild suppression is global, so using
     // it for existing windows' layout animation would also hide those
@@ -2338,6 +2623,8 @@ export class Workspace {
   }
 
   private scrollToWindow(window: WaylandWindow) {
+    this.stopKineticScroll();
+
     const tileable = this.tileableWindows();
     const index = tileable.findIndex((current) => current.id === window.id);
     if (index < 0) {
@@ -2564,9 +2851,14 @@ function insetRect(
   };
 }
 
-function withManagedWindowOnlySSDRebuildSuppressed<T>(callback: () => T): T {
+function withManagedWindowOnlySSDRebuildSuppressed<T>(
+  callback: () => T,
+  options: { strict?: boolean } = {},
+): T {
   return WINDOW_MANAGER.runtime.withSSDRebuildSuppressed(
-    MANAGED_WINDOW_ONLY_REBUILD_SUPPRESSION,
+    options.strict
+      ? STRICT_MANAGED_WINDOW_ONLY_REBUILD_SUPPRESSION
+      : MANAGED_WINDOW_ONLY_REBUILD_SUPPRESSION,
     callback,
   );
 }

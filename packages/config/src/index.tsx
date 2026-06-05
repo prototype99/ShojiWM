@@ -190,6 +190,13 @@ WINDOW_MANAGER.input.configure((input, _) => {
   };
 });
 
+HYBRID_WINDOW_MANAGER.configureWorkspaceGestureSpeed({
+  workspaceScrollFactor: 1.5,
+  workspaceScrollKineticFactor: 1,
+  workspaceSwitchFactor: 1,
+  workspaceSwitchVelocityFactor: 1,
+});
+
 WINDOW_MANAGER.effect.background_effect = compileEffect({
   input: backdropSource(),
   invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },

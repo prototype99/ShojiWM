@@ -40,6 +40,7 @@ import {
   createCompositionEvaluationCache,
   type WindowCompositionContext,
   createManagedPoll,
+  consumeManagedWindowOnlyFastPathInvalidated,
   dropLayerDependencies,
   dropWindowDependencies,
   dropWindowState,
@@ -50,6 +51,7 @@ import {
   installRuntimeHooks,
   enterWindowDependencyScope,
   invokeKeyBinding,
+  managedWindowOnlyDirtyIds,
   takePendingDebugConfig,
   takePendingDisplayConfig,
   takePendingKeyBindingConfig,
@@ -969,6 +971,9 @@ async function main() {
     markLayerDirty(layerId) {
       if (statsEnabled) stats.markLayerDirty++;
       dirtyLayerIds.add(layerId);
+      ensureImmediateDirtyPoll();
+    },
+    wakeRuntime() {
       ensureImmediateDirtyPoll();
     },
   });
@@ -2513,13 +2518,24 @@ function collectRuntimeMutationState(): {
       nextPollInMs === undefined ? delay : Math.min(nextPollInMs, delay);
   }
 
-  const nextDirtyWindowIds = Array.from(dirtyWindowIds);
+  const nextDirtyWindowIds = Array.from(
+    new Set([...dirtyWindowIds, ...managedWindowOnlyDirtyIds()]),
+  );
   dirtyWindowIds.clear();
+  const managedOnlyFastPathInvalidated =
+    consumeManagedWindowOnlyFastPathInvalidated();
+  if (managedOnlyFastPathInvalidated) {
+    for (const windowId of nextDirtyWindowIds) {
+      takeManagedWindowOnlyDirty(windowId);
+    }
+  }
   const nextDirtyLayerIds = Array.from(dirtyLayerIds);
   dirtyLayerIds.clear();
-  const dirtyManagedWindowIds = nextDirtyWindowIds.filter((windowId) =>
-    isManagedWindowOnlyDirty(windowId),
-  );
+  const dirtyManagedWindowIds = managedOnlyFastPathInvalidated
+    ? []
+    : nextDirtyWindowIds.filter((windowId) =>
+        isManagedWindowOnlyDirty(windowId),
+      );
   const dirtyWindowNodeIds = Object.fromEntries(
     nextDirtyWindowIds
       .map((windowId) => [windowId, takeDirtyWindowNodeIds(windowId)] as const)

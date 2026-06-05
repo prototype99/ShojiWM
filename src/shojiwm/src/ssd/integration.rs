@@ -1625,7 +1625,10 @@ impl ShojiWM {
     }
 
     pub fn cancel_managed_window_animation(&mut self, window_id: &str, channel: Option<&str>) {
-        if managed_animation_debug_enabled() || hot_reload_debug_enabled() {
+        let should_log_cancel = managed_animation_debug_enabled()
+            || hot_reload_debug_enabled()
+            || managed_rect_debug_enabled();
+        if should_log_cancel {
             info!(
                 window_id,
                 channel = ?channel,
@@ -1654,7 +1657,7 @@ impl ShojiWM {
         if !active {
             self.reset_managed_window_animation_state_to_static(window_id);
         }
-        if hot_reload_debug_enabled() {
+        if should_log_cancel {
             info!(
                 window_id,
                 channel = ?channel,
@@ -1664,7 +1667,7 @@ impl ShojiWM {
                     .get(window_id)
                     .map(|channels| channels.keys().cloned().collect::<Vec<_>>()),
                 reset_to_static = !active,
-                "hot reload: managed animation cancel applied"
+                "managed animation: cancel applied"
             );
         }
         self.schedule_redraw();
@@ -2182,9 +2185,23 @@ impl ShojiWM {
                 pending_process_actions.extend(evaluation.process_actions.clone());
                 pre_advance_actions.extend(std::mem::take(&mut evaluation.actions));
                 let tree = DecorationTree::new(evaluation.node);
+                let previous_animation_state =
+                    self.window_decorations.get(&window).and_then(|cached| {
+                        cached.managed_window_animation_active.then(|| {
+                            (
+                                cached.managed_window.clone(),
+                                cached.visual_transform,
+                                cached.last_configured_client_size,
+                            )
+                        })
+                    });
+                let layout_managed_window = previous_animation_state
+                    .as_ref()
+                    .map(|(managed_window, _, _)| managed_window)
+                    .unwrap_or(&evaluation.managed_window);
                 let layout_client_rect = managed_client_rect_for_state(
                     &tree,
-                    &evaluation.managed_window,
+                    layout_managed_window,
                     client_rect,
                     layout_scale,
                 )?;
@@ -2286,6 +2303,23 @@ impl ShojiWM {
                 let (rounded_cache, shader_cache, backdrop_cache, window_effect_cache) = caches;
                 let static_transform = evaluation.transform;
                 let static_managed = evaluation.managed_window.clone();
+                let (
+                    visual_transform,
+                    managed_window,
+                    managed_window_animation_active,
+                    last_configured_client_size,
+                ) = previous_animation_state
+                    .map(
+                        |(managed_window, visual_transform, last_configured_client_size)| {
+                            (
+                                visual_transform,
+                                managed_window,
+                                true,
+                                last_configured_client_size,
+                            )
+                        },
+                    )
+                    .unwrap_or((static_transform, evaluation.managed_window, false, None));
                 self.window_decorations.insert(
                     window,
                     WindowDecorationState {
@@ -2295,10 +2329,10 @@ impl ShojiWM {
                         layout_scale,
                         client_rect: layout_client_rect,
                         client_rect_potentially_stale: false,
-                        visual_transform: static_transform,
-                        managed_window: evaluation.managed_window,
-                        managed_window_animation_active: false,
-                        last_configured_client_size: None,
+                        visual_transform,
+                        managed_window,
+                        managed_window_animation_active,
+                        last_configured_client_size,
                         static_visual_transform: static_transform,
                         static_managed_window: static_managed,
                         window_effects: evaluation.window_effects,
@@ -2526,11 +2560,38 @@ impl ShojiWM {
 
                         let next_managed_window = evaluation.managed_window;
                         let next_transform = evaluation.transform;
+                        let previous_dynamic_rect = cached.managed_window.rect;
+                        let previous_static_rect = cached.static_managed_window.rect;
+                        let previous_transform = cached.visual_transform;
+                        let previous_static_transform = cached.static_visual_transform;
 
                         cached.snapshot = snapshot;
                         cached.static_managed_window = next_managed_window.clone();
                         cached.static_visual_transform = next_transform;
                         cached.window_effects = evaluation.window_effects;
+                        if managed_rect_debug_enabled() {
+                            info!(
+                                window_id = %snapshot_id,
+                                title = %cached.snapshot.title,
+                                has_active_animation,
+                                previous_dynamic_rect = ?previous_dynamic_rect,
+                                previous_static_rect = ?previous_static_rect,
+                                next_static_rect = ?cached.static_managed_window.rect,
+                                dynamic_rect_after_static_update = ?cached.managed_window.rect,
+                                previous_transform_translate_x = previous_transform.translate_x,
+                                previous_transform_translate_y = previous_transform.translate_y,
+                                previous_transform_scale_x = previous_transform.scale_x,
+                                previous_transform_scale_y = previous_transform.scale_y,
+                                previous_transform_opacity = previous_transform.opacity,
+                                previous_static_transform_translate_x = previous_static_transform.translate_x,
+                                previous_static_transform_translate_y = previous_static_transform.translate_y,
+                                next_static_transform_translate_x = cached.static_visual_transform.translate_x,
+                                next_static_transform_translate_y = cached.static_visual_transform.translate_y,
+                                dynamic_transform_translate_x = cached.visual_transform.translate_x,
+                                dynamic_transform_translate_y = cached.visual_transform.translate_y,
+                                "managed rect debug: managed-only state update"
+                            );
+                        }
 
                         if has_active_animation {
                             // 重要:
@@ -2558,6 +2619,19 @@ impl ShojiWM {
                         // animation が無い場合だけ dynamic state も更新する
                         cached.managed_window = next_managed_window;
                         cached.visual_transform = next_transform;
+                        if managed_rect_debug_enabled() {
+                            info!(
+                                window_id = %snapshot_id,
+                                title = %cached.snapshot.title,
+                                dynamic_rect_after_update = ?cached.managed_window.rect,
+                                dynamic_transform_translate_x = cached.visual_transform.translate_x,
+                                dynamic_transform_translate_y = cached.visual_transform.translate_y,
+                                dynamic_transform_scale_x = cached.visual_transform.scale_x,
+                                dynamic_transform_scale_y = cached.visual_transform.scale_y,
+                                dynamic_transform_opacity = cached.visual_transform.opacity,
+                                "managed rect debug: managed-only dynamic committed"
+                            );
+                        }
 
                         let next_root =
                             transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
@@ -2738,11 +2812,18 @@ impl ShojiWM {
                                 );
                             }
                         } else {
+                            let layout_client_rect = managed_client_rect_for_state(
+                                &cached.tree,
+                                &cached.managed_window,
+                                client_rect,
+                                layout_scale,
+                            )?;
                             cached.layout = cached
                                 .tree
-                                .layout_for_client_with_scale(client_rect, layout_scale)
+                                .layout_for_client_with_scale(layout_client_rect, layout_scale)
                                 .map_err(super::DecorationEvaluationError::Layout)?;
                             cached.layout_scale = layout_scale;
+                            cached.client_rect = layout_client_rect;
                             let shared_edges = build_shared_edge_geometry_map(&cached.layout);
                             cached.content_clip = content_clip_for_layout(
                                 &cached.tree,
@@ -2911,6 +2992,22 @@ impl ShojiWM {
             pending_window_actions.extend(deferred);
         }
         managed_rect_apply_window_ids.extend(self.advance_managed_window_animations(now_ms));
+        if managed_rect_debug_enabled() {
+            let mut apply_ids = managed_rect_apply_window_ids
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            apply_ids.sort();
+            info!(
+                ?apply_ids,
+                count = apply_ids.len(),
+                target_output = ?target_output_name,
+                force_runtime_reevaluate,
+                runtime_dirty_window_ids_count = self.runtime_dirty_window_ids.len(),
+                runtime_managed_only_window_ids_count = self.runtime_managed_only_window_ids.len(),
+                "managed rect debug: refresh apply batch"
+            );
+        }
         self.apply_managed_window_rects(&managed_rect_apply_window_ids);
 
         let closing_pass_started_at = Instant::now();
@@ -3611,6 +3708,28 @@ impl ShojiWM {
     }
 
     fn apply_managed_window_rects(&mut self, dirty_window_ids: &std::collections::HashSet<String>) {
+        if managed_rect_debug_enabled() {
+            let mut dirty_ids = dirty_window_ids.iter().cloned().collect::<Vec<_>>();
+            dirty_ids.sort();
+            let mut configured_ids = self
+                .pending_xdg_state_configure_window_ids
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            configured_ids.sort();
+            let mut cached_ids = self
+                .window_decorations
+                .values()
+                .map(|decoration| decoration.snapshot.id.clone())
+                .collect::<Vec<_>>();
+            cached_ids.sort();
+            info!(
+                ?dirty_ids,
+                ?configured_ids,
+                ?cached_ids,
+                "managed rect debug: apply start"
+            );
+        }
         let windows = self
             .window_decorations
             .iter()
@@ -3630,6 +3749,23 @@ impl ShojiWM {
             })
             .collect::<Vec<_>>();
 
+        if managed_rect_debug_enabled() {
+            let mut candidate_ids = windows
+                .iter()
+                .filter_map(|window| {
+                    self.window_decorations
+                        .get(window)
+                        .map(|decoration| decoration.snapshot.id.clone())
+                })
+                .collect::<Vec<_>>();
+            candidate_ids.sort();
+            info!(
+                ?candidate_ids,
+                count = candidate_ids.len(),
+                "managed rect debug: apply candidates"
+            );
+        }
+
         for window in windows {
             let Some((
                 force_rect_size,
@@ -3647,6 +3783,14 @@ impl ShojiWM {
                 };
                 let managed = &decoration.managed_window;
                 let Some(desired_root_raw) = managed.rect else {
+                    if managed_rect_debug_enabled() {
+                        info!(
+                            window_id = %decoration.snapshot.id,
+                            title = %decoration.snapshot.title,
+                            managed = managed.managed,
+                            "managed rect debug: apply skip missing desired rect"
+                        );
+                    }
                     continue;
                 };
                 let desired_root = managed_rect_snapshot_to_logical_rect(desired_root_raw);
@@ -3695,6 +3839,15 @@ impl ShojiWM {
 
             if desired_root == current_root && !needs_xdg_state_configure {
                 record_managed_rect_path_event(ManagedRectPathEvent::ApplyNoop);
+                if managed_rect_debug_enabled() {
+                    info!(
+                        window_id,
+                        desired_root = %format_rect(desired_root),
+                        current_root = %format_rect(current_root),
+                        needs_xdg_state_configure,
+                        "managed rect debug: apply noop root"
+                    );
+                }
                 continue;
             }
 
@@ -3719,6 +3872,17 @@ impl ShojiWM {
 
             if desired_client == current_client && !needs_xdg_state_configure {
                 record_managed_rect_path_event(ManagedRectPathEvent::ApplyNoop);
+                if managed_rect_debug_enabled() {
+                    info!(
+                        window_id,
+                        desired_root = %format_rect(desired_root),
+                        current_root = %format_rect(current_root),
+                        desired_client = %format_rect(desired_client),
+                        current_client = %format_rect(current_client),
+                        needs_xdg_state_configure,
+                        "managed rect debug: apply noop client"
+                    );
+                }
                 continue;
             }
 

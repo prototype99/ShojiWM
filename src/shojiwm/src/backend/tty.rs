@@ -120,6 +120,11 @@ fn managed_rect_debug_enabled() -> bool {
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
+fn kinetic_scroll_trace_debug_enabled() -> bool {
+    std::env::var_os("SHOJI_KINETIC_SCROLL_TRACE")
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
 fn animation_timing_debug_enabled() -> bool {
     std::env::var_os("SHOJI_ANIMATION_TIMING_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
@@ -1625,9 +1630,31 @@ fn render_surface(
             else {
                 continue;
             };
-            if window_decorations.get(window).is_some_and(|decoration| {
-                !decoration.managed_window_allows_render_on_output(output.name().as_str())
-            }) {
+            if let Some(decoration) = window_decorations.get(window) {
+                let render_allowed =
+                    decoration.managed_window_allows_render_on_output(output.name().as_str());
+                if !render_allowed {
+                    log_kinetic_window_render_state_debug(
+                        "live-skip-render",
+                        &output.name(),
+                        decoration,
+                        output_geo,
+                        scale,
+                        None,
+                        render_allowed,
+                    );
+                    continue;
+                }
+                log_kinetic_window_render_state_debug(
+                    "live-before-visual",
+                    &output.name(),
+                    decoration,
+                    output_geo,
+                    scale,
+                    None,
+                    render_allowed,
+                );
+            } else {
                 continue;
             }
             if closing_window_snapshots.contains_key(&window_id) {
@@ -1658,6 +1685,17 @@ fn render_surface(
                     translation: (0, 0).into(),
                     opacity: 1.0,
                 });
+            if let Some(decoration) = window_decorations.get(window) {
+                log_kinetic_window_render_state_debug(
+                    "live-after-visual",
+                    &output.name(),
+                    decoration,
+                    output_geo,
+                    scale,
+                    Some(visual_state),
+                    true,
+                );
+            }
             let snap_scale = Scale::from((
                 scale.x * visual_state.scale.x.max(0.0),
                 scale.y * visual_state.scale.y.max(0.0),
@@ -5402,6 +5440,113 @@ fn log_managed_rect_physical_debug(
         root_global_bottom = root_global_edges.loc.y + root_global_edges.size.h,
         client_physical = ?client,
         "managed rect debug: physical geometry"
+    );
+}
+
+fn log_kinetic_window_render_state_debug(
+    phase: &str,
+    output_name: &str,
+    decoration: &crate::ssd::WindowDecorationState,
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    visual_state: Option<WindowVisualState>,
+    render_allowed: bool,
+) {
+    if !managed_rect_debug_enabled() && !kinetic_scroll_trace_debug_enabled() {
+        return;
+    }
+
+    let root_rect = decoration.layout.root.rect;
+    let visual_root = transformed_root_rect(root_rect, decoration.visual_transform);
+    let root_physical = crate::backend::visual::logical_rect_to_physical_rect(
+        root_rect,
+        output_geo.loc,
+        scale,
+    );
+    let visual_physical =
+        crate::backend::visual::logical_rect_to_physical_rect(visual_root, output_geo.loc, scale);
+    let managed_rect = decoration.managed_window.rect.map(|rect| {
+        (
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            rect.x + rect.width,
+            rect.y + rect.height,
+        )
+    });
+    let static_managed_rect = decoration.static_managed_window.rect.map(|rect| {
+        (
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            rect.x + rect.width,
+            rect.y + rect.height,
+        )
+    });
+    let visual_origin = visual_state.map(|visual| (visual.origin.x, visual.origin.y));
+    let visual_scale = visual_state.map(|visual| (visual.scale.x, visual.scale.y));
+    let visual_translation =
+        visual_state.map(|visual| (visual.translation.x, visual.translation.y));
+    let visual_opacity = visual_state.map(|visual| visual.opacity);
+
+    tracing::info!(
+        phase,
+        output = %output_name,
+        window_id = %decoration.snapshot.id,
+        title = %decoration.snapshot.title,
+        render_allowed,
+        managed = decoration.managed_window.managed,
+        visible = decoration.managed_window.visible,
+        idle = decoration.managed_window.idle,
+        interactive = decoration.managed_window.interactive,
+        animation_active = decoration.managed_window_animation_active,
+        client_rect_stale = decoration.client_rect_potentially_stale,
+        managed_rect = ?managed_rect,
+        static_managed_rect = ?static_managed_rect,
+        layout_root = ?(
+            root_rect.x,
+            root_rect.y,
+            root_rect.width,
+            root_rect.height,
+            root_rect.x + root_rect.width,
+            root_rect.y + root_rect.height,
+        ),
+        visual_root = ?(
+            visual_root.x,
+            visual_root.y,
+            visual_root.width,
+            visual_root.height,
+            visual_root.x + visual_root.width,
+            visual_root.y + visual_root.height,
+        ),
+        root_physical = ?(
+            root_physical.loc.x,
+            root_physical.loc.y,
+            root_physical.size.w,
+            root_physical.size.h,
+            root_physical.loc.x + root_physical.size.w,
+            root_physical.loc.y + root_physical.size.h,
+        ),
+        visual_physical = ?(
+            visual_physical.loc.x,
+            visual_physical.loc.y,
+            visual_physical.size.w,
+            visual_physical.size.h,
+            visual_physical.loc.x + visual_physical.size.w,
+            visual_physical.loc.y + visual_physical.size.h,
+        ),
+        transform_translate_x = decoration.visual_transform.translate_x,
+        transform_translate_y = decoration.visual_transform.translate_y,
+        transform_scale_x = decoration.visual_transform.scale_x,
+        transform_scale_y = decoration.visual_transform.scale_y,
+        transform_opacity = decoration.visual_transform.opacity,
+        visual_origin = ?visual_origin,
+        visual_scale = ?visual_scale,
+        visual_translation = ?visual_translation,
+        visual_opacity = ?visual_opacity,
+        "kinetic-scroll render-state"
     );
 }
 

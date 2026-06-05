@@ -26,7 +26,7 @@ use smithay::{
     reexports::{
         calloop::channel::{Event as ChannelEvent, channel},
         calloop::{
-            EventLoop, Interest, LoopSignal, Mode, PostAction,
+            EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction,
             generic::Generic,
             timer::{TimeoutAction, Timer},
         },
@@ -294,6 +294,8 @@ pub struct ShojiWM {
     pub runtime_dirty_window_ids: std::collections::HashSet<String>,
     pub runtime_managed_only_window_ids: std::collections::HashSet<String>,
     pub runtime_scheduler_enabled: bool,
+    pub runtime_scheduler_kick_generation: u64,
+    pub runtime_scheduler_kick_active: bool,
     pub runtime_animation_outputs: std::collections::HashSet<String>,
     pub managed_window_animations: HashMap<String, BTreeMap<String, ActiveManagedWindowAnimation>>,
     pub managed_window_animation_sequence: u64,
@@ -645,13 +647,17 @@ impl ShojiWM {
             };
         let (runtime_async_event_tx, runtime_async_event_rx) = channel();
         decoration_evaluator.set_async_event_sender(runtime_async_event_tx);
-        event_loop
-            .handle()
-            .insert_source(runtime_async_event_rx, |event, _, state| match event {
+        let runtime_async_loop_handle = event_loop.handle();
+        let runtime_scheduler_kick_loop_handle = runtime_async_loop_handle.clone();
+        runtime_async_loop_handle
+            .insert_source(runtime_async_event_rx, move |event, _, state| match event {
                 ChannelEvent::Msg(invocation) => match invocation {
                     DecorationRuntimeAsyncInvocation::PointerMove(invocation)
                     | DecorationRuntimeAsyncInvocation::GestureSwipe(invocation) => {
-                        state.handle_runtime_pointer_move_async_invocation(invocation);
+                        state.handle_runtime_pointer_move_async_invocation(
+                            invocation,
+                            &runtime_scheduler_kick_loop_handle,
+                        );
                     }
                 },
                 ChannelEvent::Closed => {}
@@ -792,6 +798,8 @@ impl ShojiWM {
             runtime_dirty_window_ids: Default::default(),
             runtime_managed_only_window_ids: Default::default(),
             runtime_scheduler_enabled: false,
+            runtime_scheduler_kick_generation: 0,
+            runtime_scheduler_kick_active: false,
             runtime_animation_outputs: Default::default(),
             managed_window_animations: Default::default(),
             managed_window_animation_sequence: 0,
@@ -1214,87 +1222,143 @@ impl ShojiWM {
         socket_name
     }
 
+    fn runtime_scheduler_interval_ms(&self, next_poll_in_ms: Option<u64>) -> u64 {
+        match next_poll_in_ms {
+            Some(0) => self.runtime_frame_sync_interval_ms(),
+            Some(ms) => ms.clamp(1, 250),
+            None => 250,
+        }
+    }
+
+    fn tick_runtime_scheduler(&mut self) -> u64 {
+        self.refresh_runtime_processes();
+        let managed_window_animation_active = !self.managed_window_animations.is_empty();
+        if !self.runtime_scheduler_enabled
+            && !self.runtime_process_supervision_enabled
+            && !managed_window_animation_active
+        {
+            return 250;
+        }
+
+        if managed_window_animation_active
+            && !self.runtime_scheduler_enabled
+            && !self.runtime_process_supervision_enabled
+        {
+            self.request_tty_maintenance("managed-window-animation-tick");
+            self.schedule_redraw();
+            return self.runtime_frame_sync_interval_ms();
+        }
+
+        let now_ms = Duration::from(self.clock.now()).as_millis() as u64;
+        self.sync_runtime_display_state();
+        let tick = match self.decoration_evaluator.scheduler_tick(now_ms) {
+            Ok(tick) => tick,
+            Err(error) => {
+                debug!(?error, "failed to tick decoration runtime scheduler");
+                self.config_error_report =
+                    Some(crate::config_error::ConfigErrorReport::runtime(error));
+                self.schedule_redraw();
+                self.runtime_scheduler_enabled = false;
+                return 250;
+            }
+        };
+        if tick.dirty {
+            if runtime_dirty_debug_enabled() {
+                info!(
+                    dirty_window_ids = ?tick.dirty_window_ids,
+                    dirty_managed_window_ids = ?tick.dirty_managed_window_ids,
+                    dirty_window_node_ids = ?tick.dirty_window_node_ids,
+                    next_poll_in_ms = ?tick.next_poll_in_ms,
+                    "runtime dirty debug: scheduler tick dirty"
+                );
+            }
+            self.runtime_poll_dirty = true;
+            self.mark_runtime_dirty_windows(tick.dirty_window_ids, tick.dirty_managed_window_ids);
+            self.request_tty_maintenance("runtime-scheduler-dirty");
+            self.schedule_redraw();
+        }
+
+        self.consume_runtime_display_config(tick.display_config);
+        self.consume_runtime_key_binding_config(tick.key_binding_config);
+        self.consume_runtime_pointer_config(tick.pointer_config);
+        self.consume_runtime_input_config(tick.input_config);
+        self.consume_runtime_event_config(tick.event_config);
+        self.consume_runtime_process_config(tick.process_config);
+        self.consume_runtime_debug_config(tick.debug_config);
+        if !tick.process_actions.is_empty() {
+            self.apply_runtime_process_actions(tick.process_actions);
+        }
+
+        if !tick.actions.is_empty() {
+            self.request_tty_maintenance("runtime-scheduler-actions");
+            self.apply_runtime_window_actions(tick.actions);
+            self.schedule_redraw();
+        }
+
+        self.runtime_scheduler_enabled = tick.next_poll_in_ms.is_some();
+        self.runtime_scheduler_interval_ms(tick.next_poll_in_ms)
+    }
+
+    fn schedule_runtime_scheduler_kick(
+        &mut self,
+        loop_handle: &LoopHandle<'_, Self>,
+        next_poll_in_ms: Option<u64>,
+    ) {
+        if next_poll_in_ms.is_none() {
+            return;
+        }
+
+        self.runtime_scheduler_kick_generation =
+            self.runtime_scheduler_kick_generation.wrapping_add(1);
+        let generation = self.runtime_scheduler_kick_generation;
+        let initial_interval_ms = self.runtime_scheduler_interval_ms(next_poll_in_ms);
+        let insert_result = loop_handle.insert_source(
+            Timer::from_duration(Duration::from_millis(initial_interval_ms)),
+            move |_, _, state| {
+                state.record_event_source_wake("runtime-scheduler-kick");
+                if state.runtime_scheduler_kick_generation != generation
+                    || !state.runtime_scheduler_enabled
+                {
+                    if state.runtime_scheduler_kick_generation == generation {
+                        state.runtime_scheduler_kick_active = false;
+                    }
+                    return TimeoutAction::Drop;
+                }
+
+                let next_interval_ms = state.tick_runtime_scheduler();
+                if state.runtime_scheduler_kick_generation != generation
+                    || !state.runtime_scheduler_enabled
+                {
+                    if state.runtime_scheduler_kick_generation == generation {
+                        state.runtime_scheduler_kick_active = false;
+                    }
+                    TimeoutAction::Drop
+                } else {
+                    TimeoutAction::ToDuration(Duration::from_millis(next_interval_ms))
+                }
+            },
+        );
+
+        match insert_result {
+            Ok(_) => {
+                self.runtime_scheduler_kick_active = true;
+            }
+            Err(error) => {
+                debug!(?error, "failed to schedule runtime scheduler kick");
+            }
+        }
+    }
+
     fn init_runtime_scheduler(event_loop: &mut EventLoop<Self>) {
         let loop_handle = event_loop.handle();
         loop_handle
             .insert_source(Timer::immediate(), |_, _, state| {
                 state.record_event_source_wake("runtime-scheduler-timer");
-                state.refresh_runtime_processes();
-                let managed_window_animation_active = !state.managed_window_animations.is_empty();
-                if !state.runtime_scheduler_enabled
-                    && !state.runtime_process_supervision_enabled
-                    && !managed_window_animation_active
-                {
+                if state.runtime_scheduler_kick_active && state.runtime_scheduler_enabled {
+                    state.refresh_runtime_processes();
                     return TimeoutAction::ToDuration(Duration::from_millis(250));
                 }
-
-                if managed_window_animation_active
-                    && !state.runtime_scheduler_enabled
-                    && !state.runtime_process_supervision_enabled
-                {
-                    state.request_tty_maintenance("managed-window-animation-tick");
-                    state.schedule_redraw();
-                    return TimeoutAction::ToDuration(Duration::from_millis(
-                        state.runtime_frame_sync_interval_ms(),
-                    ));
-                }
-
-                let now_ms = Duration::from(state.clock.now()).as_millis() as u64;
-                state.sync_runtime_display_state();
-                let tick = match state.decoration_evaluator.scheduler_tick(now_ms) {
-                    Ok(tick) => tick,
-                    Err(error) => {
-                        debug!(?error, "failed to tick decoration runtime scheduler");
-                        state.config_error_report =
-                            Some(crate::config_error::ConfigErrorReport::runtime(error));
-                        state.schedule_redraw();
-                        state.runtime_scheduler_enabled = false;
-                        return TimeoutAction::ToDuration(Duration::from_millis(250));
-                    }
-                };
-                if tick.dirty {
-                    if runtime_dirty_debug_enabled() {
-                        info!(
-                            dirty_window_ids = ?tick.dirty_window_ids,
-                            dirty_managed_window_ids = ?tick.dirty_managed_window_ids,
-                            dirty_window_node_ids = ?tick.dirty_window_node_ids,
-                            next_poll_in_ms = ?tick.next_poll_in_ms,
-                            "runtime dirty debug: scheduler tick dirty"
-                        );
-                    }
-                    state.runtime_poll_dirty = true;
-                    state.mark_runtime_dirty_windows(
-                        tick.dirty_window_ids,
-                        tick.dirty_managed_window_ids,
-                    );
-                    state.request_tty_maintenance("runtime-scheduler-dirty");
-                    state.schedule_redraw();
-                }
-
-                state.consume_runtime_display_config(tick.display_config);
-                state.consume_runtime_key_binding_config(tick.key_binding_config);
-                state.consume_runtime_pointer_config(tick.pointer_config);
-                state.consume_runtime_input_config(tick.input_config);
-                state.consume_runtime_event_config(tick.event_config);
-                state.consume_runtime_process_config(tick.process_config);
-                state.consume_runtime_debug_config(tick.debug_config);
-                if !tick.process_actions.is_empty() {
-                    state.apply_runtime_process_actions(tick.process_actions);
-                }
-
-                if !tick.actions.is_empty() {
-                    state.request_tty_maintenance("runtime-scheduler-actions");
-                    state.apply_runtime_window_actions(tick.actions);
-                    state.schedule_redraw();
-                }
-
-                state.runtime_scheduler_enabled = tick.next_poll_in_ms.is_some();
-                let next_interval_ms = match tick.next_poll_in_ms {
-                    Some(0) => state.runtime_frame_sync_interval_ms(),
-                    Some(ms) => ms.clamp(1, 250),
-                    None if state.runtime_process_supervision_enabled => 250,
-                    None => 250,
-                };
+                let next_interval_ms = state.tick_runtime_scheduler();
                 TimeoutAction::ToDuration(Duration::from_millis(next_interval_ms))
             })
             .expect("Failed to init runtime scheduler.");
@@ -1843,6 +1907,7 @@ impl ShojiWM {
     pub fn handle_runtime_pointer_move_async_invocation(
         &mut self,
         invocation: DecorationPointerMoveAsyncInvocation,
+        loop_handle: &LoopHandle<'_, Self>,
     ) {
         if invocation.dirty {
             self.runtime_poll_dirty = true;
@@ -1872,6 +1937,7 @@ impl ShojiWM {
 
         if invocation.next_poll_in_ms.is_some() {
             self.runtime_scheduler_enabled = true;
+            self.schedule_runtime_scheduler_kick(loop_handle, invocation.next_poll_in_ms);
         }
     }
 
