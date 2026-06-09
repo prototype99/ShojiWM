@@ -27,12 +27,29 @@ pub enum RuntimeKeyBindingPhase {
 impl RuntimeKeyBindingEntry {
     pub fn compile(&self) -> Result<CompiledRuntimeKeyBinding, RuntimeKeyBindingParseError> {
         let shortcut = parse_runtime_key_shortcut(&self.shortcut)?;
+        // A modifier-only shortcut (e.g. "Super") fires as a "tap": it is only
+        // meaningful on release, since on press we cannot yet tell a tap from a
+        // modifier held for a combo. Reject press to surface the mistake.
+        if shortcut.is_modifier_only() && self.on != RuntimeKeyBindingPhase::Release {
+            return Err(RuntimeKeyBindingParseError::ModifierOnlyRequiresRelease(
+                self.shortcut.clone(),
+            ));
+        }
         Ok(CompiledRuntimeKeyBinding {
             id: self.id.clone(),
             phase: self.on,
             shortcut,
         })
     }
+}
+
+/// A keyboard modifier class, independent of the left/right physical key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModifierClass {
+    Ctrl,
+    Alt,
+    Shift,
+    Logo,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,11 +76,17 @@ pub struct RuntimeKeyShortcut {
     pub alt: bool,
     pub shift: bool,
     pub logo: bool,
-    pub keysym: xkb::Keysym,
+    /// `None` for a modifier-only shortcut (a "tap" binding).
+    pub keysym: Option<xkb::Keysym>,
 }
 
 impl RuntimeKeyShortcut {
     pub fn matches(&self, modifiers: &ModifiersState, handle: &KeysymHandle<'_>) -> bool {
+        // Modifier-only shortcuts are not matched here; they are dispatched as a
+        // release "tap" by the input layer (see process_input_event).
+        let Some(keysym) = self.keysym else {
+            return false;
+        };
         let Some(raw_keysym) = handle.raw_latin_sym_or_raw_current_sym() else {
             return false;
         };
@@ -72,7 +95,25 @@ impl RuntimeKeyShortcut {
             && self.alt == modifiers.alt
             && self.shift == modifiers.shift
             && self.logo == modifiers.logo
-            && self.keysym == raw_keysym
+            && keysym == raw_keysym
+    }
+
+    pub fn is_modifier_only(&self) -> bool {
+        self.keysym.is_none()
+    }
+
+    /// The single modifier class for a modifier-only shortcut, else `None`.
+    pub fn modifier_class(&self) -> Option<ModifierClass> {
+        if self.keysym.is_some() {
+            return None;
+        }
+        match (self.ctrl, self.alt, self.shift, self.logo) {
+            (true, false, false, false) => Some(ModifierClass::Ctrl),
+            (false, true, false, false) => Some(ModifierClass::Alt),
+            (false, false, true, false) => Some(ModifierClass::Shift),
+            (false, false, false, true) => Some(ModifierClass::Logo),
+            _ => None,
+        }
     }
 }
 
@@ -82,6 +123,10 @@ pub enum RuntimeKeyBindingParseError {
     EmptyShortcut,
     #[error("shortcut `{0}` must include exactly one non-modifier key")]
     MissingKey(String),
+    #[error("modifier-only shortcut `{0}` must use exactly one modifier")]
+    ModifierOnlyMultipleModifiers(String),
+    #[error("modifier-only shortcut `{0}` is only valid with `on: \"release\"`")]
+    ModifierOnlyRequiresRelease(String),
     #[error("shortcut `{shortcut}` contains unknown modifier `{modifier}`")]
     UnknownModifier { shortcut: String, modifier: String },
     #[error("shortcut `{shortcut}` contains duplicate modifier `{modifier}`")]
@@ -157,9 +202,21 @@ fn parse_runtime_key_shortcut(
     }
 
     let Some(keysym) = keysym else {
-        return Err(RuntimeKeyBindingParseError::MissingKey(
-            shortcut.to_string(),
-        ));
+        // Modifier-only shortcut ("tap"): require exactly one modifier.
+        let modifier_count =
+            [ctrl, alt, shift, logo].into_iter().filter(|set| *set).count();
+        if modifier_count != 1 {
+            return Err(RuntimeKeyBindingParseError::ModifierOnlyMultipleModifiers(
+                shortcut.to_string(),
+            ));
+        }
+        return Ok(RuntimeKeyShortcut {
+            ctrl,
+            alt,
+            shift,
+            logo,
+            keysym: None,
+        });
     };
 
     Ok(RuntimeKeyShortcut {
@@ -167,7 +224,7 @@ fn parse_runtime_key_shortcut(
         alt,
         shift,
         logo,
-        keysym,
+        keysym: Some(keysym),
     })
 }
 
@@ -195,4 +252,76 @@ fn parse_keysym_name(name: &str) -> Option<xkb::Keysym> {
     };
     let keysym = xkb::keysym_from_name(&normalized, xkb::KEYSYM_CASE_INSENSITIVE);
     (keysym != xkb::keysyms::KEY_NoSymbol.into()).then_some(keysym)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(shortcut: &str, on: RuntimeKeyBindingPhase) -> RuntimeKeyBindingEntry {
+        RuntimeKeyBindingEntry {
+            id: "test".to_string(),
+            shortcut: shortcut.to_string(),
+            on,
+        }
+    }
+
+    #[test]
+    fn combo_shortcut_has_keysym() {
+        let shortcut = parse_runtime_key_shortcut("Super+A").unwrap();
+        assert!(!shortcut.is_modifier_only());
+        assert!(shortcut.keysym.is_some());
+        assert!(shortcut.logo);
+        assert_eq!(shortcut.modifier_class(), None);
+    }
+
+    #[test]
+    fn modifier_only_shortcut_parses() {
+        let shortcut = parse_runtime_key_shortcut("Super").unwrap();
+        assert!(shortcut.is_modifier_only());
+        assert!(shortcut.keysym.is_none());
+        assert_eq!(shortcut.modifier_class(), Some(ModifierClass::Logo));
+    }
+
+    #[test]
+    fn modifier_only_other_modifiers() {
+        assert_eq!(
+            parse_runtime_key_shortcut("Ctrl").unwrap().modifier_class(),
+            Some(ModifierClass::Ctrl),
+        );
+        assert_eq!(
+            parse_runtime_key_shortcut("Alt").unwrap().modifier_class(),
+            Some(ModifierClass::Alt),
+        );
+        assert_eq!(
+            parse_runtime_key_shortcut("Shift").unwrap().modifier_class(),
+            Some(ModifierClass::Shift),
+        );
+    }
+
+    #[test]
+    fn modifier_only_requires_single_modifier() {
+        assert!(matches!(
+            parse_runtime_key_shortcut("Super+Shift"),
+            Err(RuntimeKeyBindingParseError::ModifierOnlyMultipleModifiers(_)),
+        ));
+    }
+
+    #[test]
+    fn modifier_only_requires_release_phase() {
+        assert!(matches!(
+            entry("Super", RuntimeKeyBindingPhase::Press).compile(),
+            Err(RuntimeKeyBindingParseError::ModifierOnlyRequiresRelease(_)),
+        ));
+        assert!(entry("Super", RuntimeKeyBindingPhase::Release)
+            .compile()
+            .is_ok());
+    }
+
+    #[test]
+    fn combo_allows_press_phase() {
+        assert!(entry("Super+A", RuntimeKeyBindingPhase::Press)
+            .compile()
+            .is_ok());
+    }
 }

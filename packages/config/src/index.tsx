@@ -191,6 +191,19 @@ function updateDockProximity(monitor: string, inside: boolean) {
   WORKSPACE_IPC.broadcast("dock.proximity", { monitor, inside });
 }
 
+// Snap-zone preview: broadcast the active snap rect (floating edge zones, or the
+// opened tiling slot) to the bar, which renders the rounded preview overlay.
+//   snap.preview  { monitor, rect: {x,y,w,h} | null, kind: "floating"|"tiling" }
+let lastSnapJson = "";
+HYBRID_WINDOW_MANAGER.setSnapPreviewBroadcaster((preview) => {
+  const json = JSON.stringify(preview);
+  if (json === lastSnapJson) {
+    return;
+  }
+  lastSnapJson = json;
+  WORKSPACE_IPC.broadcast("snap.preview", preview);
+});
+
 WINDOW_MANAGER.onDisable(() => {
   WORKSPACE_IPC.close();
 });
@@ -203,9 +216,38 @@ WINDOW_MANAGER.process.once("shell", {
   command: "cd ~/.config/shoji-bar-2 && ags run app.tsx",
   runPolicy: "once-per-session",
 });
+// cliphist clipboard history watchers. Text and image need separate watchers;
+// run as services so they are restarted if they ever exit.
+WINDOW_MANAGER.process.service("cliphist-text", {
+  command: ["wl-paste", "--type", "text", "--watch", "cliphist", "store"],
+  restart: "on-exit",
+});
+WINDOW_MANAGER.process.service("cliphist-image", {
+  command: ["wl-paste", "--type", "image", "--watch", "cliphist", "store"],
+  restart: "on-exit",
+});
 
 WINDOW_MANAGER.key.bind("terminal", "Super+T", () => {
   WINDOW_MANAGER.process.spawn({ command: ["kitty"] });
+});
+// Resolve the monitor under the cursor and toggle shoji-bar-2's StartMenu via ags request.
+function toggleStartMenu() {
+  const monitor = HYBRID_WINDOW_MANAGER.getCurrentMonitorName();
+  WINDOW_MANAGER.process.spawn({
+    command: ["ags", "request", "-i", "ags", "start-menu", "toggle", monitor],
+  });
+}
+WINDOW_MANAGER.key.bind("start-menu", "Super+A", toggleStartMenu);
+// Super tap (fires on release only, when no other key/button was pressed in between).
+WINDOW_MANAGER.key.bind("start-menu-tap", "Super", toggleStartMenu, {
+  on: "release",
+});
+// Toggle shoji-bar-2's clipboard history on the monitor under the cursor.
+WINDOW_MANAGER.key.bind("clipboard", "Super+V", () => {
+  const monitor = HYBRID_WINDOW_MANAGER.getCurrentMonitorName();
+  WINDOW_MANAGER.process.spawn({
+    command: ["ags", "request", "-i", "ags", "clipboard", "toggle", monitor],
+  });
 });
 WINDOW_MANAGER.key.bind("screenshot", "Super+P", () => {
   WINDOW_MANAGER.process.spawn({

@@ -319,6 +319,12 @@ pub struct ShojiWM {
     pub runtime_gesture_swipe_async_enabled: bool,
     pub runtime_gesture_swipe: Option<RuntimeGestureSwipeState>,
     pub current_keyboard_modifiers: ModifiersState,
+    // Modifier-only tap detection (e.g. "Super"). If no other input occurs
+    // between press and release, the release is treated as a tap.
+    pub tap_pressed_keys: u32,
+    pub tap_armed_modifier: Option<crate::runtime_key_binding::ModifierClass>,
+    pub tap_interrupted: bool,
+    pub pending_tap_binding_ids: Vec<String>,
     pub suggested_window_offset: Option<(i32, i32)>,
     pub async_asset_dirty: bool,
     pub configured_background_effect: Option<BackgroundEffectConfig>,
@@ -830,6 +836,10 @@ impl ShojiWM {
             runtime_gesture_swipe_async_enabled: false,
             runtime_gesture_swipe: None,
             current_keyboard_modifiers: ModifiersState::default(),
+            tap_pressed_keys: 0,
+            tap_armed_modifier: None,
+            tap_interrupted: false,
+            pending_tap_binding_ids: Vec::new(),
             suggested_window_offset: None,
             async_asset_dirty: false,
             configured_background_effect: None,

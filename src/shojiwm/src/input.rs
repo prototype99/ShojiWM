@@ -46,6 +46,23 @@ fn pointer_button_debug_enabled() -> bool {
     std::env::var_os("SHOJI_POINTER_BUTTON_DEBUG").is_some()
 }
 
+/// Classify a raw keysym as a modifier key (for modifier-tap detection),
+/// independent of the left/right physical key.
+fn modifier_class_of_keysym(
+    keysym: u32,
+) -> Option<crate::runtime_key_binding::ModifierClass> {
+    use crate::runtime_key_binding::ModifierClass;
+    match keysym {
+        keysyms::KEY_Super_L | keysyms::KEY_Super_R | keysyms::KEY_Meta_L => {
+            Some(ModifierClass::Logo)
+        }
+        keysyms::KEY_Control_L | keysyms::KEY_Control_R => Some(ModifierClass::Ctrl),
+        keysyms::KEY_Alt_L | keysyms::KEY_Alt_R => Some(ModifierClass::Alt),
+        keysyms::KEY_Shift_L | keysyms::KEY_Shift_R => Some(ModifierClass::Shift),
+        _ => None,
+    }
+}
+
 fn unfocused_popup_focus_debug_enabled() -> bool {
     std::env::var_os("SHOJI_UNFOCUSED_POPUP_FOCUS_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
@@ -56,6 +73,55 @@ fn stack_hit_debug_enabled() -> bool {
 }
 
 impl ShojiWM {
+    /// Invoke a runtime key binding handler by id and apply the resulting
+    /// runtime config/state changes. Shared by the normal (intercepted) key
+    /// path and the modifier-tap (forwarded) path.
+    fn run_runtime_key_binding(&mut self, binding_id: &str) {
+        let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
+        self.sync_runtime_display_state();
+        match self
+            .decoration_evaluator
+            .invoke_key_binding(binding_id, now_ms)
+        {
+            Ok(invocation) => {
+                self.consume_runtime_display_config(invocation.display_config);
+                self.consume_runtime_key_binding_config(invocation.key_binding_config);
+                self.consume_runtime_pointer_config(invocation.pointer_config);
+                self.consume_runtime_input_config(invocation.input_config);
+                self.consume_runtime_event_config(invocation.event_config);
+                self.consume_runtime_process_config(invocation.process_config);
+                if !invocation.process_actions.is_empty() {
+                    self.apply_runtime_process_actions(invocation.process_actions);
+                }
+                if invocation.dirty {
+                    self.runtime_poll_dirty = true;
+                    self.mark_runtime_dirty_windows(
+                        invocation.dirty_window_ids,
+                        invocation.dirty_managed_window_ids,
+                    );
+                    self.request_tty_maintenance("runtime-key-binding-dirty");
+                    self.schedule_redraw();
+                }
+                if !invocation.actions.is_empty() {
+                    self.request_tty_maintenance("runtime-key-binding-actions");
+                    self.apply_runtime_window_actions(invocation.actions);
+                    self.schedule_redraw();
+                }
+                self.runtime_scheduler_enabled = invocation.next_poll_in_ms.is_some();
+                if invocation.next_poll_in_ms == Some(0) {
+                    self.request_tty_maintenance("runtime-key-binding-animation");
+                    self.schedule_redraw();
+                }
+            }
+            Err(error) => {
+                tracing::warn!(?error, binding_id, "failed to invoke runtime key binding");
+                self.config_error_report =
+                    Some(crate::config_error::ConfigErrorReport::runtime(error));
+                self.schedule_redraw();
+            }
+        }
+    }
+
     fn dispatch_pointer_move_async_event(
         &mut self,
         previous_pos: smithay::utils::Point<f64, smithay::utils::Logical>,
@@ -120,6 +186,54 @@ impl ShojiWM {
                         time,
                         |data, modifiers, handle| {
                             data.current_keyboard_modifiers = modifiers.clone();
+
+                            // --- modifier-only tap detection ---
+                            // If no other key/button is pressed between press and
+                            // release, fire modifier-only bindings as a "tap" on
+                            // release. The modifier key itself is still forwarded
+                            // normally (not consumed here).
+                            let tap_class = handle
+                                .raw_latin_sym_or_raw_current_sym()
+                                .and_then(|sym| modifier_class_of_keysym(sym.raw()));
+                            match key_phase {
+                                crate::runtime_key_binding::RuntimeKeyBindingPhase::Press => {
+                                    let was_idle = data.tap_pressed_keys == 0;
+                                    data.tap_pressed_keys += 1;
+                                    match tap_class {
+                                        Some(class) if was_idle => {
+                                            data.tap_armed_modifier = Some(class);
+                                            data.tap_interrupted = false;
+                                        }
+                                        _ => {
+                                            data.tap_interrupted = true;
+                                        }
+                                    }
+                                }
+                                crate::runtime_key_binding::RuntimeKeyBindingPhase::Release => {
+                                    if let Some(class) = tap_class
+                                        && data.tap_armed_modifier == Some(class)
+                                        && !data.tap_interrupted
+                                    {
+                                        for binding in runtime_key_bindings.iter() {
+                                            if binding.phase
+                                                == crate::runtime_key_binding::RuntimeKeyBindingPhase::Release
+                                                && binding.shortcut.modifier_class()
+                                                    == Some(class)
+                                            {
+                                                data.pending_tap_binding_ids
+                                                    .push(binding.id.clone());
+                                            }
+                                        }
+                                    }
+                                    data.tap_pressed_keys =
+                                        data.tap_pressed_keys.saturating_sub(1);
+                                    if data.tap_pressed_keys == 0 {
+                                        data.tap_armed_modifier = None;
+                                        data.tap_interrupted = false;
+                                    }
+                                }
+                            }
+
                             if let Some(binding_id) = runtime_key_bindings
                                 .iter()
                                 .find(|binding| binding.matches(key_phase, modifiers, &handle))
@@ -186,61 +300,20 @@ impl ShojiWM {
                     KeyboardAction::Quit => self.shutdown(),
                     KeyboardAction::ReloadConfig => self.reload_decoration_runtime(),
                     KeyboardAction::RuntimeKeyBinding(binding_id) => {
-                        let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
-                        self.sync_runtime_display_state();
-                        match self
-                            .decoration_evaluator
-                            .invoke_key_binding(&binding_id, now_ms)
-                        {
-                            Ok(invocation) => {
-                                self.consume_runtime_display_config(invocation.display_config);
-                                self.consume_runtime_key_binding_config(
-                                    invocation.key_binding_config,
-                                );
-                                self.consume_runtime_pointer_config(invocation.pointer_config);
-                                self.consume_runtime_input_config(invocation.input_config);
-                                self.consume_runtime_event_config(invocation.event_config);
-                                self.consume_runtime_process_config(invocation.process_config);
-                                if !invocation.process_actions.is_empty() {
-                                    self.apply_runtime_process_actions(invocation.process_actions);
-                                }
-                                if invocation.dirty {
-                                    self.runtime_poll_dirty = true;
-                                    self.mark_runtime_dirty_windows(
-                                        invocation.dirty_window_ids,
-                                        invocation.dirty_managed_window_ids,
-                                    );
-                                    self.request_tty_maintenance("runtime-key-binding-dirty");
-                                    self.schedule_redraw();
-                                }
-                                if !invocation.actions.is_empty() {
-                                    self.request_tty_maintenance("runtime-key-binding-actions");
-                                    self.apply_runtime_window_actions(invocation.actions);
-                                    self.schedule_redraw();
-                                }
-                                self.runtime_scheduler_enabled =
-                                    invocation.next_poll_in_ms.is_some();
-                                if invocation.next_poll_in_ms == Some(0) {
-                                    self.request_tty_maintenance("runtime-key-binding-animation");
-                                    self.schedule_redraw();
-                                }
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    ?error,
-                                    binding_id,
-                                    "failed to invoke runtime key binding"
-                                );
-                                self.config_error_report =
-                                    Some(crate::config_error::ConfigErrorReport::runtime(error));
-                                self.schedule_redraw();
-                            }
-                        }
+                        self.run_runtime_key_binding(&binding_id);
                     }
                     KeyboardAction::LogMarker(digit) => {
                         tracing::info!(marker = digit, "log marker");
                     }
                     KeyboardAction::Forward => {}
+                }
+
+                // Fire any modifier-only tap bindings queued above (the release was already forwarded).
+                if !self.pending_tap_binding_ids.is_empty() {
+                    let ids = std::mem::take(&mut self.pending_tap_binding_ids);
+                    for id in ids {
+                        self.run_runtime_key_binding(&id);
+                    }
                 }
             }
             InputEvent::PointerMotion { event, .. } => {
@@ -324,6 +397,11 @@ impl ShojiWM {
                 let button = event.button_code();
 
                 let button_state = event.state();
+
+                // A pointer button press cancels a pending modifier tap (e.g. Super+drag).
+                if matches!(button_state, ButtonState::Pressed) {
+                    self.tap_interrupted = true;
+                }
 
                 if pointer_button_debug_enabled() {
                     debug!(

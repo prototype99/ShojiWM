@@ -118,6 +118,39 @@ const MANAGED_WINDOW_ONLY_ANIMATION = {
   suppressSSDRebuild: true,
 } as const;
 
+// Windows-style edge snapping for floating drags. Distances are logical px.
+//   - within SNAP_EDGE_PX of an edge triggers that edge's zone
+//   - within SNAP_CORNER_PX of a corner (along both axes) triggers a quarter
+//   - SNAP_GAP_PX is the gap left between adjacent halves/quarters
+const SNAP_EDGE_PX = 16;
+const SNAP_CORNER_PX = 140;
+const SNAP_GAP_PX = 8;
+
+export type SnapZone =
+  | "maximize"
+  | "left"
+  | "right"
+  | "top-left"
+  | "top-right"
+  | "bottom-left"
+  | "bottom-right";
+
+/** Monitor-local logical rect (relative to the monitor origin) for the bar. */
+export interface SnapPreviewRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface SnapPreviewPayload {
+  monitor: string;
+  rect: SnapPreviewRect | null;
+  kind: "floating" | "tiling";
+}
+
+export type SnapPreviewBroadcaster = (preview: SnapPreviewPayload) => void;
+
 function markWindowCompositionDirty(window: WaylandWindow): void {
   markWindowDirty(window.id);
 }
@@ -307,6 +340,15 @@ export class HybridWindowManager {
   private workspaceScrollGestureRectAnimationsCancelled = false;
   private workspaceGestureSpeed = { ...DEFAULT_WORKSPACE_GESTURE_SPEED };
   private lastPointerPosition: PointerMoveEvent["position"] | null = null;
+  // Broadcasts the active snap-zone preview rect to external clients (the bar).
+  private snapPreviewBroadcaster: SnapPreviewBroadcaster | null = null;
+  // Pending Windows-style snap decision for the in-flight floating drag.
+  private floatingSnap: {
+    windowId: string;
+    monitor: string;
+    zone: SnapZone;
+    rect: ManagedWindowRect;
+  } | null = null;
 
   public constructor(
     naturalRootRect: (rect: WaylandWindow) => ManagedWindowRect,
@@ -666,20 +708,35 @@ export class HybridWindowManager {
 
       if (event.phase === "end") {
         this.isGrabbing = false;
-        window.unmaximize();
+        const snapped = this.finishFloatingDragSnap(event, workspace);
+        if (!snapped) {
+          window.unmaximize();
+        }
       } else if (event.phase === "cancel") {
         this.isGrabbing = false;
+        this.finishFloatingDragSnap(event, workspace);
+      } else {
+        this.updateFloatingDragSnap(event);
       }
       return;
     }
 
+    if (event.phase === "end" || event.phase === "cancel") {
+      this.isGrabbing = false;
+      const snapped = this.finishFloatingDragSnap(event, workspace);
+      if (!snapped) {
+        stopRectAnimation(window, WINDOW_STATE_RECT);
+        window.state[WINDOW_STATE_RECT].set(event.currentRect);
+        workspace?.syncFloatingWindowRect(window, event.currentRect);
+      }
+      this.raiseTiledWorkspaceFloatingWindows(workspace);
+      return;
+    }
+
+    this.updateFloatingDragSnap(event);
     stopRectAnimation(window, WINDOW_STATE_RECT);
     window.state[WINDOW_STATE_RECT].set(event.currentRect);
     workspace?.syncFloatingWindowRect(window, event.currentRect);
-
-    if (event.phase === "end" || event.phase === "cancel") {
-      this.isGrabbing = false;
-    }
     this.raiseTiledWorkspaceFloatingWindows(workspace);
   }
 
@@ -740,16 +797,24 @@ export class HybridWindowManager {
       }
 
       this.raiseTiledWorkspaceFloatingWindows(targetWorkspace);
+      this.updateFloatingDragSnap(event);
     }
 
     if (event.phase === "end" || event.phase === "cancel") {
-      stopRectAnimation(window, WINDOW_STATE_RECT);
-      window.state[WINDOW_STATE_RECT].set(nextRect);
-      drag.workspace.syncFloatingWindowRect(window, nextRect);
+      const snapped = this.finishFloatingDragSnap(event, drag.workspace);
+      if (!snapped) {
+        stopRectAnimation(window, WINDOW_STATE_RECT);
+        window.state[WINDOW_STATE_RECT].set(nextRect);
+        drag.workspace.syncFloatingWindowRect(window, nextRect);
+      }
       this.raiseTiledWorkspaceFloatingWindows(drag.workspace);
       this.floatingDrag = null;
       this.isGrabbing = false;
-      if (event.phase === "end" && window.state[WINDOW_STATE_MAXIMIZED]()) {
+      if (
+        !snapped &&
+        event.phase === "end" &&
+        window.state[WINDOW_STATE_MAXIMIZED]()
+      ) {
         window.unmaximize();
       }
     }
@@ -777,6 +842,7 @@ export class HybridWindowManager {
     }
 
     if (event.phase === "end" || event.phase === "cancel") {
+      this.emitSnapPreview(drag.workspace.monitor, null, "tiling");
       drag.workspace.endTileDrag(window, event.phase === "cancel");
       this.tileDrag = null;
       this.isGrabbing = false;
@@ -796,6 +862,11 @@ export class HybridWindowManager {
       window,
       event.currentRect,
       event.currentPointer.x,
+    );
+    this.emitSnapPreview(
+      targetWorkspace.monitor,
+      targetWorkspace.draggingSlotRect(),
+      "tiling",
     );
   }
 
@@ -906,11 +977,11 @@ export class HybridWindowManager {
     }
     const workspace = this.findWorkspaceForWindow(event.window);
     if (workspace) {
-      // 別ワークスペースのウィンドウなら、キーボード/ジェスチャと同じ
-      // スライド/フェードのアニメーションで切り替える(同一なら no-op)。
+      // If the window is on another workspace, switch with the same
+      // slide/fade animation as keyboard/gesture switching (no-op if same).
       this.switchWorkspaceTo(workspace.monitor, workspace.index);
     }
-    // 切替後に対象ウィンドウへフォーカス(switchWorkspaceTo の focusActiveWindow を上書き)。
+    // Focus the target window after switching (overrides switchWorkspaceTo's focusActiveWindow).
     event.window.focus();
   }
 
@@ -960,6 +1031,15 @@ export class HybridWindowManager {
 
   public refreshUsableAreaLayouts() {
     this.syncWorkspaces();
+    // While a window is being interactively dragged, do not re-apply the
+    // usable-area layout. It would clobber the in-flight drag — most visibly,
+    // a maximized window (which stays WINDOW_STATE_MAXIMIZED during the
+    // unmaximize-grab) gets snapped back to its full rect, flashing maximized
+    // whenever a layer surface mounts/unmounts (e.g. the snap-preview overlay).
+    // The layout is re-applied by the next layout event once the drag ends.
+    if (this.isGrabbing) {
+      return;
+    }
     for (const workspace of this.workspaces.values()) {
       workspace.refreshUsableAreaLayout();
     }
@@ -1043,6 +1123,12 @@ export class HybridWindowManager {
       this.workspaceForMonitor(this.currentMonitor) ??
       this.workspaces.values().next().value
     );
+  }
+
+  /** Name (connector) of the monitor under the cursor; updated on pointer move. */
+  public getCurrentMonitorName(): string {
+    this.syncWorkspaces();
+    return this.currentMonitor || WINDOW_MANAGER.output.list.at(0) || "";
   }
 
   /**
@@ -1799,6 +1885,241 @@ export class HybridWindowManager {
     }
     return undefined;
   }
+
+  // -------------------------------------------------------------------------
+  // Snap zones (Windows-style edge snapping for floating drags + tiling drag
+  // slot preview). The bar renders the preview rect; this side decides the
+  // zone, broadcasts the preview, and applies the snap on drop.
+  // -------------------------------------------------------------------------
+
+  public setSnapPreviewBroadcaster(broadcaster: SnapPreviewBroadcaster | null) {
+    this.snapPreviewBroadcaster = broadcaster;
+  }
+
+  /** Full logical rect of a monitor (ignores reserved insets). */
+  private monitorFullRect(monitor: string): ManagedWindowRect | null {
+    const output = WINDOW_MANAGER.output.current[monitor];
+    if (!output?.resolution) {
+      return null;
+    }
+    return {
+      x: output.position.x,
+      y: output.position.y,
+      width: output.resolution.width / output.scale,
+      height: output.resolution.height / output.scale,
+    };
+  }
+
+  /** Usable area inset by the maximized padding — the base for all snap rects. */
+  private monitorSnapBaseRect(monitor: string): ManagedWindowRect | null {
+    const usable =
+      WINDOW_MANAGER.layer.usableArea(monitor) ??
+      this.monitorFullRect(monitor);
+    if (!usable) {
+      return null;
+    }
+    return insetRect(usable, MAXIMIZED_WINDOW_PADDING);
+  }
+
+  /** Resolve the snap zone for a pointer near the physical screen edges. */
+  private floatingSnapZoneAt(
+    monitor: string,
+    px: number,
+    py: number,
+  ): SnapZone | null {
+    const full = this.monitorFullRect(monitor);
+    if (!full) {
+      return null;
+    }
+    const left = read(full.x);
+    const top = read(full.y);
+    const right = left + read(full.width);
+    const bottom = top + read(full.height);
+
+    const nearLeft = px <= left + SNAP_EDGE_PX;
+    const nearRight = px >= right - SNAP_EDGE_PX;
+    const nearTop = py <= top + SNAP_EDGE_PX;
+
+    // Corners win over edges so the quarters stay reachable.
+    if (nearLeft && py <= top + SNAP_CORNER_PX) return "top-left";
+    if (nearLeft && py >= bottom - SNAP_CORNER_PX) return "bottom-left";
+    if (nearRight && py <= top + SNAP_CORNER_PX) return "top-right";
+    if (nearRight && py >= bottom - SNAP_CORNER_PX) return "bottom-right";
+    if (nearTop) return "maximize";
+    if (nearLeft) return "left";
+    if (nearRight) return "right";
+    return null;
+  }
+
+  /** Target rect (global logical coords) for a snap zone on a monitor. */
+  private snapZoneRect(
+    monitor: string,
+    zone: SnapZone,
+  ): ManagedWindowRect | null {
+    const base = this.monitorSnapBaseRect(monitor);
+    if (!base) {
+      return null;
+    }
+    const bx = read(base.x);
+    const by = read(base.y);
+    const bw = read(base.width);
+    const bh = read(base.height);
+    const halfW = (bw - SNAP_GAP_PX) / 2;
+    const halfH = (bh - SNAP_GAP_PX) / 2;
+    const rightX = bx + halfW + SNAP_GAP_PX;
+    const bottomY = by + halfH + SNAP_GAP_PX;
+
+    switch (zone) {
+      case "maximize":
+        return { x: bx, y: by, width: bw, height: bh };
+      case "left":
+        return { x: bx, y: by, width: halfW, height: bh };
+      case "right":
+        return { x: rightX, y: by, width: halfW, height: bh };
+      case "top-left":
+        return { x: bx, y: by, width: halfW, height: halfH };
+      case "top-right":
+        return { x: rightX, y: by, width: halfW, height: halfH };
+      case "bottom-left":
+        return { x: bx, y: bottomY, width: halfW, height: halfH };
+      case "bottom-right":
+        return { x: rightX, y: bottomY, width: halfW, height: halfH };
+    }
+  }
+
+  /** Broadcast a preview rect (converted to monitor-local) or a hide (null). */
+  private emitSnapPreview(
+    monitor: string,
+    rect: ManagedWindowRect | null,
+    kind: "floating" | "tiling",
+  ) {
+    if (!this.snapPreviewBroadcaster) {
+      return;
+    }
+    if (!rect) {
+      this.snapPreviewBroadcaster({ monitor, rect: null, kind });
+      return;
+    }
+    const output = WINDOW_MANAGER.output.current[monitor];
+    const ox = output?.position.x ?? 0;
+    const oy = output?.position.y ?? 0;
+    this.snapPreviewBroadcaster({
+      monitor,
+      kind,
+      rect: {
+        x: read(rect.x) - ox,
+        y: read(rect.y) - oy,
+        width: read(rect.width),
+        height: read(rect.height),
+      },
+    });
+  }
+
+  /** Update the floating-drag snap candidate + preview during a move. */
+  private updateFloatingDragSnap(event: WindowMoveEvent) {
+    if (event.phase === "start") {
+      this.floatingSnap = null;
+      return;
+    }
+    if (event.phase === "end" || event.phase === "cancel") {
+      return;
+    }
+
+    const monitor =
+      event.outputName &&
+      WINDOW_MANAGER.output.list.includes(event.outputName)
+        ? event.outputName
+        : this.currentMonitor;
+    const zone = monitor
+      ? this.floatingSnapZoneAt(
+          monitor,
+          event.currentPointer.x,
+          event.currentPointer.y,
+        )
+      : null;
+
+    if (!monitor || !zone) {
+      if (this.floatingSnap) {
+        this.emitSnapPreview(this.floatingSnap.monitor, null, "floating");
+        this.floatingSnap = null;
+      }
+      return;
+    }
+
+    const rect = this.snapZoneRect(monitor, zone);
+    if (!rect) {
+      return;
+    }
+    this.floatingSnap = { windowId: event.window.id, monitor, zone, rect };
+    this.emitSnapPreview(monitor, rect, "floating");
+  }
+
+  /**
+   * Apply the pending snap on drop (or clear it on cancel). Returns true if the
+   * window was snapped, so the caller skips leaving it at the drop position.
+   */
+  private finishFloatingDragSnap(
+    event: WindowMoveEvent,
+    workspace: Workspace | undefined,
+  ): boolean {
+    const snap = this.floatingSnap;
+    this.floatingSnap = null;
+    if (!snap || snap.windowId !== event.window.id) {
+      if (snap) {
+        this.emitSnapPreview(snap.monitor, null, "floating");
+      }
+      return false;
+    }
+
+    this.emitSnapPreview(snap.monitor, null, "floating");
+    if (event.phase !== "end") {
+      return false;
+    }
+
+    const window = event.window;
+    const isMaximized =
+      window.state[WINDOW_STATE_MAXIMIZED]() || read(window.isMaximized);
+
+    if (snap.zone === "maximize") {
+      // Route through the real maximize so the compositor `isMaximized` state
+      // (and therefore the SSD maximize/restore icon) stays in sync. Calling
+      // maximize() fires onWindowMaximizeRequest, which applies the rect.
+      if (!isMaximized) {
+        window.maximize();
+      } else {
+        // Already maximized (e.g. re-dropped on the top edge): just re-apply
+        // the maximized rect for the monitor under the cursor.
+        const rect = this.maximizedRectForWindow(window);
+        playRectAnimation(
+          window,
+          WINDOW_STATE_RECT,
+          rect,
+          WINDOW_MANAGEMENT_EASING,
+          WINDOW_MANAGEMENT_ANIMATION_DURATION,
+        );
+        workspace?.syncFloatingWindowRect(window, rect);
+      }
+    } else {
+      // Half / quarter: ensure the window is unmaximized first (syncs the SSD
+      // icon), with the restore rect cleared so unmaximize() does not animate
+      // back to it and fight the snap, then place it at the zone rect.
+      if (isMaximized) {
+        window.state[WINDOW_STATE_RESTORE_RECT].set(null);
+        window.state[WINDOW_STATE_MAXIMIZED].set(false);
+        window.unmaximize();
+      }
+      playRectAnimation(
+        window,
+        WINDOW_STATE_RECT,
+        snap.rect,
+        WINDOW_MANAGEMENT_EASING,
+        WINDOW_MANAGEMENT_ANIMATION_DURATION,
+      );
+      workspace?.syncFloatingWindowRect(window, snap.rect);
+    }
+    this.raiseTiledWorkspaceFloatingWindows(workspace);
+    return true;
+  }
 }
 
 export class Workspace {
@@ -1819,6 +2140,9 @@ export class Workspace {
   private activeWindowId: string | null = null;
   private visibilityAnimationToken = 0;
   private draggingWindowId: string | null = null;
+  // Layout slot reserved for the tile being dragged (the gap opened in the row).
+  // Captured during applyLayout so the bar can preview where the tile will land.
+  private lastDraggingSlotRect: ManagedWindowRect | null = null;
   private scrollOffset = 0;
   private kineticScrollPoll: PollHandle | null = null;
   private kineticScrollToken = 0;
@@ -2254,6 +2578,7 @@ export class Workspace {
     const tileHeight = read(viewportRect.height);
     let nextX = read(viewportRect.x) - this.scrollOffset;
     const appliedRects: Record<string, ManagedWindowRect> = {};
+    this.lastDraggingSlotRect = null;
 
     tileable.forEach((window, index) => {
       const tileWidth = this.tileWidthForWindow(window, viewportRect);
@@ -2266,6 +2591,9 @@ export class Workspace {
             height: tileHeight,
           };
       appliedRects[window.id] = rect;
+      if (window.id === this.draggingWindowId) {
+        this.lastDraggingSlotRect = rect;
+      }
       if (window.id !== this.draggingWindowId) {
         if (animate) {
           playRectAnimation(
@@ -2321,6 +2649,11 @@ export class Workspace {
     this.tileWidthByWindowId.set(event.window.id, width);
     this.scrollToWindow(event.window);
     this.applyLayout();
+  }
+
+  /** Layout slot reserved for the tile being dragged, or null when not dragging. */
+  public draggingSlotRect(): ManagedWindowRect | null {
+    return this.draggingWindowId ? this.lastDraggingSlotRect : null;
   }
 
   public beginTileDrag(window: WaylandWindow, rect: ManagedWindowRect) {
