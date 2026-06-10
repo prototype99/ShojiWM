@@ -2512,6 +2512,25 @@ export class Workspace {
     }
 
     for (const window of this.windows) {
+      // A window that is still maximized across the mode switch keeps its
+      // maximized rect. Restoring FLOATING_RECT here would configure the
+      // client to the rect captured at first commit (often degenerate),
+      // collapsing it to its minimum size. (Chrome and friends remember
+      // their previous session state and start maximized, which makes this
+      // easy to hit.)
+      if (window.state[WINDOW_STATE_MAXIMIZED]()) {
+        playRectAnimation(
+          window,
+          WINDOW_STATE_RECT,
+          this.maximizedRootRect(window),
+          WINDOW_MANAGEMENT_EASING,
+          WINDOW_MANAGEMENT_ANIMATION_DURATION,
+          MANAGED_WINDOW_ONLY_ANIMATION,
+        );
+        window.state[WINDOW_STATE_FLOATING_RECT].set(null);
+        this.syncWindowVisibleOutputs(window);
+        continue;
+      }
       const rect = window.state[WINDOW_STATE_FLOATING_RECT]();
       if (rect) {
         const viewportRect = this.shouldTile(window)
@@ -3152,6 +3171,12 @@ export class Workspace {
     animate = true,
   ) {
     for (const window of this.floatingWindows()) {
+      // A maximized window's rect is owned by the maximize flow. Rolling it
+      // back to FLOATING_RECT here could hit a degenerate rect (same reason
+      // as in setTiled(false)).
+      if (window.state[WINDOW_STATE_MAXIMIZED]()) {
+        continue;
+      }
       const contentRect =
         window.state[WINDOW_STATE_FLOATING_RECT]() ??
         this.viewportRectToFloatingContentRect(
@@ -3198,11 +3223,27 @@ export class Workspace {
     const logicalX = usableRect?.x ?? monitor.position.x;
     const logicalY = usableRect?.y ?? monitor.position.y;
 
+    let width = read(sizeRect.width);
+    let height = read(sizeRect.height);
+    // Reading the natural size while the client geometry is still unsettled
+    // (≈0, e.g. right after the first commit) yields a degenerate rect that
+    // is nothing but the SSD frame. Freezing that as the floating restore
+    // rect would later configure the client to a tiny size when switching to
+    // floating mode. Fall back to a default size based on the usable area
+    // only when the rect is clearly degenerate (frame + titlebar at most).
+    // 50px is a conservative threshold that no real app's natural size ever
+    // falls under.
+    const DEGENERATE_SIZE_PX = 50;
+    if (width < DEGENERATE_SIZE_PX || height < DEGENERATE_SIZE_PX) {
+      width = Math.round(logicalWidth * 0.6);
+      height = Math.round(logicalHeight * 0.7);
+    }
+
     return {
-      x: logicalX + (logicalWidth - read(sizeRect.width)) / 2,
-      y: logicalY + (logicalHeight - read(sizeRect.height)) / 2,
-      width: read(sizeRect.width),
-      height: read(sizeRect.height),
+      x: logicalX + (logicalWidth - width) / 2,
+      y: logicalY + (logicalHeight - height) / 2,
+      width,
+      height,
     };
   }
 
