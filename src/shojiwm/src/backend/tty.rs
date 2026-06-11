@@ -6406,12 +6406,37 @@ fn composed_popup_scene_elements(
             .behind
             .as_ref()
             .filter(|effect| !matches!(effect.effect.input, EffectInput::PopupSource(_)))
-            .filter(|effect| effect.effect.supports_framebuffer_backdrop())
+            .filter(|effect| effect.effect.supports_popup_framebuffer_backdrop())
             .and_then(|effect| {
                 let rect = expand_logical_rect(popup_rect, effect.outsets);
                 let stable_key =
                     format!("{}@popup-behind-framebuffer@{}", popup_id, output.name());
-                crate::backend::shader_effect::framebuffer_backdrop_element_for_output_rects(
+                let popup_source = if effect.effect.uses_popup_source_input() {
+                    let mut tracker =
+                        smithay::backend::renderer::damage::OutputDamageTracker::new(
+                            (0, 0),
+                            1.0,
+                            Transform::Normal,
+                        );
+                    capture_snapshot_from_output_elements(
+                        renderer,
+                        output_geo,
+                        rect,
+                        scale,
+                        None,
+                        &mut tracker,
+                        &popup_elements,
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|snapshot| snapshot.texture)
+                } else {
+                    None
+                };
+                if effect.effect.uses_popup_source_input() && popup_source.is_none() {
+                    return None;
+                }
+                crate::backend::shader_effect::framebuffer_backdrop_element_for_output_rects_with_popup_source(
                     renderer,
                     popup_framebuffer_effect_states
                         .entry(stable_key)
@@ -6421,6 +6446,7 @@ fn composed_popup_scene_elements(
                     output_geo,
                     scale,
                     1.0,
+                    popup_source,
                 )
                 .inspect_err(|error| {
                     warn!(popup_id, ?error, "failed to build popup behind effect");
@@ -8078,16 +8104,11 @@ fn lower_layer_scene_elements(
             popup_effect_cache,
             popup_framebuffer_effect_states,
         ));
-        let root_elements = window_render::layer_surface_root_elements(
-            renderer,
-            output,
-            layer_surface,
-            scale,
-            1.0,
-        )
-        .into_iter()
-        .map(TtyRenderElements::Window)
-        .collect::<Vec<_>>();
+        let root_elements =
+            window_render::layer_surface_root_elements(renderer, output, layer_surface, scale, 1.0)
+                .into_iter()
+                .map(TtyRenderElements::Window)
+                .collect::<Vec<_>>();
         if let (Some(effects), Some(layer_rect)) = (
             configured_layer_effects.get(&layer_id),
             layer_surface_logical_rect(output, layer_surface),

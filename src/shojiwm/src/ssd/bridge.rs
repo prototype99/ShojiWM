@@ -5,8 +5,7 @@ use super::{
     ButtonNode, Color, CompiledEffect, DecorationInteractionHandlers, DecorationNode,
     DecorationNodeKind, DecorationStateChangeHandler, DecorationStyle, Edges, EffectAlphaMode,
     EffectInput, EffectInvalidationPolicy, EffectOutsets, EffectStage, ImageNode, JustifyContent,
-    LabelNode,
-    LayoutDirection, NodeTransform, NoiseKind, NoiseStage, Overflow, PointerEvents,
+    LabelNode, LayoutDirection, NodeTransform, NoiseKind, NoiseStage, Overflow, PointerEvents,
     PositionOffsets, ShaderEffectNode, ShaderModule, ShaderStage, ShaderUniformValue,
     StylePosition, WindowAction, WindowEffectConfig, WindowEffectSlot, WindowSourceInclude,
 };
@@ -593,7 +592,9 @@ impl TryFrom<WireWindowEffectSlot> for WindowEffectSlot {
     type Error = DecorationBridgeError;
 
     fn try_from(value: WireWindowEffectSlot) -> Result<Self, Self::Error> {
-        if value.kind != "window-effect" && value.kind != "layer-effect" && value.kind != "popup-effect"
+        if value.kind != "window-effect"
+            && value.kind != "layer-effect"
+            && value.kind != "popup-effect"
         {
             return Err(DecorationBridgeError::InvalidShaderDescriptor);
         }

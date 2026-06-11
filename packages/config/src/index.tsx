@@ -23,6 +23,7 @@ import {
   read,
   type DisplayConfigDraft,
   compilePopupEffect,
+  popupSource,
 } from "shoji_wm";
 import type { CompositionRenderable, ManagedWindowRect } from "shoji_wm/types";
 import { createIpcServer } from "shoji_wm/ipc";
@@ -402,7 +403,7 @@ WINDOW_MANAGER.effect.layer = () => ({
   behind: LAYER_BLUR_MASK,
 });
 
-const LAYER_POPUP_BLUR_MASK = compilePopupEffect({
+const POPUP_BLUR = compilePopupEffect({
   input: backdropSource(),
   invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
   // The mask stage intentionally outputs transparency (the blur is clipped
@@ -413,7 +414,7 @@ const LAYER_POPUP_BLUR_MASK = compilePopupEffect({
     dualKawaseBlur({ radius: 4, passes: 2 }),
     shaderStage(loadShader("./src/layer-blur-mask.frag"), {
       textures: {
-        layer_mask: layerSource(),
+        layer_mask: popupSource(),
       },
       uniforms: {
         opacity_threshold: 0.25,
@@ -424,8 +425,8 @@ const LAYER_POPUP_BLUR_MASK = compilePopupEffect({
 });
 
 WINDOW_MANAGER.effect.popup = () => ({
-  behind: LAYER_POPUP_BLUR_MASK,
-})
+  behind: POPUP_BLUR,
+});
 
 WINDOW_MANAGER.event.onOpen((window) => {
   HYBRID_WINDOW_MANAGER.onOpen(window);

@@ -434,18 +434,16 @@ fn validate_popup_effect_config(
 ) -> Result<WindowEffectConfig, DecorationBridgeError> {
     let is_popup_source =
         |slot: &super::WindowEffectSlot| matches!(slot.effect.input, EffectInput::PopupSource(_));
-    // `behind` additionally accepts backdrop inputs, but only ones that can be
-    // resolved from the framebuffer at draw time: popups render inline with
-    // their parent's element stream, so there is no offline "scene below the
-    // popup" capture path (unlike layers).
-    if effects
-        .behind
+    // `behind` additionally accepts backdrop inputs that can be resolved from
+    // the framebuffer at draw time. They may sample a pre-captured popup
+    // source, but not xray/window/layer sources: popups render inline with
+    // their parent's element stream, so there is no offline scene capture.
+    if effects.behind.as_ref().is_some_and(|slot| {
+        !is_popup_source(slot) && !slot.effect.supports_popup_framebuffer_backdrop()
+    }) || effects
+        .behind_root_surface
         .as_ref()
-        .is_some_and(|slot| !is_popup_source(slot) && !slot.effect.supports_framebuffer_backdrop())
-        || effects
-            .behind_root_surface
-            .as_ref()
-            .is_some_and(|slot| !is_popup_source(slot))
+        .is_some_and(|slot| !is_popup_source(slot))
         || effects
             .in_front
             .as_ref()
@@ -3864,7 +3862,9 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
 mod tests {
     use super::*;
     use crate::ssd::{
-        DecorationNodeKind,
+        BackdropBlur, CompiledEffect, DecorationNodeKind, EffectAlphaMode,
+        EffectInvalidationPolicy, EffectOutsets, EffectStage, ShaderModule, ShaderStage,
+        WindowEffectSlot, WindowSourceInclude,
         window_model::{WaylandWindowSnapshot, WindowPositionSnapshot},
     };
 
@@ -3920,5 +3920,39 @@ mod tests {
                 .expect("unfocused evaluation should succeed");
 
         assert_ne!(focused.root.style.border, unfocused.root.style.border);
+    }
+
+    #[test]
+    fn popup_backdrop_mask_can_sample_popup_source() {
+        let effect = CompiledEffect {
+            input: EffectInput::Backdrop,
+            invalidate: EffectInvalidationPolicy::Always,
+            pipeline: vec![
+                EffectStage::DualKawaseBlur(BackdropBlur {
+                    radius: 4,
+                    passes: 2,
+                }),
+                EffectStage::Shader(ShaderStage {
+                    shader: ShaderModule {
+                        path: "popup-mask.frag".into(),
+                    },
+                    uniforms: std::collections::BTreeMap::new(),
+                    textures: std::collections::BTreeMap::from([(
+                        "popup_mask".into(),
+                        EffectInput::PopupSource(WindowSourceInclude::Full),
+                    )]),
+                }),
+            ],
+            alpha: EffectAlphaMode::Preserve,
+        };
+        let effects = WindowEffectConfig {
+            behind: Some(WindowEffectSlot {
+                effect,
+                outsets: EffectOutsets::default(),
+            }),
+            ..Default::default()
+        };
+
+        assert!(validate_popup_effect_config(effects).is_ok());
     }
 }

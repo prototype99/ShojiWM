@@ -36,6 +36,7 @@ import {
   hasActiveAnimations,
   type CompiledEffectHandle,
   type LayerEffectAssignment,
+  type PopupEffectAssignment,
   createReactiveLayer,
   createWindowAnimationControllerWithStore,
   createCompositionEvaluationCache,
@@ -92,6 +93,7 @@ import {
   WINDOW_MANAGER,
   type WaylandLayerSnapshot,
   type WaylandLayer,
+  type WaylandPopup,
   type WaylandWindowActions,
   type WaylandWindowSnapshot,
   type WindowEffectAssignment,
@@ -358,6 +360,16 @@ interface EvaluateLayerEffectsRequest {
   inputState?: Record<string, InputDeviceInfo>;
 }
 
+interface EvaluatePopupEffectsRequest {
+  requestId: number;
+  kind: "evaluatePopupEffects";
+  outputName: string;
+  nowMs: number;
+  popups: WaylandPopup[];
+  displayState: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
+}
+
 interface LifecycleEnableRequest {
   requestId: number;
   kind: "lifecycleEnable";
@@ -393,6 +405,7 @@ type RuntimeRequest =
   | GestureSwipeAsyncRequest
   | GetEffectConfigRequest
   | EvaluateLayerEffectsRequest
+  | EvaluatePopupEffectsRequest
   | LifecycleEnableRequest
   | LifecycleDisableRequest;
 
@@ -689,6 +702,21 @@ interface EvaluateLayerEffectsSuccess {
   processActions?: RuntimeProcessSpawnAction[];
 }
 
+interface EvaluatePopupEffectsSuccess {
+  requestId: number;
+  ok: true;
+  kind: "evaluatePopupEffects";
+  effects: RuntimePopupEffectAssignment[];
+  nextPollInMs?: number;
+  displayConfig?: { outputs: DisplayConfigDraft };
+  keyBindingConfig?: { entries: RuntimeKeyBindingConfigEntry[] };
+  pointerConfig?: RuntimePointerConfig;
+  inputConfig?: { config: InputConfigDraft };
+  eventConfig?: RuntimeEventConfig;
+  processConfig?: { entries: RuntimeProcessConfigEntry[] };
+  processActions?: RuntimeProcessSpawnAction[];
+}
+
 interface LifecycleEnableSuccess {
   requestId: number;
   ok: true;
@@ -721,12 +749,18 @@ interface RuntimeLayerEffectAssignment {
   effects: LayerEffectAssignment | null;
 }
 
+interface RuntimePopupEffectAssignment {
+  popupId: string;
+  effects: PopupEffectAssignment | null;
+}
+
 interface RuntimeEffectConfig {
   background_effect: CompiledEffectHandle | null;
   window?: (
     window: ReturnType<typeof createCompositionEvaluationCache>["window"],
   ) => WindowEffectAssignment | null;
   layer?: (layer: WaylandLayer) => LayerEffectAssignment | null;
+  popup?: (popup: WaylandPopup) => PopupEffectAssignment | null;
 }
 
 interface RuntimeProcessConfigEntry {
@@ -927,6 +961,8 @@ const stats = {
   getEffectConfig: 0,
   evaluateLayerEffects: 0,
   evaluateLayerEffectsAnim: 0,
+  evaluatePopupEffects: 0,
+  evaluatePopupEffectsAnim: 0,
   markWindowDirty: 0,
   markRuntimeDirty: 0,
   markLayerDirty: 0,
@@ -1090,6 +1126,10 @@ async function main() {
           case "evaluateLayerEffects":
             stats.evaluateLayerEffects++;
             if (hasActiveAnimations()) stats.evaluateLayerEffectsAnim++;
+            break;
+          case "evaluatePopupEffects":
+            stats.evaluatePopupEffects++;
+            if (hasActiveAnimations()) stats.evaluatePopupEffectsAnim++;
             break;
           case "lifecycleEnable":
           case "lifecycleDisable":
@@ -1393,6 +1433,32 @@ async function main() {
               keyBindingConfig,
               pointerConfig,
               inputConfig,
+              processConfig,
+              processActions,
+            });
+          } else if (request.kind === "evaluatePopupEffects") {
+            const result = evaluatePopupEffects(
+              effectConfig,
+              request.outputName,
+              request.popups,
+            );
+            const keyBindingConfig = pendingKeyBindingConfigPayload();
+            const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
+            const eventConfig = pendingEventConfigPayload(events);
+            const processConfig = pendingProcessConfigPayload();
+            const processActions = pendingProcessActionsPayload();
+            await writeResponse(output, {
+              requestId: request.requestId,
+              ok: true,
+              kind: "evaluatePopupEffects",
+              effects: result.effects,
+              nextPollInMs: hasActiveAnimations() ? 0 : result.nextPollInMs,
+              displayConfig: pendingDisplayConfigPayload(),
+              keyBindingConfig,
+              pointerConfig,
+              inputConfig,
+              eventConfig,
               processConfig,
               processActions,
             });
@@ -2393,6 +2459,28 @@ function evaluateLayerEffect(
   }
 }
 
+function evaluatePopupEffects(
+  effectConfig: RuntimeEffectConfig,
+  outputName: string,
+  popups: WaylandPopup[],
+): {
+  effects: RuntimePopupEffectAssignment[];
+  nextPollInMs?: number;
+} {
+  const evaluate = effectConfig.popup;
+  return {
+    effects: popups
+      .filter((popup) => popup.outputName === outputName)
+      .map((popup) => ({
+        popupId: popup.id,
+        effects: evaluate
+          ? (resolveSignals(evaluate(popup)) as PopupEffectAssignment | null)
+          : null,
+      })),
+    nextPollInMs: hasActiveAnimations() ? 0 : peekNextPollDelay(),
+  };
+}
+
 function resolveSignals<T>(value: T): T {
   if (isSignal(value)) {
     return read(value) as T;
@@ -3149,6 +3237,7 @@ function resolveEffectConfig(
               background_effect?: CompiledEffectHandle | null;
               window?: RuntimeEffectConfig["window"];
               layer?: RuntimeEffectConfig["layer"];
+              popup?: RuntimeEffectConfig["popup"];
             };
           }
         | undefined
@@ -3158,6 +3247,7 @@ function resolveEffectConfig(
     background_effect: maybeEffect?.background_effect ?? null,
     window: maybeEffect?.window,
     layer: maybeEffect?.layer,
+    popup: maybeEffect?.popup,
   };
 }
 
@@ -3184,6 +3274,7 @@ function writeResponse(
     | PointerMoveAsyncSuccess
     | GetEffectConfigSuccess
     | EvaluateLayerEffectsSuccess
+    | EvaluatePopupEffectsSuccess
     | LifecycleEnableSuccess
     | LifecycleDisableSuccess
     | RuntimeFailure,

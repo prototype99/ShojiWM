@@ -540,9 +540,7 @@ fn composed_popup_scene_elements(
         let behind_popup_source = effects
             .behind
             .as_ref()
-            .filter(|effect| {
-                matches!(effect.effect.input, crate::ssd::EffectInput::PopupSource(_))
-            })
+            .filter(|effect| matches!(effect.effect.input, crate::ssd::EffectInput::PopupSource(_)))
             .map(|effect| render_slot("popup-behind", effect))
             .unwrap_or_default();
         // Backdrop-input behind effects resolve from the framebuffer below the
@@ -553,12 +551,32 @@ fn composed_popup_scene_elements(
             .filter(|effect| {
                 !matches!(effect.effect.input, crate::ssd::EffectInput::PopupSource(_))
             })
-            .filter(|effect| effect.effect.supports_framebuffer_backdrop())
+            .filter(|effect| effect.effect.supports_popup_framebuffer_backdrop())
             .and_then(|effect| {
                 let rect = expand_effect_rect(popup_rect, effect.outsets);
                 let stable_key =
                     format!("{}@popup-behind-framebuffer@{}", popup_id, output.name());
-                crate::backend::shader_effect::framebuffer_backdrop_element_for_output_rects(
+                let popup_source = if effect.effect.uses_popup_source_input() {
+                    let mut tracker = OutputDamageTracker::new((0, 0), 1.0, Transform::Normal);
+                    capture_snapshot_from_output_elements(
+                        renderer,
+                        output_geo,
+                        rect,
+                        scale,
+                        None,
+                        &mut tracker,
+                        &popup_elements,
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|snapshot| snapshot.texture)
+                } else {
+                    None
+                };
+                if effect.effect.uses_popup_source_input() && popup_source.is_none() {
+                    return None;
+                }
+                crate::backend::shader_effect::framebuffer_backdrop_element_for_output_rects_with_popup_source(
                     renderer,
                     popup_framebuffer_effect_states
                         .entry(stable_key)
@@ -568,6 +586,7 @@ fn composed_popup_scene_elements(
                     output_geo,
                     scale,
                     1.0,
+                    popup_source,
                 )
                 .ok()
                 .flatten()
@@ -2898,16 +2917,11 @@ fn lower_layer_scene_elements(
             &mut state.popup_effect_cache,
             &mut state.popup_framebuffer_effect_states,
         ));
-        let root_elements = window_render::layer_surface_root_elements(
-            renderer,
-            output,
-            layer_surface,
-            scale,
-            1.0,
-        )
-        .into_iter()
-        .map(WinitRenderElements::Window)
-        .collect::<Vec<_>>();
+        let root_elements =
+            window_render::layer_surface_root_elements(renderer, output, layer_surface, scale, 1.0)
+                .into_iter()
+                .map(WinitRenderElements::Window)
+                .collect::<Vec<_>>();
         let effects = state.configured_layer_effects.get(&layer_id).cloned();
         if let (Some(effects), Some(layer_rect)) =
             (effects, layer_surface_logical_rect(output, layer_surface))
@@ -3842,16 +3856,11 @@ fn upper_layer_scene_elements(
         if let (Some(effects), Some(layer_rect)) =
             (effects, layer_surface_logical_rect(output, &layer_surface))
         {
-            let capture_elements = window_render::layer_surface_elements(
-                renderer,
-                output,
-                &layer_surface,
-                scale,
-                1.0,
-            )
-            .into_iter()
-            .map(WinitRenderElements::Window)
-            .collect::<Vec<_>>();
+            let capture_elements =
+                window_render::layer_surface_elements(renderer, output, &layer_surface, scale, 1.0)
+                    .into_iter()
+                    .map(WinitRenderElements::Window)
+                    .collect::<Vec<_>>();
             elements.extend(compose_layer_source_effects(
                 renderer,
                 output,

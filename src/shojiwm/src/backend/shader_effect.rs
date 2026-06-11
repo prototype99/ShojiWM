@@ -156,6 +156,7 @@ pub struct StableBackdropFramebufferElement {
     render_scale: f32,
     clip_rect: Option<SnappedLogicalRect>,
     clip_radius: f32,
+    popup_source: Option<GlesTexture>,
     kind: Kind,
 }
 
@@ -568,6 +569,21 @@ pub fn framebuffer_backdrop_element_for_output_rects(
     scale: Scale<f64>,
     alpha: f32,
 ) -> Result<Option<StableBackdropFramebufferElement>, ShaderEffectError> {
+    framebuffer_backdrop_element_for_output_rects_with_popup_source(
+        renderer, state, rects, effect, output_geo, scale, alpha, None,
+    )
+}
+
+pub fn framebuffer_backdrop_element_for_output_rects_with_popup_source(
+    renderer: &mut GlesRenderer,
+    state: &mut ShaderEffectElementState,
+    rects: &[LogicalRect],
+    effect: CompiledEffect,
+    output_geo: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    alpha: f32,
+    popup_source: Option<GlesTexture>,
+) -> Result<Option<StableBackdropFramebufferElement>, ShaderEffectError> {
     let Some(rect) = crate::backend::window::bounding_box_for_rects(rects) else {
         return Ok(None);
     };
@@ -604,25 +620,25 @@ pub fn framebuffer_backdrop_element_for_output_rects(
             })
             .collect()
     };
-    state
-        .backdrop_element(
-            renderer,
-            ShaderEffectSpec {
-                rect: Rectangle::new(
-                    Point::from((area.x, area.y)),
-                    (area.width, area.height).into(),
-                ),
-                geometry,
-                framebuffer_regions,
-                framebuffer_capture_padding,
-                shader: effect,
-                alpha_bits: alpha.to_bits(),
-                render_scale: scale.x as f32,
-                clip_rect: None,
-                clip_radius: 0.0,
-            },
-        )
-        .map(Some)
+    let mut element = state.backdrop_element(
+        renderer,
+        ShaderEffectSpec {
+            rect: Rectangle::new(
+                Point::from((area.x, area.y)),
+                (area.width, area.height).into(),
+            ),
+            geometry,
+            framebuffer_regions,
+            framebuffer_capture_padding,
+            shader: effect,
+            alpha_bits: alpha.to_bits(),
+            render_scale: scale.x as f32,
+            clip_rect: None,
+            clip_radius: 0.0,
+        },
+    )?;
+    element.popup_source = popup_source;
+    Ok(Some(element))
 }
 
 /// Ensures a thread-local scratch FBO exists and returns its id. Must be
@@ -884,7 +900,18 @@ impl ShaderEffectElementState {
             self.last_spec = Some(spec.clone());
         }
 
-        let program = compile_display_texture_program(renderer)?;
+        // Framebuffer effects run their pipeline with DeferToDisplay (no
+        // materialize finish pass), so this display program is the only place
+        // the effect's alpha mode is applied. Effects declaring
+        // `alpha: "preserve"` (e.g. popup blur masks) must keep the
+        // pipeline's alpha; forcing it opaque would turn masked-out regions
+        // into opaque black.
+        let program = match spec.shader.alpha {
+            crate::ssd::EffectAlphaMode::Preserve => {
+                compile_display_texture_program_preserve_alpha(renderer)?
+            }
+            crate::ssd::EffectAlphaMode::Opaque => compile_display_texture_program(renderer)?,
+        };
         Ok(StableBackdropFramebufferElement {
             shader: spec.shader,
             program,
@@ -898,6 +925,7 @@ impl ShaderEffectElementState {
             render_scale: spec.render_scale,
             clip_rect: spec.clip_rect,
             clip_radius: spec.clip_radius,
+            popup_source: None,
             kind: Kind::Unspecified,
         })
     }
@@ -1182,17 +1210,33 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
         inner.pipeline.begin_frame();
         let mut guard = frame.renderer();
         let renderer = guard.as_mut();
-        match apply_effect_pipeline_cached_with_finish_mode(
-            renderer,
-            framebuffer_texture,
-            None,
-            (size.w, size.h),
-            sample_src,
-            Some((dst.size.w, dst.size.h)),
-            &self.shader,
-            &mut inner.pipeline,
-            BackdropFinishMode::DeferToDisplay,
-        ) {
+        let result = if let Some(popup_source) = self.popup_source.clone() {
+            apply_effect_pipeline_cached_with_popup_source_and_finish_mode(
+                renderer,
+                framebuffer_texture,
+                None,
+                popup_source,
+                (size.w, size.h),
+                sample_src,
+                Some((dst.size.w, dst.size.h)),
+                &self.shader,
+                &mut inner.pipeline,
+                BackdropFinishMode::DeferToDisplay,
+            )
+        } else {
+            apply_effect_pipeline_cached_with_finish_mode(
+                renderer,
+                framebuffer_texture,
+                None,
+                (size.w, size.h),
+                sample_src,
+                Some((dst.size.w, dst.size.h)),
+                &self.shader,
+                &mut inner.pipeline,
+                BackdropFinishMode::DeferToDisplay,
+            )
+        };
+        match result {
             Ok(texture) => {
                 inner.sample_src = if texture.size() == size {
                     sample_src
@@ -2695,24 +2739,50 @@ pub fn apply_effect_pipeline_cached_for_key_with_popup_source(
     SHARED_EFFECT_PIPELINE_CACHES.with(|caches| {
         let mut caches = caches.borrow_mut();
         let cache = caches.pipeline(renderer, cache_key);
-        let mut ctx = EffectExecutionContext {
-            backdrop: texture,
-            xray_backdrop: xray_texture,
-            layer_source: None,
-            popup_source: Some(popup_source),
-            size,
-            named: HashMap::new(),
-        };
-        run_effect_pipeline(
+        apply_effect_pipeline_cached_with_popup_source_and_finish_mode(
             renderer,
-            effect,
-            &mut ctx,
+            texture,
+            xray_texture,
+            popup_source,
+            size,
             sample_region,
             output_size,
-            Some(cache),
+            effect,
+            cache,
             BackdropFinishMode::Materialize,
         )
     })
+}
+
+fn apply_effect_pipeline_cached_with_popup_source_and_finish_mode(
+    renderer: &mut GlesRenderer,
+    texture: GlesTexture,
+    xray_texture: Option<GlesTexture>,
+    popup_source: GlesTexture,
+    size: (i32, i32),
+    sample_region: Option<Rectangle<f64, Buffer>>,
+    output_size: Option<(i32, i32)>,
+    effect: &CompiledEffect,
+    cache: &mut EffectPipelineCache,
+    finish_mode: BackdropFinishMode,
+) -> Result<GlesTexture, ShaderEffectError> {
+    let mut ctx = EffectExecutionContext {
+        backdrop: texture,
+        xray_backdrop: xray_texture,
+        layer_source: None,
+        popup_source: Some(popup_source),
+        size,
+        named: HashMap::new(),
+    };
+    run_effect_pipeline(
+        renderer,
+        effect,
+        &mut ctx,
+        sample_region,
+        output_size,
+        Some(cache),
+        finish_mode,
+    )
 }
 
 pub fn log_gap_texture_region_readback(

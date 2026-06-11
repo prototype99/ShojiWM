@@ -24,9 +24,9 @@ use super::{
     ComputedDecorationTree, DecorationCachedEvaluationResult, DecorationEvaluationError,
     DecorationEvaluationResult, DecorationEvaluator, DecorationHandlerInvocation,
     DecorationHitTestResult, DecorationSchedulerTick, DecorationTree, LayerEffectEvaluationResult,
-    PopupEffectEvaluationResult,
-    LogicalPoint, LogicalRect, StaticDecorationEvaluator, WaylandLayerSnapshot,
-    WaylandWindowSnapshot, WindowPositionSnapshot, WindowTransform, reapply_tree_preserving_layout,
+    LogicalPoint, LogicalRect, PopupEffectEvaluationResult, StaticDecorationEvaluator,
+    WaylandLayerSnapshot, WaylandWindowSnapshot, WindowPositionSnapshot, WindowTransform,
+    reapply_tree_preserving_layout,
     window_model::{
         ManagedWindowAnimationEasingSnapshot, ManagedWindowAnimationMode,
         ManagedWindowAnimationSnapshot, ManagedWindowPointAnimationSnapshot,
@@ -2054,9 +2054,9 @@ impl ShojiWM {
             .collect::<std::collections::HashSet<_>>();
         let now_ms = Duration::from(self.clock.now()).as_millis() as u64;
         self.sync_runtime_display_state();
-        let evaluation = self
-            .decoration_evaluator
-            .evaluate_popup_effects(output_name, &snapshots, now_ms)?;
+        let evaluation =
+            self.decoration_evaluator
+                .evaluate_popup_effects(output_name, &snapshots, now_ms)?;
         self.consume_runtime_display_config(evaluation.display_config.clone());
         self.consume_runtime_key_binding_config(evaluation.key_binding_config.clone());
         self.consume_runtime_pointer_config(evaluation.pointer_config.clone());

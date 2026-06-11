@@ -488,10 +488,10 @@ export interface PopupSourceHandle {
 
 /**
  * Inputs allowed for popup effects. Note that a backdrop input on the
- * `behind` slot must be resolvable from the framebuffer at draw time (plain
- * blur etc. — no xray/window/layer sources): popups render inline with their
- * parent's element stream, so there is no offline "scene below the popup"
- * capture path.
+ * `behind` slot must be resolvable from the framebuffer at draw time. It may
+ * additionally use popupSource() as a named shader texture, but cannot use
+ * xray/window/layer sources: popups render inline with their parent's element
+ * stream, so there is no offline "scene below the popup" capture path.
  */
 export type PopupEffectInputHandle = PopupSourceHandle | BackdropSourceHandle;
 
@@ -541,7 +541,8 @@ export interface PopupEffectAssignment {
   /**
    * Drawn between the popup and the content below it. Accepts popupSource()
    * inputs (e.g. a drop shadow derived from the popup's own alpha) or a
-   * framebuffer-resolvable backdrop effect (e.g. plain blur behind the popup).
+   * framebuffer-resolvable backdrop effect, optionally sampling popupSource()
+   * as a named shader texture for masking.
    */
   behind?: PopupEffectHandle | null;
   behindRootSurface?: PopupEffectHandle | null;

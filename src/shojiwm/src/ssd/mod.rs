@@ -46,13 +46,12 @@ pub use window_model::{
     OutputPositionSnapshot, PointerHitTargetSnapshot, PointerModifierStateSnapshot,
     PointerMoveEventSnapshot, PointerMovePointSnapshot, PopupParentKindSnapshot, TransformOrigin,
     WaylandLayerSnapshot, WaylandOutputSnapshot, WaylandPopupSnapshot, WaylandWindowAction,
-    WaylandWindowSnapshot, WindowActivateRequestEventSnapshot,
-    WindowActivateRequestSourceSnapshot, WindowIconSnapshot, WindowMaximizeRequestEventSnapshot,
-    WindowMinimizeRequestEventSnapshot, WindowMoveEventSnapshot, WindowMovePhaseSnapshot,
-    WindowMoveSourceSnapshot, WindowPositionSnapshot, WindowResizeEdgesSnapshot,
-    WindowResizeEventSnapshot, WindowResizePhaseSnapshot, WindowResizePointSnapshot,
-    WindowResizeSourceSnapshot, WindowStateRequestSourceSnapshot, WindowTransform,
-    layer_runtime_id, popup_runtime_id,
+    WaylandWindowSnapshot, WindowActivateRequestEventSnapshot, WindowActivateRequestSourceSnapshot,
+    WindowIconSnapshot, WindowMaximizeRequestEventSnapshot, WindowMinimizeRequestEventSnapshot,
+    WindowMoveEventSnapshot, WindowMovePhaseSnapshot, WindowMoveSourceSnapshot,
+    WindowPositionSnapshot, WindowResizeEdgesSnapshot, WindowResizeEventSnapshot,
+    WindowResizePhaseSnapshot, WindowResizePointSnapshot, WindowResizeSourceSnapshot,
+    WindowStateRequestSourceSnapshot, WindowTransform, layer_runtime_id, popup_runtime_id,
 };
 
 /// Top-level decoration tree.
@@ -924,6 +923,15 @@ impl CompiledEffect {
             && !self.uses_window_source_input()
             && !self.uses_layer_source_input()
             && !self.uses_popup_source_input()
+    }
+
+    /// Popup backdrop effects may additionally sample the popup's own
+    /// pre-captured texture while resolving the backdrop from the framebuffer.
+    pub fn supports_popup_framebuffer_backdrop(&self) -> bool {
+        self.uses_backdrop_input()
+            && !self.uses_xray_backdrop_input()
+            && !self.uses_window_source_input()
+            && !self.uses_layer_source_input()
     }
 
     pub fn blur_stage(&self) -> Option<BackdropBlur> {
@@ -4860,5 +4868,23 @@ mod tests {
         assert!(layer_mask.uses_backdrop_input());
         assert!(layer_mask.uses_layer_source_input());
         assert!(!layer_mask.supports_framebuffer_backdrop());
+
+        let popup_mask = CompiledEffect {
+            input: EffectInput::Backdrop,
+            invalidate: EffectInvalidationPolicy::Always,
+            pipeline: vec![EffectStage::Shader(ShaderStage {
+                shader: ShaderModule {
+                    path: "popup-mask.frag".into(),
+                },
+                uniforms: std::collections::BTreeMap::new(),
+                textures: std::collections::BTreeMap::from([(
+                    "popup_mask".into(),
+                    EffectInput::PopupSource(WindowSourceInclude::Full),
+                )]),
+            })],
+            alpha: EffectAlphaMode::Preserve,
+        };
+        assert!(!popup_mask.supports_framebuffer_backdrop());
+        assert!(popup_mask.supports_popup_framebuffer_backdrop());
     }
 }
