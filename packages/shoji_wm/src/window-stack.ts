@@ -1,4 +1,4 @@
-import { computed, signal, type ReadonlySignal } from "./signals";
+import { signal, type ReadonlySignal, type Signal } from "./signals";
 import { withoutCompositionOwnership } from "./runtime-hooks";
 import type { WaylandWindow } from "./types";
 
@@ -33,34 +33,69 @@ export interface WindowStack {
 export function createWindowStack(options: WindowStackOptions = {}): WindowStack {
   const baseZIndex = options.baseZIndex ?? 0;
   const step = options.step ?? 1;
-  const order = signal<string[]>([]);
+  let order: string[] = [];
   const windowsById = new Map<string, WaylandWindow>();
-  const zIndexById = new Map<string, ReadonlySignal<number>>();
+  const zIndexById = new Map<string, Signal<number>>();
 
   const normalize = (window: WaylandWindow): string => {
     windowsById.set(window.id, window);
     return window.id;
   };
 
-  const setOrder = (nextOrder: string[]): void => {
+  const uniqueOrder = (nextOrder: string[]): string[] => {
     const seen = new Set<string>();
-    const unique = nextOrder.filter((id) => {
+    return nextOrder.filter((id) => {
       if (seen.has(id)) {
         return false;
       }
       seen.add(id);
       return true;
     });
-    order.set(unique);
+  };
+
+  const zIndexSignal = (id: string): Signal<number> => {
+    let existing = zIndexById.get(id);
+    if (!existing) {
+      existing = withoutCompositionOwnership(() => signal(baseZIndex));
+      zIndexById.set(id, existing);
+    }
+    return existing;
+  };
+
+  const zIndexForId = (id: string): number =>
+    zIndexById.get(id)?.peek() ?? baseZIndex;
+
+  const edgeZIndex = (
+    remaining: readonly string[],
+    placement: WindowStackPlacement,
+  ): number => {
+    if (remaining.length === 0) {
+      return baseZIndex;
+    }
+    const edgeId =
+      placement === "front" ? remaining[remaining.length - 1] : remaining[0];
+    return zIndexForId(edgeId) + (placement === "front" ? step : -step);
   };
 
   const moveTo = (window: WaylandWindow, placement: WindowStackPlacement): void => {
     const id = normalize(window);
-    const without = order.peek().filter((candidate) => candidate !== id);
-    setOrder(placement === "front" ? [...without, id] : [id, ...without]);
+    const currentIndex = order.indexOf(id);
+    const targetIndex = placement === "front" ? order.length - 1 : 0;
+    if (currentIndex >= 0 && currentIndex === targetIndex) {
+      return;
+    }
+
+    const without = order.filter((candidate) => candidate !== id);
+    zIndexSignal(id).set(edgeZIndex(without, placement));
+    order = placement === "front" ? [...without, id] : [id, ...without];
   };
 
-  const indexOf = (window: WaylandWindow): number => order.peek().indexOf(window.id);
+  const rebalance = (nextOrder: string[]): void => {
+    order = uniqueOrder(nextOrder);
+    for (const [index, id] of order.entries()) {
+      zIndexSignal(id).set(baseZIndex + index * step);
+    }
+  };
 
   return {
     add(window, addOptions = {}) {
@@ -70,10 +105,10 @@ export function createWindowStack(options: WindowStackOptions = {}): WindowStack
     remove(window) {
       windowsById.delete(window.id);
       zIndexById.delete(window.id);
-      setOrder(order.peek().filter((id) => id !== window.id));
+      order = order.filter((id) => id !== window.id);
     },
     has(window) {
-      return order.peek().includes(window.id);
+      return order.includes(window.id);
     },
     raise(window) {
       moveTo(window, "front");
@@ -84,13 +119,13 @@ export function createWindowStack(options: WindowStackOptions = {}): WindowStack
     moveBefore(window, target) {
       const id = normalize(window);
       const targetId = normalize(target);
-      const without = order.peek().filter((candidate) => candidate !== id);
+      const without = order.filter((candidate) => candidate !== id);
       const targetIndex = without.indexOf(targetId);
       if (targetIndex < 0) {
-        setOrder([...without, id]);
+        rebalance([...without, id]);
         return;
       }
-      setOrder([
+      rebalance([
         ...without.slice(0, targetIndex),
         id,
         ...without.slice(targetIndex),
@@ -99,58 +134,45 @@ export function createWindowStack(options: WindowStackOptions = {}): WindowStack
     moveAfter(window, target) {
       const id = normalize(window);
       const targetId = normalize(target);
-      const without = order.peek().filter((candidate) => candidate !== id);
+      const without = order.filter((candidate) => candidate !== id);
       const targetIndex = without.indexOf(targetId);
       if (targetIndex < 0) {
-        setOrder([...without, id]);
+        rebalance([...without, id]);
         return;
       }
-      setOrder([
+      rebalance([
         ...without.slice(0, targetIndex + 1),
         id,
         ...without.slice(targetIndex + 1),
       ]);
     },
     zIndex(window) {
-      normalize(window);
-      let existing = zIndexById.get(window.id);
-      if (!existing) {
-        const id = window.id;
-        // Long-lived per-window cache: must outlive the composition pass it
-        // was first requested from. See animation.ts for the same pattern.
-        existing = withoutCompositionOwnership(() =>
-          computed(() => {
-            const index = order().indexOf(id);
-            return baseZIndex + (index < 0 ? 0 : index * step);
-          }),
-        );
-        zIndexById.set(id, existing);
-      }
-      return existing;
+      const id = normalize(window);
+      // Long-lived per-window signal: must outlive the composition pass it
+      // was first requested from. See animation.ts for the same pattern.
+      return zIndexSignal(id);
     },
     zIndexValue(window) {
-      const index = indexOf(window);
-      return baseZIndex + (index < 0 ? 0 : index * step);
+      return zIndexForId(window.id);
     },
     windows() {
-      return order.peek()
+      return order
         .map((id) => windowsById.get(id))
         .filter((window): window is WaylandWindow => window !== undefined);
     },
     ids() {
-      return [...order.peek()];
+      return [...order];
     },
     front() {
-      const ids = order.peek();
-      return windowsById.get(ids[ids.length - 1] ?? "");
+      return windowsById.get(order[order.length - 1] ?? "");
     },
     back() {
-      return windowsById.get(order.peek()[0] ?? "");
+      return windowsById.get(order[0] ?? "");
     },
     clear() {
       windowsById.clear();
       zIndexById.clear();
-      order.set([]);
+      order = [];
     },
   };
 }
