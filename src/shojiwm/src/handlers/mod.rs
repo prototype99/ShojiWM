@@ -8,7 +8,7 @@ mod xwayland;
 //
 
 use smithay::input::dnd::{DnDGrab, DndGrabHandler, GrabType, Source};
-use smithay::input::pointer::Focus;
+use smithay::input::pointer::{Focus, PointerHandle};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
 use smithay::desktop::{PopupKind, WindowSurfaceType, find_popup_root_surface, layer_map_for_output};
@@ -20,6 +20,9 @@ use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Logical, Rectangle};
 use smithay::utils::Serial;
 use smithay::wayland::output::OutputHandler;
+use smithay::wayland::pointer_constraints::{
+    PointerConstraintsHandler, with_pointer_constraint,
+};
 use smithay::wayland::background_effect::{Capability, ExtBackgroundEffectHandler};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, ImportNotifier};
 use smithay::wayland::fractional_scale::{with_fractional_scale, FractionalScaleHandler};
@@ -99,6 +102,55 @@ impl SeatHandler for ShojiWM {
 }
 
 smithay::delegate_dispatch2!(ShojiWM);
+
+impl PointerConstraintsHandler for ShojiWM {
+    fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+        if pointer.current_focus().as_ref() != Some(surface) {
+            return;
+        }
+        let Some((focused_surface, surface_origin)) = self.pointer_contents.surface.as_ref() else {
+            return;
+        };
+        if focused_surface != surface {
+            return;
+        }
+        let location = pointer.current_location();
+        with_pointer_constraint(surface, pointer, |constraint| {
+            let Some(constraint) = constraint else {
+                return;
+            };
+            let local = (location - *surface_origin).to_i32_round();
+            if constraint
+                .region()
+                .is_none_or(|region| region.contains(local))
+            {
+                constraint.activate();
+            }
+        });
+    }
+
+    fn remove_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
+
+    fn cursor_position_hint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) {
+        if !with_pointer_constraint(surface, pointer, |constraint| {
+            constraint.is_some_and(|constraint| constraint.is_active())
+        }) {
+            return;
+        }
+
+        let Some((focused_surface, surface_origin)) = self.pointer_contents.surface.as_ref() else {
+            return;
+        };
+        if focused_surface == surface {
+            pointer.set_location(*surface_origin + location);
+        }
+    }
+}
 
 impl ForeignToplevelListHandler for ShojiWM {
     fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {

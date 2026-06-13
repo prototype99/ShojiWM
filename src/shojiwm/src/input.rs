@@ -7,10 +7,11 @@ use smithay::{
     desktop::{Window, WindowSurfaceType},
     input::{
         keyboard::{FilterResult, keysyms},
-        pointer::{AxisFrame, ButtonEvent, CursorIcon, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent, CursorIcon, MotionEvent, RelativeMotionEvent},
     },
     reexports::{wayland_protocols::xdg::shell::server::xdg_toplevel, wayland_server::Resource},
     utils::{SERIAL_COUNTER, Serial},
+    wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
 };
 use std::time::Instant;
 use tracing::{debug, info, warn};
@@ -355,6 +356,52 @@ impl ShojiWM {
 
                 let pointer = self.seat.get_pointer().unwrap();
                 let previous_pos = pointer.current_location();
+                // Keep using the last focus while a constraint is active. Re-running hit testing
+                // here can briefly return a different surface while a client updates its surface
+                // tree, which would make a locked pointer move for one event.
+                let under = self.pointer_contents.surface.clone();
+                let mut pointer_locked = false;
+                let mut pointer_confined = false;
+                let mut confine_region = None;
+
+                if let Some((surface, surface_origin)) = under.as_ref() {
+                    if pointer.current_focus().as_ref() == Some(surface) {
+                        with_pointer_constraint(surface, &pointer, |constraint| {
+                            let Some(constraint) =
+                                constraint.filter(|constraint| constraint.is_active())
+                            else {
+                                return;
+                            };
+                            if !constraint.region().is_none_or(|region| {
+                                region.contains((previous_pos - *surface_origin).to_i32_round())
+                            }) {
+                                return;
+                            }
+                            match &*constraint {
+                                PointerConstraint::Locked(_) => pointer_locked = true,
+                                PointerConstraint::Confined(confined) => {
+                                    pointer_confined = true;
+                                    confine_region = confined.region().cloned();
+                                }
+                            }
+                        });
+                    }
+                }
+
+                if pointer_locked {
+                    pointer.relative_motion(
+                        self,
+                        under,
+                        &RelativeMotionEvent {
+                            delta: event.delta(),
+                            delta_unaccel: event.delta_unaccel(),
+                            utime: event.time(),
+                        },
+                    );
+                    pointer.frame(self);
+                    return;
+                }
+
                 let mut pos = previous_pos + event.delta();
 
                 pos.x = pos.x.clamp(
@@ -366,20 +413,56 @@ impl ShojiWM {
                     (output_bounds.loc.y + output_bounds.size.h - 1) as f64,
                 );
 
+                let next_contents = self.pointer_contents_at(pos);
+                if pointer_confined {
+                    let remains_on_surface = match (&under, &next_contents.surface) {
+                        (Some((surface, _)), Some((next_surface, _))) => surface == next_surface,
+                        _ => false,
+                    };
+                    let remains_in_region = confine_region.as_ref().is_none_or(|region| {
+                        under.as_ref().is_some_and(|(_, surface_origin)| {
+                            region.contains((pos - *surface_origin).to_i32_round())
+                        })
+                    });
+                    if !remains_on_surface || !remains_in_region {
+                        pointer.relative_motion(
+                            self,
+                            under,
+                            &RelativeMotionEvent {
+                                delta: event.delta(),
+                                delta_unaccel: event.delta_unaccel(),
+                                utime: event.time(),
+                            },
+                        );
+                        pointer.frame(self);
+                        return;
+                    }
+                }
+
                 let serial = SERIAL_COUNTER.next_serial();
-                self.pointer_contents = self.pointer_contents_at(pos);
+                self.pointer_contents = next_contents;
                 let under = self.pointer_contents.surface.clone();
 
                 pointer.motion(
                     self,
-                    under,
+                    under.clone(),
                     &MotionEvent {
                         location: pos,
                         serial,
                         time: event.time_msec(),
                     },
                 );
+                pointer.relative_motion(
+                    self,
+                    under,
+                    &RelativeMotionEvent {
+                        delta: event.delta(),
+                        delta_unaccel: event.delta_unaccel(),
+                        utime: event.time(),
+                    },
+                );
                 pointer.frame(self);
+                self.activate_pointer_constraint_at(pos);
 
                 self.dispatch_pointer_move_async_event(previous_pos, pos, event.time_msec());
                 self.update_decoration_hover_target(pos);
@@ -400,6 +483,9 @@ impl ShojiWM {
 
                 let pointer = self.seat.get_pointer().unwrap();
                 let previous_pos = pointer.current_location();
+                if self.active_pointer_lock_focus(&pointer).is_some() {
+                    return;
+                }
 
                 self.pointer_contents = self.pointer_contents_at(pos);
                 let under = self.pointer_contents.surface.clone();
@@ -414,6 +500,7 @@ impl ShojiWM {
                     },
                 );
                 pointer.frame(self);
+                self.activate_pointer_constraint_at(pos);
                 self.dispatch_pointer_move_async_event(previous_pos, pos, event.time_msec());
                 self.update_decoration_hover_target(pos);
                 if !pointer.is_grabbed() {
@@ -452,6 +539,24 @@ impl ShojiWM {
                 }
                 if button == 272 && button_state == ButtonState::Released {
                     self.release_decoration_active_target();
+                }
+
+                // A locked-pointer client already owns pointer focus. Re-running compositor hit
+                // testing before a button event can briefly change that focus while the client
+                // updates its surface tree, deactivating the lock and leaking one absolute move.
+                if self.active_pointer_lock_focus(&pointer).is_some() {
+                    pointer.button(
+                        self,
+                        &ButtonEvent {
+                            button,
+                            state: button_state,
+                            serial,
+                            time: event.time_msec(),
+                        },
+                    );
+                    pointer.frame(self);
+                    self.schedule_redraw();
+                    return;
                 }
 
                 if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
@@ -2106,6 +2211,9 @@ impl ShojiWM {
         if pointer.is_grabbed() {
             return;
         }
+        if self.active_pointer_lock_focus(&pointer).is_some() {
+            return;
+        }
 
         let location = pointer.current_location();
         self.pointer_contents = self.pointer_contents_at(location);
@@ -2122,6 +2230,58 @@ impl ShojiWM {
         pointer.frame(self);
         self.update_decoration_hover_target(location);
         self.update_decoration_cursor_icon(location);
+    }
+
+    fn active_pointer_lock_focus(
+        &self,
+        pointer: &smithay::input::pointer::PointerHandle<Self>,
+    ) -> Option<(
+        smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        smithay::utils::Point<f64, smithay::utils::Logical>,
+    )> {
+        let focus = self.pointer_contents.surface.clone()?;
+        if pointer.current_focus().as_ref() != Some(&focus.0) {
+            return None;
+        }
+        let location = pointer.current_location();
+        let locked = with_pointer_constraint(&focus.0, pointer, |constraint| {
+            constraint.is_some_and(|constraint| {
+                constraint.is_active()
+                    && matches!(&*constraint, PointerConstraint::Locked(_))
+                    && constraint.region().is_none_or(|region| {
+                        region.contains((location - focus.1).to_i32_round())
+                    })
+            })
+        });
+        locked.then_some(focus)
+    }
+
+    fn activate_pointer_constraint_at(
+        &mut self,
+        location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let Some((surface, surface_origin)) = self.surface_under(location) else {
+            return;
+        };
+        if pointer.current_focus().as_ref() != Some(&surface) {
+            return;
+        }
+
+        with_pointer_constraint(&surface, &pointer, |constraint| {
+            let Some(constraint) = constraint.filter(|constraint| !constraint.is_active()) else {
+                return;
+            };
+            let local = (location - surface_origin).to_i32_round();
+            if constraint
+                .region()
+                .is_none_or(|region| region.contains(local))
+            {
+                constraint.activate();
+            }
+        });
     }
 }
 

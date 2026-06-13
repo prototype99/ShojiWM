@@ -53,7 +53,9 @@ use smithay::{
         fractional_scale::FractionalScaleManagerState,
         input_method::InputMethodManagerState,
         output::OutputManagerState,
+        pointer_constraints::PointerConstraintsState,
         presentation::PresentationState,
+        relative_pointer::RelativePointerManagerState,
         selection::{
             data_device::DataDeviceState, primary_selection::PrimarySelectionState,
             wlr_data_control::DataControlState,
@@ -610,6 +612,8 @@ impl ShojiWM {
         TextInputManagerState::new::<Self>(&dh);
         InputMethodManagerState::new::<Self, _>(&dh, |_client| true);
         VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
+        RelativePointerManagerState::new::<Self>(&dh);
+        PointerConstraintsState::new::<Self>(&dh);
 
         // Data device is responsible for clipboard and drag-and-drop
         let data_device_state = DataDeviceState::new::<Self>(&dh);
