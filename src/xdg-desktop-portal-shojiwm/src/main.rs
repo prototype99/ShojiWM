@@ -64,10 +64,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         })?;
 
     // Block here forever, owning the main thread for the winit event loop.
-    if let Err(e) = picker::run_on_main_thread() {
-        tracing::error!("picker iced exited: {e}");
+    // If the compositor connection breaks, iced/winit returns and the portal
+    // is no longer useful: the picker cannot show UI, and future ScreenCast
+    // requests may silently miss the ShojiWM backend. Terminate the process so
+    // the systemd user unit relaunches us on the current Wayland display.
+    let picker_result = picker::run_on_main_thread();
+    drop(connection);
+    match picker_result {
+        Ok(()) => {
+            tracing::error!("picker event loop exited unexpectedly");
+        }
+        Err(e) => {
+            tracing::error!("picker iced exited: {e}");
+        }
     }
 
-    drop(connection);
-    Ok(())
+    std::process::exit(1);
 }

@@ -151,6 +151,7 @@ fn sanitize_inherited_compositor_environment() {
     unsafe {
         std::env::set_var("XDG_CURRENT_DESKTOP", "ShojiWM");
         std::env::set_var("XDG_SESSION_DESKTOP", "ShojiWM");
+        std::env::set_var("XDG_SESSION_TYPE", "wayland");
         std::env::set_var("DESKTOP_SESSION", "ShojiWM");
     }
 }

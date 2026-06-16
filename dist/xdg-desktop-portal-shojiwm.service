@@ -7,5 +7,6 @@ After=graphical-session.target
 Type=dbus
 BusName=org.freedesktop.impl.portal.desktop.shojiwm
 ExecStart=/usr/bin/xdg-desktop-portal-shojiwm
-Restart=on-failure
+Restart=always
+RestartSec=500ms
 TimeoutStopSec=10

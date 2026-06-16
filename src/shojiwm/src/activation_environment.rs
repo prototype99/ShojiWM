@@ -7,6 +7,7 @@ const ACTIVATION_ENV_KEYS: &[&str] = &[
     "DISPLAY",
     "XDG_CURRENT_DESKTOP",
     "XDG_SESSION_DESKTOP",
+    "XDG_SESSION_TYPE",
     "DESKTOP_SESSION",
 ];
 

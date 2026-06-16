@@ -896,6 +896,14 @@ fn build_video_format_param(
     height: u32,
     framerate: u32,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let max_framerate = Fraction {
+        num: framerate.max(1),
+        denom: 1,
+    };
+    let preferred_framerate = Fraction {
+        num: framerate.max(1).min(60),
+        denom: 1,
+    };
     let obj = Value::Object(Object {
         type_: spa_sys::SPA_TYPE_OBJECT_Format,
         id: spa_sys::SPA_PARAM_EnumFormat,
@@ -918,10 +926,25 @@ fn build_video_format_param(
             ),
             Property::new(
                 spa_sys::SPA_FORMAT_VIDEO_framerate,
-                Value::Fraction(Fraction {
-                    num: framerate,
-                    denom: 1,
-                }),
+                Value::Choice(ChoiceValue::Fraction(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range {
+                        default: preferred_framerate,
+                        min: Fraction { num: 0, denom: 1 },
+                        max: max_framerate,
+                    },
+                ))),
+            ),
+            Property::new(
+                spa_sys::SPA_FORMAT_VIDEO_maxFramerate,
+                Value::Choice(ChoiceValue::Fraction(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range {
+                        default: preferred_framerate,
+                        min: Fraction { num: 0, denom: 1 },
+                        max: max_framerate,
+                    },
+                ))),
             ),
         ],
     });

@@ -681,24 +681,28 @@ impl AppState {
     }
 
     fn on_add_buffer(&mut self, _stream: &pw::stream::Stream, buffer: *mut pw::sys::pw_buffer) {
-        let slot = match self.create_dmabuf_slot() {
-            Ok(Some(slot)) => slot,
-            Ok(None) => match self.create_shm_slot() {
-                Ok(slot) => slot,
-                Err(e) => {
-                    tracing::error!("create SHM screencast buffer: {e}");
-                    return;
-                }
-            },
+        let negotiated_data_types = unsafe {
+            let buf = (*buffer).buffer;
+            if buf.is_null() {
+                tracing::error!("on_add_buffer: pw_buffer.buffer is null");
+                return;
+            }
+            let datas = std::slice::from_raw_parts_mut((*buf).datas, (*buf).n_datas as usize);
+            if datas.is_empty() {
+                tracing::error!("on_add_buffer: no datas in pw_buffer");
+                return;
+            }
+            datas[0].type_
+        };
+
+        let slot = match self.create_slot_for_pw_data_types(negotiated_data_types) {
+            Ok(slot) => slot,
             Err(e) => {
-                tracing::warn!("create DMA-BUF screencast buffer: {e}; falling back to SHM");
-                match self.create_shm_slot() {
-                    Ok(slot) => slot,
-                    Err(e) => {
-                        tracing::error!("create SHM screencast buffer: {e}");
-                        return;
-                    }
-                }
+                tracing::error!(
+                    data_types = negotiated_data_types,
+                    "create screencast buffer: {e}"
+                );
+                return;
             }
         };
         let stride = slot.stride;
@@ -742,6 +746,39 @@ impl AppState {
                 _storage: storage,
             },
         );
+    }
+
+    fn create_slot_for_pw_data_types(
+        &self,
+        data_types: spa_sys::spa_data_type,
+    ) -> Result<AllocatedSlot, Box<dyn std::error::Error + Send + Sync>> {
+        let dmabuf_flag = 1 << spa_sys::SPA_DATA_DmaBuf;
+        let memfd_flag = 1 << spa_sys::SPA_DATA_MemFd;
+        let allows_dmabuf = data_types & dmabuf_flag != 0 || data_types == spa_sys::SPA_DATA_DmaBuf;
+        let allows_memfd = data_types & memfd_flag != 0 || data_types == spa_sys::SPA_DATA_MemFd;
+
+        if allows_dmabuf {
+            match self.create_dmabuf_slot() {
+                Ok(Some(slot)) => return Ok(slot),
+                Ok(None) if !allows_memfd => {
+                    return Err("PipeWire selected DMA-BUF, but DMA-BUF allocation is unavailable"
+                        .into());
+                }
+                Ok(None) => {}
+                Err(e) if !allows_memfd => return Err(e),
+                Err(e) => {
+                    tracing::warn!(
+                        "create DMA-BUF screencast buffer: {e}; falling back to SHM"
+                    );
+                }
+            }
+        }
+
+        if allows_memfd {
+            return self.create_shm_slot();
+        }
+
+        Err(format!("unsupported PipeWire data types bitmask: {data_types}").into())
     }
 
     fn create_dmabuf_slot(
@@ -1031,6 +1068,14 @@ fn init_gbm_device() -> Result<Option<GbmDevice<File>>, Box<dyn std::error::Erro
 fn build_video_format_param(
     spec: &StreamSpec,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let max_framerate = Fraction {
+        num: spec.framerate.max(1),
+        denom: 1,
+    };
+    let preferred_framerate = Fraction {
+        num: spec.framerate.max(1).min(60),
+        denom: 1,
+    };
     let obj = Value::Object(Object {
         type_: spa_sys::SPA_TYPE_OBJECT_Format,
         id: spa_sys::SPA_PARAM_EnumFormat,
@@ -1056,10 +1101,25 @@ fn build_video_format_param(
             ),
             Property::new(
                 spa_sys::SPA_FORMAT_VIDEO_framerate,
-                Value::Fraction(Fraction {
-                    num: spec.framerate,
-                    denom: 1,
-                }),
+                Value::Choice(ChoiceValue::Fraction(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range {
+                        default: preferred_framerate,
+                        min: Fraction { num: 0, denom: 1 },
+                        max: max_framerate,
+                    },
+                ))),
+            ),
+            Property::new(
+                spa_sys::SPA_FORMAT_VIDEO_maxFramerate,
+                Value::Choice(ChoiceValue::Fraction(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range {
+                        default: preferred_framerate,
+                        min: Fraction { num: 0, denom: 1 },
+                        max: max_framerate,
+                    },
+                ))),
             ),
         ],
     });
@@ -1072,31 +1132,38 @@ fn build_buffers_param(
     spec: &StreamSpec,
     prefer_dmabuf: bool,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let stride = (spec.width * 4) as i32;
-    let size = stride * spec.height as i32;
     let memfd_flag = 1 << spa_sys::SPA_DATA_MemFd;
     let dmabuf_flag = 1 << spa_sys::SPA_DATA_DmaBuf;
-    let (default_data_type, data_type_flags) = if prefer_dmabuf {
-        (dmabuf_flag, vec![dmabuf_flag, memfd_flag])
+    let mut properties = vec![
+        Property::new(
+            spa_sys::SPA_PARAM_BUFFERS_buffers,
+            Value::Choice(ChoiceValue::Int(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Range {
+                    default: 8,
+                    min: 2,
+                    max: 16,
+                },
+            ))),
+        ),
+        Property::new(spa_sys::SPA_PARAM_BUFFERS_blocks, Value::Int(1)),
+    ];
+
+    if prefer_dmabuf {
+        properties.push(Property::new(
+            spa_sys::SPA_PARAM_BUFFERS_dataType,
+            Value::Choice(ChoiceValue::Int(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Flags {
+                    default: dmabuf_flag | memfd_flag,
+                    flags: vec![dmabuf_flag, memfd_flag],
+                },
+            ))),
+        ));
     } else {
-        (memfd_flag, vec![memfd_flag])
-    };
-    let obj = Value::Object(Object {
-        type_: spa_sys::SPA_TYPE_OBJECT_ParamBuffers,
-        id: spa_sys::SPA_PARAM_Buffers,
-        properties: vec![
-            Property::new(
-                spa_sys::SPA_PARAM_BUFFERS_buffers,
-                Value::Choice(ChoiceValue::Int(Choice(
-                    ChoiceFlags::empty(),
-                    ChoiceEnum::Range {
-                        default: 8,
-                        min: 2,
-                        max: 16,
-                    },
-                ))),
-            ),
-            Property::new(spa_sys::SPA_PARAM_BUFFERS_blocks, Value::Int(1)),
+        let stride = (spec.width * 4) as i32;
+        let size = stride * spec.height as i32;
+        properties.extend([
             Property::new(spa_sys::SPA_PARAM_BUFFERS_size, Value::Int(size)),
             Property::new(spa_sys::SPA_PARAM_BUFFERS_stride, Value::Int(stride)),
             Property::new(
@@ -1104,12 +1171,18 @@ fn build_buffers_param(
                 Value::Choice(ChoiceValue::Int(Choice(
                     ChoiceFlags::empty(),
                     ChoiceEnum::Flags {
-                        default: default_data_type,
-                        flags: data_type_flags,
+                        default: memfd_flag,
+                        flags: vec![memfd_flag],
                     },
                 ))),
             ),
-        ],
+        ]);
+    }
+
+    let obj = Value::Object(Object {
+        type_: spa_sys::SPA_TYPE_OBJECT_ParamBuffers,
+        id: spa_sys::SPA_PARAM_Buffers,
+        properties,
     });
     Ok(PodSerializer::serialize(Cursor::new(Vec::new()), &obj)?
         .0

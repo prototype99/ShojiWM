@@ -121,6 +121,8 @@ fn prepare_runtime_process_environment(command: &mut Command) {
 
     command.env("XDG_CURRENT_DESKTOP", "ShojiWM");
     command.env("XDG_SESSION_DESKTOP", "ShojiWM");
+    command.env("XDG_SESSION_TYPE", "wayland");
+    command.env("DESKTOP_SESSION", "ShojiWM");
 }
 
 pub fn spawn_runtime_process(
