@@ -714,6 +714,12 @@ WINDOW_MANAGER.window.composition = (window: WaylandWindow) => {
           paddingX: 0,
           paddingRight: 0,
         }}
+        interaction={{
+          resizeHitArea: {
+            edgePx: 8,
+            cornerPx: 14,
+          },
+        }}
       >
         <Box direction="row">{innerComponents}</Box>
       </WindowBorder>

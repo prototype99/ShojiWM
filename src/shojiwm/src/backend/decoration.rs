@@ -1646,6 +1646,7 @@ mod tests {
         ComputedDecorationNode {
             stable_id: Some(stable_id.to_string()),
             interaction: Default::default(),
+            window_border_interaction: Default::default(),
             kind,
             style,
             rect: LogicalRect::new(0, 0, 10, 10),

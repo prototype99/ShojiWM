@@ -7,7 +7,8 @@ use super::{
     EffectInput, EffectInvalidationPolicy, EffectOutsets, EffectStage, ImageNode, JustifyContent,
     LabelNode, LayoutDirection, NodeTransform, NoiseKind, NoiseStage, Overflow, PointerEvents,
     PositionOffsets, ShaderEffectNode, ShaderModule, ShaderStage, ShaderUniformValue,
-    StylePosition, WindowAction, WindowEffectConfig, WindowEffectSlot, WindowSourceInclude,
+    StylePosition, WindowAction, WindowBorderInteraction, WindowEffectConfig, WindowEffectSlot,
+    WindowResizeHitArea, WindowSourceInclude,
 };
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -43,6 +44,27 @@ pub struct WireProps {
     pub on_click: Option<WireOnClick>,
     pub on_hover_change: Option<WireStateChangeHandler>,
     pub on_active_change: Option<WireStateChangeHandler>,
+    pub interaction: Option<WireWindowBorderInteraction>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireWindowBorderInteraction {
+    pub resize_hit_area: Option<WireResizeHitArea>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum WireResizeHitArea {
+    Uniform(i32),
+    Detailed(WireResizeHitAreaFields),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireResizeHitAreaFields {
+    pub edge_px: Option<i32>,
+    pub corner_px: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -386,6 +408,16 @@ impl TryFrom<WireDecorationNode> for DecorationNode {
             }
         };
 
+        let window_border_interaction = if matches!(kind, DecorationNodeKind::WindowBorder) {
+            value
+                .props
+                .interaction
+                .map(TryInto::try_into)
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            WindowBorderInteraction::default()
+        };
         let style = DecorationStyle::try_from(value.props.style)?;
         let children = value
             .children
@@ -407,10 +439,35 @@ impl TryFrom<WireDecorationNode> for DecorationNode {
                     .map(TryInto::try_into)
                     .transpose()?,
             },
+            window_border_interaction,
             kind,
             style,
             children,
         })
+    }
+}
+
+impl TryFrom<WireWindowBorderInteraction> for WindowBorderInteraction {
+    type Error = DecorationBridgeError;
+
+    fn try_from(value: WireWindowBorderInteraction) -> Result<Self, Self::Error> {
+        Ok(Self {
+            resize_hit_area: value
+                .resize_hit_area
+                .map(WireResizeHitArea::into_resize_hit_area),
+        })
+    }
+}
+
+impl WireResizeHitArea {
+    fn into_resize_hit_area(self) -> WindowResizeHitArea {
+        match self {
+            WireResizeHitArea::Uniform(width) => WindowResizeHitArea::uniform(width),
+            WireResizeHitArea::Detailed(fields) => WindowResizeHitArea {
+                edge_width: fields.edge_px,
+                corner_width: fields.corner_px,
+            },
+        }
     }
 }
 
@@ -1034,6 +1091,9 @@ mod tests {
         {
           "kind": "WindowBorder",
           "props": {
+            "interaction": {
+              "resizeHitArea": { "edgePx": 8, "cornerPx": 14 }
+            },
             "style": {
               "border": { "px": 1, "color": "#ffffff" }
             }
@@ -1055,6 +1115,15 @@ mod tests {
 
         assert!(matches!(tree.kind, DecorationNodeKind::WindowBorder));
         assert_eq!(tree.style.border.unwrap().width, 1);
+        assert_eq!(
+            tree.window_border_interaction
+                .resize_hit_area
+                .expect("resize hit area should decode"),
+            WindowResizeHitArea {
+                edge_width: Some(8),
+                corner_width: Some(14),
+            }
+        );
         assert!(matches!(
             tree.children[0].kind,
             DecorationNodeKind::Box(BoxNode {

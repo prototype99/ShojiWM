@@ -5203,6 +5203,7 @@ impl super::ComputedDecorationNode {
         Self {
             stable_id: self.stable_id.clone(),
             interaction: self.interaction.clone(),
+            window_border_interaction: self.window_border_interaction,
             kind: self.kind.clone(),
             style: self.style.clone(),
             rect: LogicalRect::new(

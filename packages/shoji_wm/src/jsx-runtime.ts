@@ -6,6 +6,7 @@ import type {
   ImageProps,
   ManagedWindowProps,
   ShaderEffectProps,
+  WindowBorderProps,
   CompositionChild,
   CompositionRenderable,
   CompositionNodeType,
@@ -65,7 +66,7 @@ export namespace JSX {
     ManagedWindow: ManagedWindowProps;
     ClientWindow: ClientWindowProps;
     Window: ComponentProps;
-    WindowBorder: ComponentProps;
+    WindowBorder: WindowBorderProps;
     Fragment: ComponentProps;
   }
 }

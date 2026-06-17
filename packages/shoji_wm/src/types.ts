@@ -879,6 +879,15 @@ export interface BorderValue {
   color: MaybeSignal<string>;
 }
 
+export interface WindowResizeHitArea {
+  edgePx?: MaybeSignal<number>;
+  cornerPx?: MaybeSignal<number>;
+}
+
+export interface WindowBorderInteraction {
+  resizeHitArea?: MaybeSignal<number> | WindowResizeHitArea;
+}
+
 export type SSDPosition = "relative" | "absolute";
 export type SSDOverflow = "visible" | "hidden";
 export type SSDPointerEvents = "auto" | "none";
@@ -1025,6 +1034,7 @@ export type WindowProps = ClientWindowProps;
 
 export interface WindowBorderProps extends ComponentProps {
   style?: SSDStyle;
+  interaction?: WindowBorderInteraction;
   id?: string;
 }
 

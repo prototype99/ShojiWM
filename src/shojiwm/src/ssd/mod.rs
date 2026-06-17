@@ -153,7 +153,15 @@ impl ComputedDecorationTree {
 
         if let Some(slot_rect) = self.window_slot_rect() {
             if let Some(border) = self.root.window_border_style() {
-                if let Some(edges) = hit_test_resize_edges(self.root.rect, border.width, point) {
+                let hit_area = self
+                    .root
+                    .window_border_resize_hit_area()
+                    .unwrap_or_default();
+                let edge_width = hit_area.edge_width.unwrap_or(border.width);
+                let corner_width = hit_area.corner_width.unwrap_or(edge_width);
+                if let Some(edges) =
+                    hit_test_resize_edges(self.root.rect, edge_width, corner_width, point)
+                {
                     return DecorationHitTestResult::Resize(edges);
                 }
             }
@@ -182,6 +190,7 @@ impl ComputedDecorationTree {
 pub struct ComputedDecorationNode {
     pub stable_id: Option<String>,
     pub interaction: DecorationInteractionHandlers,
+    pub window_border_interaction: WindowBorderInteraction,
     pub kind: DecorationNodeKind,
     pub style: DecorationStyle,
     pub rect: LogicalRect,
@@ -240,6 +249,16 @@ impl ComputedDecorationNode {
         }
 
         self.children.iter().find_map(Self::window_border_style)
+    }
+
+    fn window_border_resize_hit_area(&self) -> Option<WindowResizeHitArea> {
+        if matches!(self.kind, DecorationNodeKind::WindowBorder) {
+            return self.window_border_interaction.resize_hit_area;
+        }
+
+        self.children
+            .iter()
+            .find_map(Self::window_border_resize_hit_area)
     }
 
     pub(crate) fn bounds_rect(&self) -> LogicalRect {
@@ -387,6 +406,7 @@ impl ComputedDecorationNode {
         DecorationNode {
             stable_id: self.stable_id.clone(),
             interaction: self.interaction.clone(),
+            window_border_interaction: self.window_border_interaction,
             kind: self.kind.clone(),
             style: self.style.clone(),
             children: self.children.iter().map(Self::to_decoration_node).collect(),
@@ -491,6 +511,26 @@ pub struct DecorationInteractionTarget {
     pub handlers: DecorationInteractionHandlers,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WindowBorderInteraction {
+    pub resize_hit_area: Option<WindowResizeHitArea>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WindowResizeHitArea {
+    pub edge_width: Option<i32>,
+    pub corner_width: Option<i32>,
+}
+
+impl WindowResizeHitArea {
+    pub fn uniform(width: i32) -> Self {
+        Self {
+            edge_width: Some(width),
+            corner_width: Some(width),
+        }
+    }
+}
+
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct ResizeEdges: u32 {
@@ -534,6 +574,7 @@ fn validate_node(
 pub struct DecorationNode {
     pub stable_id: Option<String>,
     pub interaction: DecorationInteractionHandlers,
+    pub window_border_interaction: WindowBorderInteraction,
     pub kind: DecorationNodeKind,
     pub style: DecorationStyle,
     pub children: Vec<DecorationNode>,
@@ -544,6 +585,7 @@ impl DecorationNode {
         Self {
             stable_id: None,
             interaction: DecorationInteractionHandlers::default(),
+            window_border_interaction: WindowBorderInteraction::default(),
             kind,
             style: DecorationStyle::default(),
             children: Vec::new(),
@@ -552,6 +594,14 @@ impl DecorationNode {
 
     pub fn with_style(mut self, style: DecorationStyle) -> Self {
         self.style = style;
+        self
+    }
+
+    pub fn with_window_border_interaction(
+        mut self,
+        interaction: WindowBorderInteraction,
+    ) -> Self {
+        self.window_border_interaction = interaction;
         self
     }
 
@@ -1542,6 +1592,7 @@ fn layout_node_resolved(
     let mut computed = ComputedDecorationNode {
         stable_id: node.stable_id.clone(),
         interaction: node.interaction.clone(),
+        window_border_interaction: node.window_border_interaction,
         kind: node.kind.clone(),
         style: node.style.clone(),
         rect: resolved_rect.round_to_logical_rect(),
@@ -1566,6 +1617,7 @@ pub(super) fn reapply_tree_preserving_layout(
 ) {
     computed.stable_id = node.stable_id.clone();
     computed.interaction = node.interaction.clone();
+    computed.window_border_interaction = node.window_border_interaction;
     computed.kind = node.kind.clone();
     computed.style = node.style.clone();
     let content_rect = computed
@@ -2992,31 +3044,59 @@ fn find_interaction_target(
 
 fn hit_test_resize_edges(
     rect: LogicalRect,
-    border_width: i32,
+    edge_width: i32,
+    corner_width: i32,
     point: LogicalPoint,
 ) -> Option<ResizeEdges> {
-    let border_width = border_width.max(0);
-    if border_width == 0 || !rect.contains(point) {
+    let edge_width = edge_width.max(0);
+    let corner_width = corner_width.max(edge_width).max(0);
+    if edge_width == 0 || !rect.contains(point) {
         return None;
     }
 
-    let on_left = point.x < rect.x + border_width;
-    let on_right = point.x >= rect.x + rect.width - border_width;
-    let on_top = point.y < rect.y + border_width;
-    let on_bottom = point.y >= rect.y + rect.height - border_width;
+    let right = rect.x + rect.width;
+    let bottom = rect.y + rect.height;
+    let on_left = point.x < rect.x + edge_width;
+    let on_right = point.x >= right - edge_width;
+    let on_top = point.y < rect.y + edge_width;
+    let on_bottom = point.y >= bottom - edge_width;
+    let near_left_corner = point.x < rect.x + corner_width;
+    let near_right_corner = point.x >= right - corner_width;
+    let near_top_corner = point.y < rect.y + corner_width;
+    let near_bottom_corner = point.y >= bottom - corner_width;
 
     let mut edges = ResizeEdges::empty();
-    if on_left {
-        edges |= ResizeEdges::LEFT;
-    }
-    if on_right {
-        edges |= ResizeEdges::RIGHT;
-    }
     if on_top {
         edges |= ResizeEdges::TOP;
+        if near_left_corner {
+            edges |= ResizeEdges::LEFT;
+        } else if near_right_corner {
+            edges |= ResizeEdges::RIGHT;
+        }
     }
     if on_bottom {
         edges |= ResizeEdges::BOTTOM;
+        if near_left_corner {
+            edges |= ResizeEdges::LEFT;
+        } else if near_right_corner {
+            edges |= ResizeEdges::RIGHT;
+        }
+    }
+    if on_left {
+        edges |= ResizeEdges::LEFT;
+        if near_top_corner {
+            edges |= ResizeEdges::TOP;
+        } else if near_bottom_corner {
+            edges |= ResizeEdges::BOTTOM;
+        }
+    }
+    if on_right {
+        edges |= ResizeEdges::RIGHT;
+        if near_top_corner {
+            edges |= ResizeEdges::TOP;
+        } else if near_bottom_corner {
+            edges |= ResizeEdges::BOTTOM;
+        }
     }
 
     (!edges.is_empty()).then_some(edges)
@@ -4372,6 +4452,42 @@ mod tests {
         );
         assert_eq!(
             layout.hit_test(LogicalPoint::new(50, 1)),
+            DecorationHitTestResult::Resize(ResizeEdges::TOP)
+        );
+    }
+
+    #[test]
+    fn hit_test_uses_window_border_resize_hit_area() {
+        let root = DecorationNode::new(DecorationNodeKind::WindowBorder)
+            .with_style(DecorationStyle {
+                border: Some(BorderStyle {
+                    width: 2,
+                    color: Color::WHITE,
+                }),
+                ..Default::default()
+            })
+            .with_window_border_interaction(WindowBorderInteraction {
+                resize_hit_area: Some(WindowResizeHitArea {
+                    edge_width: Some(8),
+                    corner_width: Some(14),
+                }),
+            })
+            .with_children(vec![DecorationNode::new(DecorationNodeKind::WindowSlot)]);
+
+        let layout = DecorationTree::new(root)
+            .layout(LogicalRect::new(0, 0, 100, 60))
+            .expect("layout should succeed");
+
+        assert_eq!(
+            layout.hit_test(LogicalPoint::new(6, 30)),
+            DecorationHitTestResult::Resize(ResizeEdges::LEFT)
+        );
+        assert_eq!(
+            layout.hit_test(LogicalPoint::new(10, 1)),
+            DecorationHitTestResult::Resize(ResizeEdges::TOP_LEFT)
+        );
+        assert_eq!(
+            layout.hit_test(LogicalPoint::new(20, 1)),
             DecorationHitTestResult::Resize(ResizeEdges::TOP)
         );
     }
