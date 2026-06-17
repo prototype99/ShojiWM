@@ -371,6 +371,11 @@ export class HybridWindowManager {
     workspace: Workspace;
     lastWorkspaceSwitchAt: number;
   } | null = null;
+  private maximizedMoveDrag: {
+    windowId: string;
+    width: number;
+    height: number;
+  } | null = null;
   private workspaceGesture: WorkspaceGestureState | null = null;
   private workspaceGestureMode: WorkspaceGestureMode | null = null;
   private workspaceScrollGestureRectAnimationsCancelled = false;
@@ -692,6 +697,10 @@ export class HybridWindowManager {
     }
 
     const workspace = this.findWorkspaceForWindow(event.window);
+    if (event.phase === "start" || event.phase === "update") {
+      this.beginInteractiveUnmaximize(event.window);
+    }
+
     if (workspace?.isTiled && workspace.shouldTile(event.window)) {
       workspace.resizeTile(event);
       this.applyWorkspaceStackPolicy(workspace);
@@ -724,17 +733,31 @@ export class HybridWindowManager {
     }
 
     const window = event.window;
+    if (event.phase === "start" && window.state[WINDOW_STATE_MAXIMIZED]()) {
+      const restoreRect =
+        window.state[WINDOW_STATE_RESTORE_RECT]() ?? event.currentRect;
+      this.maximizedMoveDrag = {
+        windowId: window.id,
+        width: read(restoreRect.width),
+        height: read(restoreRect.height),
+      };
+      this.beginInteractiveUnmaximize(window);
+    }
     if (event.phase === "start") {
       this.isGrabbing = true;
       this.clearWindowSnapState(window);
     }
 
-    if (window.state[WINDOW_STATE_MAXIMIZED]()) {
-      const restoreRect =
-        window.state[WINDOW_STATE_RESTORE_RECT]() ?? event.currentRect;
-      const width = read(restoreRect.width);
-      const height = read(restoreRect.height);
-      const nextRect = this.restoreRectForMaximizedMove(event, width, height);
+    const maximizedMoveDrag =
+      this.maximizedMoveDrag?.windowId === window.id
+        ? this.maximizedMoveDrag
+        : null;
+    if (maximizedMoveDrag) {
+      const nextRect = this.restoreRectForMaximizedMove(
+        event,
+        maximizedMoveDrag.width,
+        maximizedMoveDrag.height,
+      );
       if (event.phase === "start") {
         playRectAnimation(
           window,
@@ -747,17 +770,15 @@ export class HybridWindowManager {
         stopRectAnimation(window, WINDOW_STATE_RECT);
         window.state[WINDOW_STATE_RECT].set(nextRect);
       }
-      window.state[WINDOW_STATE_RESTORE_RECT].set(nextRect);
       workspace?.syncFloatingWindowRect(window, nextRect);
 
       if (event.phase === "end") {
         this.isGrabbing = false;
-        const snapped = this.finishFloatingDragSnap(event, workspace);
-        if (!snapped) {
-          window.unmaximize();
-        }
+        this.maximizedMoveDrag = null;
+        this.finishFloatingDragSnap(event, workspace);
       } else if (event.phase === "cancel") {
         this.isGrabbing = false;
+        this.maximizedMoveDrag = null;
         this.finishFloatingDragSnap(event, workspace);
       } else {
         this.updateFloatingDragSnap(event);
@@ -797,6 +818,16 @@ export class HybridWindowManager {
         workspace,
         lastWorkspaceSwitchAt: event.timestamp,
       };
+      if (window.state[WINDOW_STATE_MAXIMIZED]()) {
+        const restoreRect =
+          window.state[WINDOW_STATE_RESTORE_RECT]() ?? event.currentRect;
+        this.maximizedMoveDrag = {
+          windowId: window.id,
+          width: read(restoreRect.width),
+          height: read(restoreRect.height),
+        };
+        this.beginInteractiveUnmaximize(window);
+      }
       this.clearWindowSnapState(window);
     }
 
@@ -805,17 +836,19 @@ export class HybridWindowManager {
       return;
     }
 
-    let nextRect: ManagedWindowRect = event.currentRect;
-    if (window.state[WINDOW_STATE_MAXIMIZED]()) {
-      const restoreRect =
-        window.state[WINDOW_STATE_RESTORE_RECT]() ?? event.currentRect;
-      const width = read(restoreRect.width);
-      const height = read(restoreRect.height);
-      nextRect = this.restoreRectForMaximizedMove(event, width, height);
-      window.state[WINDOW_STATE_RESTORE_RECT].set(nextRect);
-    }
+    const maximizedMoveDrag =
+      this.maximizedMoveDrag?.windowId === window.id
+        ? this.maximizedMoveDrag
+        : null;
+    const nextRect: ManagedWindowRect = maximizedMoveDrag
+      ? this.restoreRectForMaximizedMove(
+          event,
+          maximizedMoveDrag.width,
+          maximizedMoveDrag.height,
+        )
+      : event.currentRect;
 
-    if (window.state[WINDOW_STATE_MAXIMIZED]() && event.phase === "start") {
+    if (maximizedMoveDrag && event.phase === "start") {
       playRectAnimation(
         window,
         WINDOW_STATE_RECT,
@@ -854,14 +887,10 @@ export class HybridWindowManager {
       }
       this.applyWorkspaceStackPolicy(drag.workspace);
       this.floatingDrag = null;
-      this.isGrabbing = false;
-      if (
-        !snapped &&
-        event.phase === "end" &&
-        window.state[WINDOW_STATE_MAXIMIZED]()
-      ) {
-        window.unmaximize();
+      if (maximizedMoveDrag) {
+        this.maximizedMoveDrag = null;
       }
+      this.isGrabbing = false;
     }
   }
 
@@ -1318,6 +1347,18 @@ export class HybridWindowManager {
 
   public getWindowZIndex(window: WaylandWindow): ReadonlySignal<number> {
     return this.windowStack.zIndex(window);
+  }
+
+  private beginInteractiveUnmaximize(window: WaylandWindow): boolean {
+    if (!window.state[WINDOW_STATE_MAXIMIZED]()) {
+      return false;
+    }
+
+    window.state[WINDOW_STATE_MAXIMIZED].set(false);
+    window.state[WINDOW_STATE_RESTORE_RECT].set(null);
+    this.clearWindowSnapState(window);
+    window.unmaximize();
+    return true;
   }
 
   private applyWorkspaceStackPolicy(workspace: Workspace | undefined) {
@@ -2584,8 +2625,7 @@ export class HybridWindowManager {
     }
 
     const window = event.window;
-    const isMaximized =
-      window.state[WINDOW_STATE_MAXIMIZED]() || read(window.isMaximized);
+    const isMaximized = window.state[WINDOW_STATE_MAXIMIZED]();
 
     if (snap.zone === "maximize") {
       this.clearWindowSnapState(window);
@@ -3167,6 +3207,15 @@ export class Workspace {
       return;
     }
 
+    if (
+      (event.phase === "start" || event.phase === "update") &&
+      event.window.state[WINDOW_STATE_MAXIMIZED]()
+    ) {
+      event.window.state[WINDOW_STATE_MAXIMIZED].set(false);
+      event.window.state[WINDOW_STATE_RESTORE_RECT].set(null);
+      event.window.unmaximize();
+    }
+
     stopRectAnimation(event.window, WINDOW_STATE_RECT);
     this.activeWindowId = event.window.id;
 
@@ -3194,7 +3243,12 @@ export class Workspace {
     }
     this.activeWindowId = window.id;
     this.draggingWindowId = window.id;
+    const wasMaximized = window.state[WINDOW_STATE_MAXIMIZED]();
     window.state[WINDOW_STATE_MAXIMIZED].set(false);
+    window.state[WINDOW_STATE_RESTORE_RECT].set(null);
+    if (wasMaximized) {
+      window.unmaximize();
+    }
     window.state[WINDOW_STATE_TILE_DRAGGING].set(true);
     this.syncWindowVisibleOutputs(window);
     window.state[WINDOW_STATE_WORKSPACE_VISIBLE].set(true);
