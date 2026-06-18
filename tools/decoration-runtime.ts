@@ -67,7 +67,7 @@ import {
   takeDirtyLayerNodeIds,
   takeManagedWindowOnlyDirty,
   takeDirtyWindowNodeIds,
-  type WindowManagerEventController,
+  type CompositorEventController,
   installSchedulerBridge,
   isManagedWindowOnlyDirty,
   type CompositionEvaluationCache,
@@ -92,7 +92,7 @@ import {
   updateOutputState,
   updateInputState,
   updateLayerSnapshots,
-  WINDOW_MANAGER,
+  COMPOSITOR,
   type WaylandLayerSnapshot,
   type WaylandLayer,
   type WaylandPopup,
@@ -863,7 +863,7 @@ function pendingInputConfigPayload(): { config: InputConfigDraft } | undefined {
 }
 
 function pendingEventConfigPayload(
-  events: WindowManagerEventController,
+  events: CompositorEventController,
 ): RuntimeEventConfig | undefined {
   return events.takePendingEventConfig();
 }
@@ -1059,12 +1059,12 @@ async function main() {
 
   let loadedConfig: Record<string, unknown> | null = null;
   let composition: WindowCompositionFunction | null = null;
-  let events: WindowManagerEventController | null = null;
+  let events: CompositorEventController | null = null;
   let effectConfig: RuntimeEffectConfig | null = null;
 
   async function loadRuntimeConfig(): Promise<{
     composition: WindowCompositionFunction;
-    events: WindowManagerEventController;
+    events: CompositorEventController;
     effectConfig: RuntimeEffectConfig;
   }> {
     if (!loadedConfig) {
@@ -1767,7 +1767,7 @@ async function main() {
 
 function evaluateCached(
   composition: WindowCompositionFunction,
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   effectConfig: RuntimeEffectConfig,
   windowId: string,
   snapshot?: WaylandWindowSnapshot,
@@ -1944,7 +1944,7 @@ function collectSerializedLabels(node: unknown, labels: unknown[]): void {
 
 function evaluateSnapshot(
   composition: WindowCompositionFunction,
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   effectConfig: RuntimeEffectConfig,
   snapshot: WaylandWindowSnapshot,
   nowMs: number,
@@ -2051,7 +2051,7 @@ function evaluateSnapshot(
 
 function evaluatePreconfigure(
   composition: WindowCompositionFunction,
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   effectConfig: RuntimeEffectConfig,
   snapshot: WaylandWindowSnapshot,
 ): {
@@ -2378,7 +2378,7 @@ function createRuntimeCacheEntry(
 
 function ensureRuntimeCacheEntry(
   composition: WindowCompositionFunction,
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   snapshot: WaylandWindowSnapshot,
 ): RuntimeCacheEntry {
   let entry = cacheByWindowId.get(snapshot.id);
@@ -2436,7 +2436,7 @@ function createRuntimeLayerEntry(
 }
 
 function evaluateLayerEffects(
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   effectConfig: RuntimeEffectConfig,
   outputName: string,
   snapshots: WaylandLayerSnapshot[],
@@ -2468,7 +2468,7 @@ function evaluateLayerEffects(
 }
 
 function syncLayerSnapshots(
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   snapshots: WaylandLayerSnapshot[],
 ): void {
   updateLayerSnapshots(snapshots);
@@ -2818,7 +2818,7 @@ function invokeGlobalKeyBinding(
 }
 
 function invokeWindowResize(
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   windowId: string,
   event: RuntimeWindowResizeEvent,
 ): Omit<WindowResizeSuccess, "requestId" | "ok" | "kind"> {
@@ -2858,7 +2858,7 @@ function invokeWindowResize(
 }
 
 function invokeWindowMove(
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   windowId: string,
   event: RuntimeWindowMoveEvent,
 ): Omit<WindowMoveSuccess, "requestId" | "ok" | "kind"> {
@@ -2899,7 +2899,7 @@ function invokeWindowMove(
 
 function invokeWindowMaximizeRequest(
   composition: WindowCompositionFunction,
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   windowId: string,
   snapshot: WaylandWindowSnapshot,
   event: RuntimeWindowMaximizeRequestEvent,
@@ -2929,7 +2929,7 @@ function invokeWindowMaximizeRequest(
 
 function invokeWindowMinimizeRequest(
   composition: WindowCompositionFunction,
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   windowId: string,
   snapshot: WaylandWindowSnapshot,
   event: RuntimeWindowMinimizeRequestEvent,
@@ -2959,7 +2959,7 @@ function invokeWindowMinimizeRequest(
 
 function invokeWindowFullscreenRequest(
   composition: WindowCompositionFunction,
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   windowId: string,
   snapshot: WaylandWindowSnapshot,
   event: RuntimeWindowFullscreenRequestEvent,
@@ -2989,7 +2989,7 @@ function invokeWindowFullscreenRequest(
 
 function invokeWindowActivateRequest(
   composition: WindowCompositionFunction,
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   windowId: string,
   snapshot: WaylandWindowSnapshot,
   event: RuntimeWindowActivateRequestEvent,
@@ -3031,7 +3031,7 @@ function emptyWindowStateRequestResult(): Omit<
 }
 
 async function invokePointerMoveAsync(
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   event: PointerMoveEvent,
 ): Promise<Omit<PointerMoveAsyncSuccess, "requestId" | "ok" | "kind">> {
   const invoked = await events.emitPointerMoveAsync(event);
@@ -3059,7 +3059,7 @@ async function invokePointerMoveAsync(
 }
 
 async function invokeGestureSwipeAsync(
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   event: GestureSwipeEvent,
 ): Promise<Omit<PointerMoveAsyncSuccess, "requestId" | "ok" | "kind">> {
   const invoked = await events.emitGestureSwipeAsync(event);
@@ -3087,7 +3087,7 @@ async function invokeGestureSwipeAsync(
 }
 
 function closeWindow(
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   windowId: string,
 ): void {
   const existing = cacheByWindowId.get(windowId);
@@ -3108,7 +3108,7 @@ function closeWindow(
 }
 
 function startClose(
-  events: WindowManagerEventController,
+  events: CompositorEventController,
   effectConfig: RuntimeEffectConfig,
   windowId: string,
 ): Omit<StartCloseSuccess, "requestId" | "ok" | "kind"> {
@@ -3313,12 +3313,12 @@ function resolveComposition(
   type WindowSlot = { composition?: WindowCompositionFunction | null };
   type WmSlot = { window?: WindowSlot };
   const maybeComposition =
-    WINDOW_MANAGER.window.composition ??
+    COMPOSITOR.window.composition ??
     (loaded.default as WmSlot | undefined)?.window?.composition ??
     (loaded.composition as WindowCompositionFunction | undefined);
 
   if (!maybeComposition) {
-    throw new Error("config did not assign WINDOW_MANAGER.window.composition");
+    throw new Error("config did not assign COMPOSITOR.window.composition");
   }
 
   return maybeComposition;
@@ -3326,14 +3326,14 @@ function resolveComposition(
 
 function resolveEvents(
   loaded: Record<string, unknown>,
-): WindowManagerEventController {
+): CompositorEventController {
   const maybeEvents =
-    WINDOW_MANAGER.event ??
-    (loaded.default as { event?: WindowManagerEventController } | undefined)
+    COMPOSITOR.event ??
+    (loaded.default as { event?: CompositorEventController } | undefined)
       ?.event;
 
   if (!maybeEvents) {
-    throw new Error("config did not initialize WINDOW_MANAGER.event");
+    throw new Error("config did not initialize COMPOSITOR.event");
   }
 
   return maybeEvents;
@@ -3343,7 +3343,7 @@ function resolveEffectConfig(
   loaded: Record<string, unknown>,
 ): RuntimeEffectConfig {
   const maybeEffect =
-    WINDOW_MANAGER.effect ??
+    COMPOSITOR.effect ??
     (
       loaded.default as
         | {

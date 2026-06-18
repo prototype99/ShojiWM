@@ -588,16 +588,71 @@ export {
 export type CompositionNode = CompositionChild;
 
 /**
- * M2-T2 note:
- * These component placeholders already use the custom JSX runtime contract so
- * TSX snippets can be authored before concrete layout semantics land.
+ * A flexbox-like container that arranges children horizontally or vertically.
+ * Accepts `direction`, `split`, and `style` props.
+ * 子要素を水平または垂直に整列するフレックスボックス風コンテナ。
+ * `direction`・`split`・`style` を受け付けます。
+ *
+ * @example
+ * ```tsx
+ * <Box direction="row" style={{ gap: 8, alignItems: "center" }}>
+ *   <AppIcon icon={window.icon} style={{ width: 16, height: 16 }} />
+ *   <Label text={window.title} style={{ flexGrow: 1 }} />
+ * </Box>
+ * ```
  */
 export const Box = defineIntrinsicComponent<BoxProps>("Box");
+
+/**
+ * Renders a text string, optionally reactive via a `ReadonlySignal<string>`.
+ * `ReadonlySignal<string>` を渡すとリアクティブに更新されるテキストを描画します。
+ *
+ * @example
+ * ```tsx
+ * <Label text={window.title} style={{ fontSize: 13, color: "#ffffffcc" }} />
+ * ```
+ */
 export const Label = defineIntrinsicComponent<LabelProps>("Label");
+
+/**
+ * A pressable region that triggers an action on click. Pass a callback or a
+ * `WindowActionDescriptor` from `windowAction(...)` to `onClick`.
+ * クリックでアクションをトリガーするプレス可能な領域。
+ * `onClick` にコールバックまたは `windowAction(...)` を渡します。
+ *
+ * @example
+ * ```tsx
+ * <Button onClick={windowAction("close")} style={{ width: 12, height: 12 }} />
+ * ```
+ */
 export const Button = defineIntrinsicComponent<ButtonProps>("Button");
+
+/**
+ * Renders a window's application icon. Pass `window.icon` for reactive updates.
+ * ウィンドウのアプリケーションアイコンを描画します。
+ * `window.icon` を渡すとリアクティブに更新されます。
+ *
+ * @example
+ * ```tsx
+ * <AppIcon icon={window.icon} style={{ width: 16, height: 16 }} />
+ * ```
+ */
 export const AppIcon = defineIntrinsicComponent<AppIconProps>("AppIcon");
 
 const ImageIntrinsic = defineIntrinsicComponent<ImageProps>("Image");
+
+/**
+ * Displays an image from a file path (resolved relative to the config package
+ * root) or a reactive `ReadonlySignal<string>` source.
+ * 設定パッケージルートからの相対パス、またはリアクティブな
+ * `ReadonlySignal<string>` ソースから画像を表示します。
+ *
+ * @example
+ * ```tsx
+ * <Image src="assets/wallpaper.jpg" fit="cover"
+ *   style={{ width: "100%", height: "100%" }} />
+ * ```
+ */
 export function Image(props: ImageProps) {
   const src = props.src;
   const resolved =
@@ -608,13 +663,82 @@ export function Image(props: ImageProps) {
         : src;
   return ImageIntrinsic({ ...props, src: resolved });
 }
+
+/**
+ * Applies a compiled GPU shader effect to the region occupied by its children.
+ * コンパイル済み GPU シェーダーエフェクトを子要素が占める領域に適用します。
+ *
+ * @example
+ * ```tsx
+ * const blur = compileEffect({ input: backdropSource(),
+ *   pipeline: [dualKawaseBlur({ passes: 3 })] });
+ *
+ * <ShaderEffect shader={blur} style={{ height: 32, borderRadius: 8 }}>
+ *   <Label text={window.title} />
+ * </ShaderEffect>
+ * ```
+ */
 export const ShaderEffect =
   defineIntrinsicComponent<ShaderEffectProps>("ShaderEffect");
+
+/**
+ * Binds a Wayland window into the compositor's layout system. Controls
+ * placement (`rect`), workspace, visibility, z-order, opacity, transform,
+ * and fullscreen tearing. Wrap `<ClientWindow/>` and `<WindowBorder/>` inside
+ * this component.
+ * Wayland ウィンドウをコンポジターのレイアウトシステムに結びつけます。
+ * 配置（`rect`）・ワークスペース・表示状態・z オーダー・不透明度・トランスフォーム・
+ * フルスクリーンテアリングを制御します。
+ *
+ * @example
+ * ```tsx
+ * COMPOSITOR.window.composition = (window) => (
+ *   <ManagedWindow rect={window.position} zIndex={getZIndex(window)}>
+ *     <WindowBorder style={{ borderRadius: 8 }}>
+ *       <ClientWindow style={{ borderRadius: 8 }} />
+ *     </WindowBorder>
+ *   </ManagedWindow>
+ * );
+ * ```
+ */
 export const ManagedWindow =
   defineIntrinsicComponent<ManagedWindowProps>("ManagedWindow");
+
+/**
+ * Renders the Wayland client's actual surface buffer. Must be placed inside
+ * `<ManagedWindow/>`. Leaf node — does not accept children.
+ * Wayland クライアントの実際のサーフェスバッファを描画します。
+ * `<ManagedWindow/>` の内側に配置する必要があります。子要素は受け付けません。
+ *
+ * @example
+ * ```tsx
+ * <ManagedWindow rect={...}>
+ *   <ClientWindow style={{ borderRadius: 8 }} />
+ * </ManagedWindow>
+ * ```
+ */
 export const ClientWindow =
   defineIntrinsicComponent<ClientWindowProps>("Window");
+
+/** Alias for `ClientWindow`. / `ClientWindow` の別名。 */
 export const Window = ClientWindow;
+
+/**
+ * A chrome container placed around `<ClientWindow/>` that handles border
+ * rendering and interactive resize hit areas.
+ * `<ClientWindow/>` の周囲に配置し、ボーダー描画とインタラクティブな
+ * リサイズヒット領域を処理するクロムコンテナ。
+ *
+ * @example
+ * ```tsx
+ * <WindowBorder
+ *   style={{ borderRadius: 8, border: { px: 1, color: "#ffffff20" } }}
+ *   interaction={{ resizeHitArea: { edgePx: 4, cornerPx: 8 } }}
+ * >
+ *   <ClientWindow style={{ borderRadius: 8 }} />
+ * </WindowBorder>
+ * ```
+ */
 export const WindowBorder =
   defineIntrinsicComponent<WindowBorderProps>("WindowBorder");
 

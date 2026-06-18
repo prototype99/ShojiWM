@@ -434,9 +434,15 @@ export type CompositionNodeType =
   | "WindowBorder"
   | "Fragment";
 
+/**
+ * Base props inherited by all composition components.
+ * すべての合成コンポーネントが継承するベース props。
+ */
 export interface ComponentProps {
   children?: CompositionRenderable | CompositionRenderable[];
+  /** Called with `true` when the pointer enters, `false` when it leaves. / ポインターが入ったとき `true`、出たとき `false` で呼ばれます。 */
   onHoverChange?: InteractionChangeHandler;
+  /** Called with `true` when pressed, `false` when released. / 押下で `true`、離したとき `false` で呼ばれます。 */
   onActiveChange?: InteractionChangeHandler;
 }
 
@@ -1380,56 +1386,250 @@ export interface SSDStyle {
   lineHeight?: MaybeSignal<number>;
 }
 
+/**
+ * Props for `<Box/>` — a flexbox-like container that arranges children.
+ * 子要素を整列するフレックスボックス風コンテナ `<Box/>` の props。
+ *
+ * @example Horizontal title bar / 水平タイトルバー
+ * ```tsx
+ * <Box direction="row" style={{ gap: 8, padding: 4, alignItems: "center" }}>
+ *   <AppIcon icon={window.icon} style={{ width: 16, height: 16 }} />
+ *   <Label text={window.title} style={{ flexGrow: 1, fontSize: 13 }} />
+ *   <Button onClick={windowAction("close")} style={{ width: 12, height: 12 }} />
+ * </Box>
+ * ```
+ */
 export interface BoxProps extends ComponentProps {
+  /**
+   * Layout direction for children. `"row"` / `"horizontal"` → left-to-right;
+   * `"column"` / `"vertical"` → top-to-bottom. Defaults to `"row"`.
+   * 子要素のレイアウト方向。`"row"` / `"horizontal"` は左→右、`"column"` / `"vertical"` は上→下。
+   * デフォルトは `"row"`。
+   */
   direction?: Direction;
+  /** Split direction for two-panel layouts. / 2 パネルレイアウトの分割方向。 */
   split?: Direction;
+  /** Visual styling (size, color, padding, border-radius, etc.). / 視覚スタイル（サイズ・色・パディング・角丸等）。 */
   style?: SSDStyle;
+  /** Stable node id for targeted invalidation. / ターゲット無効化のための安定したノード ID。 */
   id?: string;
 }
 
+/**
+ * Props for `<Label/>` — renders a text string.
+ * テキスト文字列を描画する `<Label/>` の props。
+ *
+ * @example Reactive window title / リアクティブなウィンドウタイトル
+ * ```tsx
+ * <Label text={window.title} style={{ fontSize: 13, color: "#ffffffcc" }} />
+ * ```
+ */
 export interface LabelProps extends ComponentProps {
+  /**
+   * The text to display. Accepts a plain string or a `ReadonlySignal<string>`
+   * for reactive text that updates automatically.
+   * 表示するテキスト。`ReadonlySignal<string>` を渡すとリアクティブに自動更新されます。
+   */
   text?: MaybeSignal<string>;
   style?: SSDStyle;
   id?: string;
 }
 
+/**
+ * Props for `<Button/>` — a pressable region that triggers an action on click.
+ * クリックでアクションをトリガーするプレス可能な領域 `<Button/>` の props。
+ *
+ * @example Close button using a built-in window action / ウィンドウアクションを使った閉じるボタン
+ * ```tsx
+ * <Button onClick={windowAction("close")} style={{ width: 12, height: 12 }} />
+ * ```
+ *
+ * @example Custom click handler / カスタムクリックハンドラー
+ * ```tsx
+ * <Button onClick={() => window.maximize()} style={{ width: 12, height: 12 }} />
+ * ```
+ */
 export interface ButtonProps extends ComponentProps {
   style?: SSDStyle;
   id?: string;
+  /**
+   * Action on click. Pass a callback for custom logic, or a
+   * `WindowActionDescriptor` created with `windowAction(...)` for built-in
+   * window operations (close, maximize, minimize, fullscreen).
+   * クリック時のアクション。カスタムロジックにはコールバック、ウィンドウ操作には
+   * `windowAction(...)` で作成した `WindowActionDescriptor` を渡します。
+   */
   onClick?: WindowActionDescriptor | (() => void);
 }
 
+/**
+ * Props for `<AppIcon/>` — renders a window's application icon.
+ * ウィンドウのアプリケーションアイコンを描画する `<AppIcon/>` の props。
+ *
+ * @example
+ * ```tsx
+ * <AppIcon icon={window.icon} style={{ width: 16, height: 16 }} />
+ * ```
+ */
 export interface AppIconProps extends ComponentProps {
+  /**
+   * The icon to display. Pass `window.icon` for reactive updates.
+   * Accepts a URL string or `{ name?, bytes? }` for named/embedded icons.
+   * 表示するアイコン。`window.icon` を渡すとリアクティブに更新されます。
+   * URL 文字列または `{ name?, bytes? }` を受け付けます。
+   */
   icon?: MaybeSignal<WindowIcon | undefined>;
   style?: SSDStyle;
   id?: string;
 }
 
+/** How the image fills its container. `"contain"` fits inside, `"cover"` crops to fill, `"fill"` stretches. / 画像がコンテナを満たす方法。 */
 export type ImageFit = "contain" | "cover" | "fill";
 
+/**
+ * Props for `<Image/>` — displays an image from a file path or reactive source.
+ * ファイルパスまたはリアクティブなソースから画像を表示する `<Image/>` の props。
+ *
+ * @example Static background image / 静的な背景画像
+ * ```tsx
+ * <Image src="assets/wallpaper.jpg" fit="cover"
+ *   style={{ width: "100%", height: "100%" }} />
+ * ```
+ */
 export interface ImageProps extends ComponentProps {
+  /**
+   * Path to the image, relative to the config package root. Also accepts a
+   * `ReadonlySignal<string>` for reactive image switching.
+   * 設定パッケージルートからの相対パス。`ReadonlySignal<string>` を渡すと
+   * リアクティブな画像切り替えが可能です。
+   */
   src: MaybeSignal<string>;
   style?: SSDStyle;
+  /**
+   * How the image fills its container:
+   * - `"contain"` — scaled to fit entirely inside without cropping
+   * - `"cover"` — scaled to fill and cropped to the container shape
+   * - `"fill"` — stretched to the exact container size
+   */
   fit?: MaybeSignal<ImageFit>;
   id?: string;
 }
 
+/**
+ * Props for `<ShaderEffect/>` — a container that applies a compiled GPU effect
+ * to the region occupied by its children.
+ * 子要素が占める領域にコンパイル済み GPU エフェクトを適用するコンテナ
+ * `<ShaderEffect/>` の props。
+ *
+ * @example Frosted-glass title bar / すりガラスタイトルバー
+ * ```tsx
+ * const frostedGlass = compileEffect({
+ *   input: backdropSource(),
+ *   pipeline: [dualKawaseBlur({ passes: 3 })],
+ * });
+ *
+ * <ShaderEffect shader={frostedGlass} style={{ height: 32, borderRadius: 8 }}>
+ *   <Label text={window.title} style={{ padding: 8 }} />
+ * </ShaderEffect>
+ * ```
+ */
 export interface ShaderEffectProps extends ComponentProps {
+  /** The compiled effect to render over this node's area. / このノードの領域に描画するコンパイル済みエフェクト。 */
   shader: CompiledEffectHandle;
+  /** Layout direction for children (same as `<Box/>`). / 子要素のレイアウト方向（`<Box/>` と同じ）。 */
   direction?: Direction;
   split?: Direction;
   style?: SSDStyle;
   id?: string;
 }
 
+/**
+ * Props for `<ManagedWindow/>` — the anchor that binds a Wayland window into
+ * the compositor's layout system. Controls placement, workspace assignment,
+ * visibility, z-order, opacity, transform, and fullscreen tearing.
+ *
+ * Place exactly one `<ManagedWindow/>` per window in the tree returned by
+ * `COMPOSITOR.window.composition`.
+ * Wayland ウィンドウをコンポジターのレイアウトシステムに結びつけるアンカー
+ * `<ManagedWindow/>` の props。配置・ワークスペース割り当て・表示状態・
+ * z オーダー・不透明度・トランスフォーム・フルスクリーンテアリングを制御します。
+ *
+ * `COMPOSITOR.window.composition` が返すツリー内にウィンドウごとに 1 つ配置します。
+ *
+ * @example Floating window with border / ボーダー付きフローティングウィンドウ
+ * ```tsx
+ * COMPOSITOR.window.composition = (window) => (
+ *   <ManagedWindow
+ *     rect={{ x: window.position.x, y: window.position.y,
+ *             width: window.position.width, height: window.position.height }}
+ *     zIndex={getZIndex(window)}
+ *   >
+ *     <WindowBorder style={{ borderRadius: 8 }}>
+ *       <ClientWindow />
+ *     </WindowBorder>
+ *   </ManagedWindow>
+ * );
+ * ```
+ *
+ * @example Game window with tearing enabled / テアリング有効のゲームウィンドウ
+ * ```tsx
+ * <ManagedWindow
+ *   rect={...}
+ *   allowTearing={window.isFullscreen}
+ * >
+ *   <ClientWindow />
+ * </ManagedWindow>
+ * ```
+ */
 export interface ManagedWindowProps extends ComponentProps {
+  /**
+   * Logical position and size of the window in global compositor coordinates.
+   * Each field is a `MaybeSignal<number>` for reactive layout.
+   * グローバル座標でのウィンドウの論理的な位置とサイズ。各フィールドは
+   * `MaybeSignal<number>` でリアクティブなレイアウトに対応します。
+   */
   rect?: MaybeSignal<ManagedWindowRect>;
+  /**
+   * Workspace this window belongs to. Accepts a string name or numeric index.
+   * このウィンドウが属するワークスペース。文字列名または数値インデックスを受け付けます。
+   */
   workspace?: MaybeSignal<string | number>;
+  /**
+   * Restrict visibility to specific outputs by name. `null` means visible on all
+   * outputs (the default).
+   * 表示する出力を名前で制限します。`null` はすべての出力で表示（デフォルト）。
+   */
   visibleOutputs?: MaybeSignal<string[] | null>;
+  /**
+   * Whether the window is visible. `false` hides it without unmapping the surface.
+   * ウィンドウが表示されているか。`false` にするとサーフェスをアンマップせずに非表示にします。
+   */
   visible?: MaybeSignal<boolean>;
+  /**
+   * When `true`, the window is excluded from focus cycling and treated as
+   * background / idle content.
+   * `true` にするとフォーカスサイクルから除外され、バックグラウンド・アイドルコンテンツ
+   * として扱われます。
+   */
   idle?: MaybeSignal<boolean>;
+  /**
+   * When `false`, the window surface ignores pointer input.
+   * `false` にするとウィンドウサーフェスがポインター入力を無視します。
+   */
   interactive?: MaybeSignal<boolean>;
+  /**
+   * When `true`, the compositor enforces `rect.width`/`rect.height` on the
+   * client, overriding its own size preferences.
+   * `true` にするとコンポジターがクライアントの希望サイズを上書きし、
+   * `rect.width`/`rect.height` を強制します。
+   */
   forceRectSize?: MaybeSignal<boolean>;
+  /**
+   * When `true`, the window is in tiled mode (no shadow, no rounded corners by
+   * convention). The compositor sends the `tiled` xdg_toplevel state to the client.
+   * `true` にするとウィンドウがタイルモードになります（慣例としてシャドウなし・角丸なし）。
+   * コンポジターはクライアントに xdg_toplevel の `tiled` 状態を送ります。
+   */
   tiled?: MaybeSignal<boolean>;
   /**
    * Whether this window may tear (immediate/async page flips) while it is fullscreen and on the
@@ -1443,22 +1643,71 @@ export interface ManagedWindowProps extends ComponentProps {
    * require the client to send `wp_tearing_control`).
    */
   allowTearing?: MaybeSignal<boolean>;
+  /** Z-order within the scene graph. Higher values render on top. / シーングラフ内の z オーダー。値が大きいほど上に描画されます。 */
   zIndex?: MaybeSignal<number>;
+  /** Overall opacity from `0.0` (transparent) to `1.0` (opaque). / 全体の不透明度（`0.0` = 透明、`1.0` = 不透明）。 */
   opacity?: MaybeSignal<number>;
+  /**
+   * Additional GPU transform (scale, translate, origin) applied to the managed
+   * window node. Use `window.transform` for per-window animation-driven transforms instead.
+   * このマネージドウィンドウノードに適用する追加の GPU トランスフォーム（スケール・
+   * 移動・原点）。アニメーション駆動のトランスフォームには `window.transform` を使います。
+   */
   transform?: MaybeSignal<ManagedWindowTransform>;
   id?: string;
 }
 
+/**
+ * Props for `<ClientWindow/>` (alias: `<Window/>`). Renders the Wayland
+ * client's actual surface content. Must be placed inside `<ManagedWindow/>`
+ * in the tree returned by `COMPOSITOR.window.composition`.
+ *
+ * Leaf node — renders the client buffer and does not accept children.
+ * Wayland クライアントの実際のサーフェスコンテンツを描画する `<ClientWindow/>`
+ * （別名: `<Window/>`）の props。`COMPOSITOR.window.composition` が返すツリー内の
+ * `<ManagedWindow/>` の内側に配置します。
+ *
+ * リーフノードです。クライアントバッファを描画し、子要素は受け付けません。
+ *
+ * @example Inside a WindowBorder / WindowBorder の内側
+ * ```tsx
+ * <ManagedWindow rect={...} zIndex={...}>
+ *   <WindowBorder style={{ borderRadius: 8 }}>
+ *     <ClientWindow style={{ borderRadius: 8 }} />
+ *   </WindowBorder>
+ * </ManagedWindow>
+ * ```
+ */
 export interface ClientWindowProps extends ComponentProps {
+  /** Clip / style applied to the client surface (typically `borderRadius`). / クライアントサーフェスへのクリップ・スタイル（通常は `borderRadius`）。 */
   style?: SSDStyle;
   id?: string;
   children?: never;
 }
 
+/** Alias for `ClientWindowProps`. / `ClientWindowProps` の別名。 */
 export type WindowProps = ClientWindowProps;
 
+/**
+ * Props for `<WindowBorder/>` — a chrome container placed around
+ * `<ClientWindow/>` that handles border rendering and interactive resize areas.
+ * `<ClientWindow/>` の周囲に配置し、ボーダー描画とインタラクティブなリサイズ領域を
+ * 処理するクロムコンテナ `<WindowBorder/>` の props。
+ *
+ * @example Rounded border with resize hit areas / リサイズ領域付き角丸ボーダー
+ * ```tsx
+ * <WindowBorder
+ *   style={{ borderRadius: 8, border: { px: 1, color: "#ffffff20" } }}
+ *   interaction={{ resizeHitArea: { edgePx: 4, cornerPx: 8 } }}
+ * >
+ *   <ClientWindow style={{ borderRadius: 8 }} />
+ * </WindowBorder>
+ * ```
+ */
 export interface WindowBorderProps extends ComponentProps {
+  /** Visual border styling (radius, color, shadow, etc.). / ボーダーの視覚スタイル（角丸・色・シャドウ等）。 */
   style?: SSDStyle;
+  /** Interactive resize hit areas. / インタラクティブなリサイズヒット領域。 */
   interaction?: WindowBorderInteraction;
   id?: string;
 }
