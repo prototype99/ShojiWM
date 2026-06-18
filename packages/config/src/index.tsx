@@ -256,6 +256,12 @@ WINDOW_MANAGER.key.bind("chrome", "Super+B", () => {
   });
 });
 
+WINDOW_MANAGER.key.bind("discord", "Super+D", () => {
+  WINDOW_MANAGER.process.spawn({
+    command: "discord --enable-features=UseOzonePlatform --ozone-platform=wayland --enable-wayland-ime --disable-gpu"
+  });
+});
+
 // Resolve the monitor under the cursor and toggle shoji-bar-2's StartMenu via ags request.
 function toggleStartMenu() {
   const monitor = HYBRID_WINDOW_MANAGER.getCurrentMonitorName();
