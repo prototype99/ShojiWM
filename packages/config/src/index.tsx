@@ -213,6 +213,10 @@ HYBRID_WINDOW_MANAGER.setSnapPreviewBroadcaster((preview) => {
   WORKSPACE_IPC.broadcast("snap.preview", preview);
 });
 
+HYBRID_WINDOW_MANAGER.setWorkspaceChangeBroadcaster(() => {
+  scheduleWorkspaceBroadcast();
+});
+
 COMPOSITOR.onDisable(() => {
   WORKSPACE_IPC.close();
 });

@@ -175,6 +175,7 @@ export interface SnapPreviewPayload {
 }
 
 export type SnapPreviewBroadcaster = (preview: SnapPreviewPayload) => void;
+export type WorkspaceChangeBroadcaster = () => void;
 
 type LayoutSnapZone = Exclude<SnapZone, "maximize">;
 type SnapColumn = "left" | "right";
@@ -384,6 +385,7 @@ export class HybridWindowManager {
   private lastPointerTarget: PointerMoveEvent["target"] = { kind: "none" };
   // Broadcasts the active snap-zone preview rect to external clients (the bar).
   private snapPreviewBroadcaster: SnapPreviewBroadcaster | null = null;
+  private workspaceChangeBroadcaster: WorkspaceChangeBroadcaster | null = null;
   // Pending Windows-style snap decision for the in-flight floating drag.
   private floatingSnap: {
     windowId: string;
@@ -1308,6 +1310,7 @@ export class HybridWindowManager {
     }
     this.applyWorkspaceStackPolicy(fromWorkspace);
     this.applyWorkspaceStackPolicy(toWorkspace);
+    this.workspaceChangeBroadcaster?.();
   }
 
   public getCurrentWorkspace(): Workspace | undefined {
@@ -2249,6 +2252,12 @@ export class HybridWindowManager {
 
   public setSnapPreviewBroadcaster(broadcaster: SnapPreviewBroadcaster | null) {
     this.snapPreviewBroadcaster = broadcaster;
+  }
+
+  public setWorkspaceChangeBroadcaster(
+    broadcaster: WorkspaceChangeBroadcaster | null,
+  ) {
+    this.workspaceChangeBroadcaster = broadcaster;
   }
 
   /** Full logical rect of a monitor (ignores reserved insets). */
