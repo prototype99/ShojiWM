@@ -9,6 +9,10 @@
 <video src="https://github.com/user-attachments/assets/a6af022e-ff36-4fbd-9348-221d5e50d9b8" width="320" height="240" controls></video>
 </div>
 
+## Documents
+ - [English](https://bea4dev.github.io/ShojiWM/)
+ - [日本語](https://bea4dev.github.io/ShojiWM/ja/)
+
 ## Features
 
 - [x] Window management
@@ -19,7 +23,3 @@
 - [x] Layer shell support
 - [x] Multi-monitor support
 - [x] Intel, AMD, and NVIDIA GPU support
-
-## Documents
- - [English](https://bea4dev.github.io/ShojiWM/)
- - [日本語](https://bea4dev.github.io/ShojiWM/ja/)
