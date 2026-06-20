@@ -275,6 +275,19 @@ COMPOSITOR.key.bind("dolphin", "Super+E", () => {
   COMPOSITOR.process.spawn({ command: "dolphin" });
 });
 
+COMPOSITOR.key.bind("play", "XF86AudioPlay", () => {
+  COMPOSITOR.process.spawn({ command: "playerctl play-pause" });
+});
+COMPOSITOR.key.bind("pause", "XF86AudioPause", () => {
+  COMPOSITOR.process.spawn({ command: "playerctl play-pause" });
+});
+COMPOSITOR.key.bind("next", "XF86AudioNext", () => {
+  COMPOSITOR.process.spawn({ command: "playerctl next" });
+});
+COMPOSITOR.key.bind("prev", "XF86AudioPrev", () => {
+  COMPOSITOR.process.spawn({ command: "playerctl previous" });
+});
+
 // Resolve the monitor under the cursor and toggle shoji-bar-2's StartMenu via ags request.
 function toggleStartMenu() {
   const monitor = HYBRID_WINDOW_MANAGER.getCurrentMonitorName();
