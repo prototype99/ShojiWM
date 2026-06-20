@@ -109,7 +109,7 @@ children. Alias: `<Window/>`.
 
 The optional `style` clips/styles the surface (typically just `borderRadius`).
 
-:::tip Fullscreen fast path
+:::tip[Fullscreen fast path]
 For fullscreen windows, return **only** a bare `<ClientWindow/>` inside
 `<ManagedWindow/>` (no border, no title bar). Rendering nothing else is what lets
 the TTY backend promote the client buffer to the primary plane (direct scanout)

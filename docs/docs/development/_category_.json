@@ -1,0 +1,8 @@
+{
+  "label": "Development & Contributing",
+  "position": 5,
+  "link": {
+    "type": "generated-index",
+    "description": "Build ShojiWM from source, profile it, and contribute changes."
+  }
+}

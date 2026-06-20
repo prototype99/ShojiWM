@@ -26,5 +26,13 @@
   "sidebar.docsSidebar.category.Architecture.link.generated-index.description": {
     "message": "ShojiWM の内部の仕組み。",
     "description": "The generated-index page description for category 'Architecture' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Development & Contributing": {
+    "message": "開発とコントリビュート",
+    "description": "The label for category 'Development & Contributing' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Development & Contributing.link.generated-index.description": {
+    "message": "ShojiWM をソースからビルド・プロファイリングし、変更をコントリビュートします。",
+    "description": "The generated-index page description for category 'Development & Contributing' in sidebar 'docsSidebar'"
   }
 }

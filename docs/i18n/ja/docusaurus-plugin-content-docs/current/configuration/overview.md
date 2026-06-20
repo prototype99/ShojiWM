@@ -27,9 +27,12 @@ COMPOSITOR.window.composition = (window) => (
 ```
 
 :::tip
-設定はデフォルトで `~/shoji_wm/config/` を読みます。このセクションの例の多くは
+設定はデフォルトで `~/.config/shojiwm/`（エントリーポイントは
+`~/.config/shojiwm/src/index.tsx`）を読みます。このセクションの例の多くは
 デフォルト設定（`packages/config/src/index.tsx`）から引用しています。下記の各機能を
-理解した後は、このファイルが最良の総合リファレンスになります。
+理解した後は、このファイルが最良の総合リファレンスになります。最初の状態で何をするか
+――キーバインドやウィンドウの挙動など――は [デフォルト設定](./default-config.md)
+を参照してください。
 :::
 
 ## `COMPOSITOR` オブジェクト

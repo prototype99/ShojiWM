@@ -27,9 +27,12 @@ COMPOSITOR.window.composition = (window) => (
 ```
 
 :::tip
-The examples throughout this section are drawn from the default config
+Your config is read from `~/.config/shojiwm/` by default (the entry point is
+`~/.config/shojiwm/src/index.tsx`) — that's the file to edit. The examples
+throughout this section are drawn from the default config
 (`packages/config/src/index.tsx`). It is the best end-to-end reference once you
-understand the individual pieces below.
+understand the individual pieces below. For a tour of what it does out of the
+box — keybindings, window behavior, and more — see [Default config](./default-config.md).
 :::
 
 ## The `COMPOSITOR` object
