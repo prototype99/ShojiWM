@@ -116,7 +116,9 @@ See [Input devices](./input.md) to change these.
 
 ## Visual effects
 
-- A full-screen **background blur** sits beneath all windows.
+- A **background blur** is provided for clients that request it via the
+  `ext-background-effect-v1` protocol (e.g. translucent apps that ask the
+  compositor to blur behind them).
 - **Layer surfaces** (bars, docks) and **layer popups** (menus) are blurred
   behind, unless a surface opts out with the `no_blur` namespace.
 

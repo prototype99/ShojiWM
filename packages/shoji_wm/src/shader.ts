@@ -461,8 +461,9 @@ export function compileEffect(
  *
  * @example Per-window drop shadow / ウィンドウごとのドロップシャドウ
  * ```ts
+ * // The handle goes in an assignment slot: behind | behindRootSurface | inFront | replace.
  * COMPOSITOR.effect.window = () => ({
- *   effect: compileWindowEffect({
+ *   behind: compileWindowEffect({
  *     input: windowSource(),
  *     pipeline: [shaderStage("shaders/shadow.glsl")],
  *     outsets: { top: 0, right: 20, bottom: 20, left: 20 },
@@ -493,7 +494,7 @@ export function compileWindowEffect(
  *   pipeline: [dualKawaseBlur({ passes: 2 })],
  * });
  * COMPOSITOR.effect.layer = (layer) =>
- *   layer.namespace.value === "bar" ? { effect: barBlur } : null;
+ *   layer.namespace.value === "bar" ? { behind: barBlur } : {};
  * ```
  */
 export function compileLayerEffect(

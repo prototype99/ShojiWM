@@ -212,8 +212,9 @@ export interface WaylandWindow {
  *
  * @example In an effect factory / エフェクトファクトリー内で
  * ```ts
+ * // panelBlur = compileLayerEffect({ input: backdropSource(), pipeline: [...] })
  * COMPOSITOR.effect.layer = (layer) =>
- *   layer.namespace.value === "bar" ? { shader: panelBlur } : null;
+ *   layer.namespace.value === "bar" ? { behind: panelBlur } : {};
  * ```
  */
 export interface WaylandLayer {
@@ -729,15 +730,23 @@ export interface WaylandPopup {
  */
 export interface CompositorEffectConfig {
   /**
-   * Full-screen background effect rendered beneath all windows. Set to `null`
-   * to disable.
-   * すべてのウィンドウの下に描画されるフルスクリーン背景エフェクト。`null` で無効化。
+   * Effect rendered behind the regions that clients request through the
+   * `ext-background-effect-v1` Wayland protocol (a `blur_region` on their
+   * surface). This is NOT a global full-screen backdrop: a window or layer-shell
+   * surface opts in by declaring a background-effect region, and the compositor
+   * renders this effect behind that region only. Set to `null` to disable.
+   * クライアントが `ext-background-effect-v1` Wayland プロトコルで要求した領域
+   * （サーフェスの `blur_region`）の背後に描画されるエフェクト。画面全体の背景では
+   * ありません。ウィンドウやレイヤーシェルサーフェスが背景エフェクト領域を宣言して
+   * オプトインし、コンポジターがその領域の背後にのみこのエフェクトを描画します。
+   * `null` で無効化。
    *
    * @example
    * ```ts
-   * COMPOSITOR.effect.background_effect = compileEffect(({ backdrop }) =>
-   *   dualKawaseBlur(backdrop(), { passes: 3, offset: 2.5 }),
-   * );
+   * COMPOSITOR.effect.background_effect = compileEffect({
+   *   input: backdropSource(),
+   *   pipeline: [dualKawaseBlur({ radius: 4, passes: 2 })],
+   * });
    * ```
    */
   background_effect: CompiledEffectHandle | null;
@@ -747,10 +756,18 @@ export interface CompositorEffectConfig {
    * マップされたトップレベルウィンドウごとに1回呼ばれるエフェクトファクトリー。
    * そのウィンドウにエフェクトを適用しない場合は `null` を返します。
    *
+   * An assignment places an effect in a slot relative to the surface:
+   * `behind`, `behindRootSurface`, `inFront`, or `replace`. Each takes a handle
+   * from `compileWindowEffect(...)`.
+   * 割り当ては、サーフェスに対する位置（`behind`・`behindRootSurface`・`inFront`・
+   * `replace`）にエフェクトを置きます。各スロットには `compileWindowEffect(...)` の
+   * ハンドルを渡します。
+   *
    * @example
    * ```ts
+   * // frostedGlass = compileWindowEffect({ input: windowSource(), pipeline: [...] })
    * COMPOSITOR.effect.window = (window) =>
-   *   window.isFullscreen ? null : { shader: frostedGlass };
+   *   window.isFullscreen() ? null : { behind: frostedGlass };
    * ```
    */
   window?: (window: WaylandWindow) => WindowEffectAssignment | null;
@@ -760,8 +777,9 @@ export interface CompositorEffectConfig {
    *
    * @example
    * ```ts
+   * // panelBlur = compileLayerEffect({ input: backdropSource(), pipeline: [...] })
    * COMPOSITOR.effect.layer = (layer) =>
-   *   layer.namespace === "bar" ? { shader: panelBlur } : null;
+   *   layer.namespace() === "no_blur" ? {} : { behind: panelBlur };
    * ```
    */
   layer?: (layer: WaylandLayer) => LayerEffectAssignment | null;
@@ -773,8 +791,9 @@ export interface CompositorEffectConfig {
    *
    * @example
    * ```ts
+   * // tooltipBlur = compilePopupEffect({ input: backdropSource(), pipeline: [...] })
    * COMPOSITOR.effect.popup = (popup) =>
-   *   popup.parentKind === "layer" ? { shader: tooltipBlur } : null;
+   *   popup.parentKind === "window" ? {} : { behind: tooltipBlur };
    * ```
    */
   popup?: (popup: WaylandPopup) => PopupEffectAssignment | null;
@@ -1794,15 +1813,17 @@ export interface CompositorDefinition {
    *
    * @example Background blur / 背景ブラー
    * ```ts
-   * COMPOSITOR.effect.background_effect = compileEffect(({ backdrop }) =>
-   *   dualKawaseBlur(backdrop(), { passes: 4, offset: 3 }),
-   * );
+   * COMPOSITOR.effect.background_effect = compileEffect({
+   *   input: backdropSource(),
+   *   pipeline: [dualKawaseBlur({ radius: 4, passes: 2 })],
+   * });
    * ```
    *
    * @example Per-window effect / ウィンドウごとのエフェクト
    * ```ts
+   * // frostedGlass = compileWindowEffect({ input: windowSource(), pipeline: [...] })
    * COMPOSITOR.effect.window = (window) =>
-   *   window.isFullscreen ? null : { shader: frostedGlass };
+   *   window.isFullscreen() ? null : { behind: frostedGlass };
    * ```
    */
   effect: CompositorEffectConfig;

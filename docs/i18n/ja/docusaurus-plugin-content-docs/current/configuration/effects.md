@@ -8,7 +8,7 @@ ShojiWM は GPU シェーダーエフェクトを4箇所で実行でき、`COMPO
 
 | フィールド | 型 | 適用先 |
 | --- | --- | --- |
-| `background_effect` | `CompiledEffectHandle \| null` | 全ウィンドウの下のフルスクリーン背景 |
+| `background_effect` | `CompiledEffectHandle \| null` | クライアントが要求した領域の背後（`ext-background-effect-v1`） |
 | `window` | `(window) => WindowEffectAssignment \| null` | トップレベルウィンドウごと |
 | `layer` | `(layer) => LayerEffectAssignment \| null` | レイヤーシェルサーフェスごと（バー・ドック） |
 | `popup` | `(popup) => PopupEffectAssignment \| null` | ポップアップごと（メニュー・ツールチップ） |
@@ -18,7 +18,12 @@ ShojiWM は GPU シェーダーエフェクトを4箇所で実行でき、`COMPO
 
 ## 背景エフェクト
 
-すべての背後に描画されるコンパイル済みエフェクトを割り当てます。`null` で無効化。
+`background_effect` は、クライアントが **`ext-background-effect-v1` Wayland プロトコル**で
+要求した領域（サーフェスに宣言された `blur_region`）の背後にコンポジターが描画する
+エフェクトです。画面全体の背景では**ありません**。ウィンドウやレイヤーシェルサーフェスが
+このプロトコルでオプトインし、コンポジターはその領域の背後にのみこのエフェクトを適用します
+――たとえば、背後をぼかすようコンポジターに要求する半透明のアプリやパネルなどです。
+`null` で無効化します。
 
 ```ts
 import {COMPOSITOR, compileEffect, backdropSource, dualKawaseBlur} from 'shoji_wm';

@@ -9,7 +9,7 @@ ShojiWM can run GPU shader effects in four places, configured via
 
 | Field | Type | Applies to |
 | --- | --- | --- |
-| `background_effect` | `CompiledEffectHandle \| null` | Full-screen background, beneath all windows |
+| `background_effect` | `CompiledEffectHandle \| null` | Behind client-requested regions (`ext-background-effect-v1`) |
 | `window` | `(window) => WindowEffectAssignment \| null` | Per toplevel window |
 | `layer` | `(layer) => LayerEffectAssignment \| null` | Per layer-shell surface (bars, docks) |
 | `popup` | `(popup) => PopupEffectAssignment \| null` | Per popup (menus, tooltips) |
@@ -19,7 +19,13 @@ You can also apply an effect to a region inside the composition with
 
 ## Background effect
 
-Assign a compiled effect that renders behind everything. Set `null` to disable.
+`background_effect` is the effect the compositor renders **behind the regions a
+client requests through the `ext-background-effect-v1` Wayland protocol** (a
+`blur_region` declared on its surface). It is **not** a global full-screen
+backdrop: a window or layer-shell surface opts in via the protocol, and the
+compositor applies this effect behind that region only — for example a
+translucent app or panel that asks the compositor to blur whatever is behind it.
+Set `null` to disable.
 
 ```ts
 import {COMPOSITOR, compileEffect, backdropSource, dualKawaseBlur} from 'shoji_wm';
