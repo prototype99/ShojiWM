@@ -1248,16 +1248,20 @@ impl ShojiWM {
                 // Inside the callback, you should insert the client into the display.
                 //
                 // You may also associate some data with the client when inserting the client.
-                state
-                    .display_handle
-                    .insert_client(
-                        client_stream,
-                        Arc::new(ClientState {
-                            compositor_state: CompositorClientState::default(),
-                            xwayland_refresh_override: client_is_xwayland_bridge,
-                        }),
-                    )
-                    .unwrap();
+                if let Err(error) = state.display_handle.insert_client(
+                    client_stream,
+                    Arc::new(ClientState {
+                        compositor_state: CompositorClientState::default(),
+                        xwayland_refresh_override: client_is_xwayland_bridge,
+                    }),
+                ) {
+                    warn!(
+                        ?error,
+                        client_is_xwayland_bridge,
+                        "failed to insert wayland client"
+                    );
+                    return;
+                }
                 state.request_tty_maintenance("wayland-listener");
             })
             .expect("Failed to init the wayland event source.");

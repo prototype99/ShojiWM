@@ -306,19 +306,13 @@ fn init_logging(args: &CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         .write(true)
         .truncate(true)
         .open(&latest_log)?;
-    let file_writer = move || {
-        log_file
-            .try_clone()
-            .expect("failed to clone latest.log for tracing")
-    };
-
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,shoji_wm=info"));
 
     tracing_subscriber::fmt()
         .compact()
         .with_ansi(false)
-        .with_writer(file_writer)
+        .with_writer(std::sync::Mutex::new(log_file))
         .with_env_filter(env_filter)
         .init();
 
