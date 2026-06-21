@@ -40,7 +40,8 @@ impl Drop for UnlinkGuard {
 }
 
 pub fn satellite_requested() -> bool {
-    std::env::var_os("SHOJI_XWAYLAND_SATELLITE").is_some_and(|value| value != "0" && value != "off")
+    !std::env::var_os("SHOJI_XWAYLAND_SATELLITE")
+        .is_some_and(|value| value == "0" || value == "off")
 }
 
 pub fn spawn_satellite() -> Result<SatelliteInstance, Box<dyn std::error::Error>> {

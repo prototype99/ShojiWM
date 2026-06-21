@@ -118,9 +118,6 @@ fn apply_runtime_overrides(args: &CliArgs) {
     if !args.tty_outputs.is_empty() {
         unsafe { std::env::set_var("SHOJI_TTY_OUTPUT", args.tty_outputs.join(",")) };
     }
-    if args.xwayland_satellite {
-        unsafe { std::env::set_var("SHOJI_XWAYLAND_SATELLITE", "1") };
-    }
     if let Some(path) = args.xwayland_satellite_path.as_deref() {
         unsafe { std::env::set_var("SHOJI_XWAYLAND_SATELLITE_PATH", path) };
     }
@@ -164,7 +161,6 @@ struct CliArgs {
     log_off: bool,
     no_log_rotate: bool,
     tty_outputs: Vec<String>,
-    xwayland_satellite: bool,
     xwayland_satellite_path: Option<String>,
     xwayland_satellite_glamor: Option<String>,
     decoration_runtime_node_args: Vec<String>,
@@ -182,8 +178,6 @@ impl CliArgs {
             std::env::var_os("SHOJI_LOG").is_some_and(|value| value == "off" || value == "0");
         let env_no_rotate = std::env::var_os("SHOJI_LOG_ROTATE")
             .is_some_and(|value| value == "0" || value == "off");
-        let env_xwayland_satellite = std::env::var_os("SHOJI_XWAYLAND_SATELLITE")
-            .is_some_and(|value| value != "0" && value != "off");
         let env_xwayland_satellite_path = std::env::var("SHOJI_XWAYLAND_SATELLITE_PATH").ok();
         let env_xwayland_satellite_glamor = std::env::var("SHOJI_XWAYLAND_SATELLITE_GLAMOR").ok();
 
@@ -195,9 +189,6 @@ impl CliArgs {
         let xwayland_satellite_glamor = parse_option_value(&args, "--xwayland-satellite-glamor")
             .or(env_xwayland_satellite_glamor)
             .filter(|value| matches!(value.as_str(), "gl" | "es" | "none"));
-        let xwayland_satellite = args.iter().any(|arg| arg == "--xwayland-satellite")
-            || env_xwayland_satellite
-            || xwayland_satellite_path.is_some();
         let config_path = parse_option_value(&args, "--config").map(PathBuf::from);
         let runtime_dir = parse_option_value(&args, "--runtime-dir").map(PathBuf::from);
         let tsx_program = parse_option_value(&args, "--tsx").map(PathBuf::from);
@@ -209,7 +200,6 @@ impl CliArgs {
             log_off: args.iter().any(|arg| arg == "--log-off") || env_log_off,
             no_log_rotate: args.iter().any(|arg| arg == "--no-log-rotate") || env_no_rotate,
             tty_outputs,
-            xwayland_satellite,
             xwayland_satellite_path,
             xwayland_satellite_glamor,
             decoration_runtime_node_args,
