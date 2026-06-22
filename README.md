@@ -92,9 +92,13 @@ and [Hyprland](https://github.com/hyprwm/Hyprland).
 | Linux gaming support, including tearing | 🟡 <sup>4</sup> | ✅ | ✅ |
 | First-class xwayland-satellite support | ✅ | ❌ | ✅ |
 
+
 <sup>1</sup> Hyprland 0.55+ adds custom layouts and event scripting via Lua (not TypeScript); core WM behavior remains built-in.
+
 <sup>2</sup> Custom GLSL is limited to window open/close/resize animations.
+
 <sup>3</sup> A single full-screen screen shader, not a per-element pipeline.
+
 <sup>4</sup> Niri supports VRR (adaptive sync), but not a tearing / immediate-flip mode.
 
 > Comparison reflects each project at the time of writing; corrections are welcome.
