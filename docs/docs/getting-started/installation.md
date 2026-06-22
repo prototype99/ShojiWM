@@ -57,6 +57,19 @@ cargo install --path ./
 
 This places the `xwayland-satellite` binary on your `PATH` (typically under
 `~/.cargo/bin`). Install it before starting a session.
+
+**Recommended for ShojiWM:** a ShojiWM-specific fork with hotfixes is available on
+the `shojiwm` branch of
+[`bea4dev/xwayland-satellite`](https://github.com/bea4dev/xwayland-satellite/tree/shojiwm).
+It includes an experimental fix for an issue where Unity tabs cannot be grabbed
+and moved. If you want these fixes and other hotfix support, install that branch
+instead:
+
+```bash
+git clone -b shojiwm https://github.com/bea4dev/xwayland-satellite.git
+cd xwayland-satellite
+cargo install --path ./
+```
 :::
 
 ## Install

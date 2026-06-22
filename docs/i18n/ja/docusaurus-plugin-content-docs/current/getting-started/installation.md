@@ -56,6 +56,18 @@ cargo install --path ./
 
 これで `xwayland-satellite` バイナリが `PATH`（通常は `~/.cargo/bin`）に置かれます。
 セッションを起動する前にインストールしておいてください。
+
+**ShojiWM 向けの推奨:** ホットフィックスを含む ShojiWM 専用のフォークが、
+[`bea4dev/xwayland-satellite`](https://github.com/bea4dev/xwayland-satellite/tree/shojiwm)
+の `shojiwm` ブランチにあります。Unity のタブを掴んで移動できない問題への試験的な修正が
+含まれています。これらの修正やその他のホットフィックスのサポートが必要な場合は、こちらの
+ブランチをインストールすることを推奨します。
+
+```bash
+git clone -b shojiwm https://github.com/bea4dev/xwayland-satellite.git
+cd xwayland-satellite
+cargo install --path ./
+```
 :::
 
 ## インストール
