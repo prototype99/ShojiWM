@@ -211,6 +211,12 @@ pub struct ActiveManagedWindowAnimation {
     pub animation: ManagedWindowAnimationSnapshot,
 }
 
+#[derive(Clone)]
+pub struct PendingLayerSurface {
+    pub output: Output,
+    pub layer: LayerSurface,
+}
+
 fn popup_lifecycle_debug_enabled() -> bool {
     std::env::var_os("SHOJI_POPUP_LIFECYCLE_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
@@ -354,6 +360,7 @@ pub struct ShojiWM {
     pub decoration_hover_target: Option<TrackedDecorationInteractionTarget>,
     pub decoration_active_target: Option<TrackedDecorationInteractionTarget>,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
+    pub pending_layer_surfaces: Vec<PendingLayerSurface>,
     pub window_keyboard_focus: Option<WlSurface>,
     pub mapped_on_demand_layer_surfaces: HashSet<u32>,
     pub force_full_damage: bool,
@@ -889,6 +896,7 @@ impl ShojiWM {
             decoration_hover_target: None,
             decoration_active_target: None,
             layer_shell_on_demand_focus: None,
+            pending_layer_surfaces: Vec::new(),
             window_keyboard_focus: None,
             mapped_on_demand_layer_surfaces: Default::default(),
             force_full_damage,

@@ -1181,7 +1181,10 @@ fn finish_processed_outputs(state: &mut ShojiWM, processed_outputs: &[String]) {
         for output in state.space.outputs() {
             let output_name = output.name();
             let map = smithay::desktop::layer_map_for_output(output);
-            for layer in map.layers() {
+            for layer in map
+                .layers()
+                .filter(|layer| crate::backend::window::layer_surface_is_mapped(layer))
+            {
                 layer_outputs
                     .entry(layer.wl_surface().id().protocol_id().to_string())
                     .or_default()
@@ -5144,7 +5147,10 @@ fn render_surface(
                 },
             );
         }
-        for layer in layer_map_for_output(&output).layers() {
+        for layer in layer_map_for_output(&output)
+            .layers()
+            .filter(|layer| crate::backend::window::layer_surface_is_mapped(layer))
+        {
             layer.send_dmabuf_feedback(
                 &output,
                 |_, _| Some(output.clone()),
@@ -9412,6 +9418,7 @@ fn upper_layer_scene_elements(
     let upper_layers: Vec<_> = layer_kinds
         .iter()
         .flat_map(|layer| map.layers_on(*layer).rev().cloned())
+        .filter(crate::backend::window::layer_surface_is_mapped)
         .collect();
     drop(map);
 

@@ -4035,6 +4035,7 @@ fn upper_layer_scene_elements(
     let upper_layers: Vec<_> = layer_kinds
         .iter()
         .flat_map(|layer| map.layers_on(*layer).rev().cloned())
+        .filter(crate::backend::window::layer_surface_is_mapped)
         .collect();
     drop(map);
 

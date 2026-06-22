@@ -30,7 +30,7 @@ use smithay::{
 };
 use tracing::info;
 
-use crate::state::ShojiWM;
+use crate::{backend::window::layer_surface_is_mapped, state::ShojiWM};
 
 const PRIMARY_OUTPUT_KEEP_WITHIN_PERCENT: i64 = 110;
 
@@ -300,7 +300,7 @@ pub fn update_primary_scanout_output(
     });
 
     let map = layer_map_for_output(output);
-    for layer_surface in map.layers() {
+    for layer_surface in map.layers().filter(|layer| layer_surface_is_mapped(layer)) {
         layer_surface.with_surfaces(|surface, states| {
             update_surface_primary_scanout_output(
                 surface,
@@ -351,7 +351,7 @@ pub fn take_presentation_feedback(
     });
 
     let map = layer_map_for_output(output);
-    for layer_surface in map.layers() {
+    for layer_surface in map.layers().filter(|layer| layer_surface_is_mapped(layer)) {
         layer_surface.take_presentation_feedback(
             &mut output_presentation_feedback,
             surface_primary_scanout_output,
@@ -484,7 +484,7 @@ impl ShojiWM {
         });
 
         let map = layer_map_for_output(output);
-        for layer_surface in map.layers() {
+        for layer_surface in map.layers().filter(|layer| layer_surface_is_mapped(layer)) {
             layer_surface.send_frame(output, time, throttle, &should_send);
         }
         drop(map);
@@ -569,7 +569,7 @@ impl ShojiWM {
         });
 
         let map = layer_map_for_output(output);
-        for layer_surface in map.layers() {
+        for layer_surface in map.layers().filter(|layer| layer_surface_is_mapped(layer)) {
             layer_surface.send_frame(output, time, throttle, &should_send);
         }
         drop(map);
@@ -653,7 +653,7 @@ impl ShojiWM {
         });
 
         let map = layer_map_for_output(output);
-        for layer_surface in map.layers() {
+        for layer_surface in map.layers().filter(|layer| layer_surface_is_mapped(layer)) {
             layer_surface.with_surfaces(|surface, states| {
                 if let Some(mut commit_timer_state) = states
                     .data_map
@@ -711,7 +711,7 @@ impl ShojiWM {
         });
 
         let map = layer_map_for_output(output);
-        for layer_surface in map.layers() {
+        for layer_surface in map.layers().filter(|layer| layer_surface_is_mapped(layer)) {
             layer_surface.with_surfaces(|_, states| {
                 let deadline = states
                     .data_map
@@ -819,7 +819,7 @@ impl ShojiWM {
         });
 
         let map = layer_map_for_output(output);
-        for layer_surface in map.layers() {
+        for layer_surface in map.layers().filter(|layer| layer_surface_is_mapped(layer)) {
             layer_surface.with_surfaces(|surface, states| {
                 let primary_scanout_output = surface_primary_scanout_output(surface, states);
                 if let Some(output) = primary_scanout_output.as_ref() {

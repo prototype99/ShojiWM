@@ -16,7 +16,7 @@ use smithay::{
 };
 use tracing::{debug, info};
 
-use crate::state::ShojiWM;
+use crate::state::{PendingLayerSurface, ShojiWM};
 
 fn layer_focus_debug_enabled() -> bool {
     std::env::var_os("SHOJI_LAYER_FOCUS_DEBUG").is_some()
@@ -36,7 +36,7 @@ impl WlrLayerShellHandler for ShojiWM {
         &mut self,
         surface: WlrLayerSurface,
         wl_output: Option<wl_output::WlOutput>,
-        _layer: Layer,
+        _layer_kind: Layer,
         namespace: String,
     ) {
         let output = wl_output
@@ -56,9 +56,8 @@ impl WlrLayerShellHandler for ShojiWM {
             })
             .unwrap_or_else(|| self.space.outputs().next().unwrap().clone());
         let layer = LayerSurface::new(surface, namespace);
-        let mut map = layer_map_for_output(&output);
-        map.map_layer(&layer).unwrap();
-        self.schedule_redraw();
+        self.pending_layer_surfaces
+            .push(PendingLayerSurface { output, layer });
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
@@ -84,6 +83,12 @@ impl WlrLayerShellHandler for ShojiWM {
             drop(map);
             self.update_keyboard_focus(SERIAL_COUNTER.next_serial());
             self.schedule_redraw();
+        } else if let Some(index) = self
+            .pending_layer_surfaces
+            .iter()
+            .position(|pending| pending.layer.layer_surface() == &surface)
+        {
+            self.pending_layer_surfaces.swap_remove(index);
         }
     }
 }
@@ -94,20 +99,35 @@ pub fn handle_commit(state: &mut ShojiWM, surface: &WlSurface) {
         root = parent;
     }
 
-    let Some(output) = state
-        .space
-        .outputs()
-        .find(|output| {
-            let map = layer_map_for_output(output);
-            map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)
-                .is_some()
-        })
-        .cloned()
-    else {
-        return;
+    let output = if let Some(index) = state
+        .pending_layer_surfaces
+        .iter()
+        .position(|pending| pending.layer.wl_surface() == &root)
+    {
+        let pending = state.pending_layer_surfaces.swap_remove(index);
+        let output = pending.output;
+        {
+            let mut map = layer_map_for_output(&output);
+            map.map_layer(&pending.layer).unwrap();
+        }
+        output
+    } else {
+        let Some(output) = state
+            .space
+            .outputs()
+            .find(|output| {
+                let map = layer_map_for_output(output);
+                map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)
+                    .is_some()
+            })
+            .cloned()
+        else {
+            return;
+        };
+        output
     };
 
-    let initial_configure_sent = with_states(surface, |states| {
+    let initial_configure_sent = with_states(&root, |states| {
         states
             .data_map
             .get::<LayerSurfaceData>()
@@ -120,14 +140,12 @@ pub fn handle_commit(state: &mut ShojiWM, surface: &WlSurface) {
     let mut map = layer_map_for_output(&output);
     map.arrange();
 
-    if !initial_configure_sent {
-        if let Some(layer) = map.layer_for_surface(surface, WindowSurfaceType::TOPLEVEL) {
+    if let Some(layer) = map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL) {
+        if !initial_configure_sent {
             debug!(surface = ?surface.id(), "sending initial layer-shell configure");
             layer.layer_surface().send_configure();
         }
-    }
 
-    if let Some(layer) = map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL) {
         let layer_geo = map.layer_geometry(&layer);
         let output_loc = state
             .space

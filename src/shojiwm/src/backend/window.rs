@@ -11,6 +11,7 @@ use smithay::{
             AsRenderElements, Element, Id, Kind,
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
         },
+        utils::with_renderer_surface_state,
         gles::GlesRenderer,
     },
     desktop::{LayerSurface, PopupManager, Window, WindowSurface, layer_map_for_output},
@@ -205,10 +206,19 @@ pub fn layer_surfaces_for_output(
 ) -> (Vec<LayerSurface>, Vec<LayerSurface>) {
     let map = layer_map_for_output(output);
     let (lower, upper): (Vec<LayerSurface>, Vec<LayerSurface>) =
-        map.layers().rev().cloned().partition(|surface| {
-            matches!(surface.layer(), WlrLayer::Background | WlrLayer::Bottom)
-        });
+        map.layers()
+            .rev()
+            .filter(|surface| layer_surface_is_mapped(surface))
+            .cloned()
+            .partition(|surface| {
+                matches!(surface.layer(), WlrLayer::Background | WlrLayer::Bottom)
+            });
     (upper, lower)
+}
+
+pub fn layer_surface_is_mapped(layer_surface: &LayerSurface) -> bool {
+    with_renderer_surface_state(layer_surface.wl_surface(), |state| state.buffer().is_some())
+        .unwrap_or(false)
 }
 
 pub fn layer_elements_for_output<R>(
