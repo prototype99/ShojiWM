@@ -404,15 +404,15 @@ fn apply_keyboard_xkb_config(
         return;
     };
 
-    let xkb_config = keyboard.as_ref().map_or_else(XkbConfig::default, |keyboard| {
-        XkbConfig {
+    let xkb_config = keyboard
+        .as_ref()
+        .map_or_else(XkbConfig::default, |keyboard| XkbConfig {
             rules: keyboard.rules.as_deref().unwrap_or(""),
             model: keyboard.model.as_deref().unwrap_or(""),
             layout: keyboard.layout.as_deref().unwrap_or(""),
             variant: keyboard.variant.as_deref().unwrap_or(""),
             options: keyboard.options.clone(),
-        }
-    });
+        });
     match handle.set_xkb_config(state, xkb_config) {
         Ok(()) => {
             state.runtime_applied_xkb_config = keyboard;

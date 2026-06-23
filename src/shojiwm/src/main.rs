@@ -30,6 +30,7 @@ pub mod runtime_pointer;
 pub mod runtime_process;
 pub mod ssd;
 pub mod state;
+pub mod wlr_foreign_toplevel;
 pub mod xwayland_satellite;
 
 #[global_allocator]

@@ -1555,7 +1555,9 @@ fn queue_tty_redraws(state: &mut ShojiWM) {
                 }
                 TtyRedrawState::Queued => {}
                 TtyRedrawState::WaitingForVBlank { .. } => {
-                    surface.redraw_state = TtyRedrawState::WaitingForVBlank { redraw_needed: true };
+                    surface.redraw_state = TtyRedrawState::WaitingForVBlank {
+                        redraw_needed: true,
+                    };
                 }
                 TtyRedrawState::WaitingForEstimatedVBlank { generation, .. } => {
                     // Tearing fast-path fix: do not let a fresh client commit get stuck behind the
@@ -2103,8 +2105,7 @@ fn render_surface(
                     1.0,
                 );
                 scene_elements.extend(popup_elements.into_iter().map(TtyRenderElements::Window));
-                scene_elements
-                    .extend(surface_elements.into_iter().map(TtyRenderElements::Window));
+                scene_elements.extend(surface_elements.into_iter().map(TtyRenderElements::Window));
                 continue;
             }
             let window_started_at = Instant::now();
@@ -4897,9 +4898,7 @@ fn render_surface(
                         window
                             .toplevel()
                             .map(|toplevel| toplevel.wl_surface())
-                            .is_some_and(
-                                crate::protocols::tearing_control::surface_prefers_tearing,
-                            )
+                            .is_some_and(crate::protocols::tearing_control::surface_prefers_tearing)
                     })
             });
         surface.tearing_active = should_tear;
@@ -4925,8 +4924,7 @@ fn render_surface(
                     let src = element.src();
                     let geometry = element.geometry(scale);
                     let transform = element.transform();
-                    let storage =
-                        describe_underlying_storage(element.underlying_storage(renderer));
+                    let storage = describe_underlying_storage(element.underlying_storage(renderer));
                     fullscreen_root_buffer_details = Some(format!(
                         "element={} id={:?} src={src:?} geometry={geometry:?} \
                          transform={transform:?} storage=[{storage}]",
@@ -7117,9 +7115,8 @@ fn composed_window_popup_scene_elements(
         crate::backend::shader_effect::ShaderEffectElementState,
     >,
 ) -> Vec<TtyRenderElements> {
-    let groups = window_render::window_popup_groups(
-        window, renderer, location, output_geo, scale, alpha,
-    );
+    let groups =
+        window_render::window_popup_groups(window, renderer, location, output_geo, scale, alpha);
     if groups.is_empty() {
         return Vec::new();
     }

@@ -2212,6 +2212,7 @@ impl ShojiWM {
         self.set_window_keyboard_focus_target(Some(window));
         self.focus_layer_surface_if_on_demand(None);
         self.update_keyboard_focus(serial);
+        self.sync_wlr_foreign_toplevel_states();
         debug!(
             window_id,
             elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0,
@@ -2263,9 +2264,9 @@ impl ShojiWM {
             constraint.is_some_and(|constraint| {
                 constraint.is_active()
                     && matches!(&*constraint, PointerConstraint::Locked(_))
-                    && constraint.region().is_none_or(|region| {
-                        region.contains((location - focus.1).to_i32_round())
-                    })
+                    && constraint
+                        .region()
+                        .is_none_or(|region| region.contains((location - focus.1).to_i32_round()))
             })
         });
         locked.then_some(focus)

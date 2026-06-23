@@ -78,10 +78,7 @@ pub fn surface_prefers_tearing(surface: &WlSurface) -> bool {
     })
 }
 
-fn with_surface_data<T>(
-    surface: &WlSurface,
-    f: impl FnOnce(&TearingControlSurfaceData) -> T,
-) -> T {
+fn with_surface_data<T>(surface: &WlSurface, f: impl FnOnce(&TearingControlSurfaceData) -> T) -> T {
     with_states(surface, |states| {
         states
             .data_map
@@ -135,8 +132,9 @@ where
             wp_tearing_control_manager_v1::Request::GetTearingControl { id, surface } => {
                 // The new object must always be initialised to consume the id,
                 // even on the error path (the offending client is then killed).
-                let already_present =
-                    with_surface_data(&surface, |data| data.has_control.swap(true, Ordering::Relaxed));
+                let already_present = with_surface_data(&surface, |data| {
+                    data.has_control.swap(true, Ordering::Relaxed)
+                });
                 data_init.init(
                     id,
                     TearingControlData {

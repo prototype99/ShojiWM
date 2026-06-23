@@ -50,10 +50,10 @@ pub use window_model::{
     WaylandWindowSnapshot, WindowActivateRequestEventSnapshot, WindowActivateRequestSourceSnapshot,
     WindowFullscreenRequestEventSnapshot, WindowIconSnapshot, WindowMaximizeRequestEventSnapshot,
     WindowMinimizeRequestEventSnapshot, WindowMoveEventSnapshot, WindowMovePhaseSnapshot,
-    WindowMoveSourceSnapshot,
-    WindowPositionSnapshot, WindowResizeEdgesSnapshot, WindowResizeEventSnapshot,
-    WindowResizePhaseSnapshot, WindowResizePointSnapshot, WindowResizeSourceSnapshot,
-    WindowStateRequestSourceSnapshot, WindowTransform, layer_runtime_id, popup_runtime_id,
+    WindowMoveSourceSnapshot, WindowPositionSnapshot, WindowResizeEdgesSnapshot,
+    WindowResizeEventSnapshot, WindowResizePhaseSnapshot, WindowResizePointSnapshot,
+    WindowResizeSourceSnapshot, WindowStateRequestSourceSnapshot, WindowTransform,
+    layer_runtime_id, popup_runtime_id,
 };
 
 /// Top-level decoration tree.
@@ -598,10 +598,7 @@ impl DecorationNode {
         self
     }
 
-    pub fn with_window_border_interaction(
-        mut self,
-        interaction: WindowBorderInteraction,
-    ) -> Self {
+    pub fn with_window_border_interaction(mut self, interaction: WindowBorderInteraction) -> Self {
         self.window_border_interaction = interaction;
         self
     }

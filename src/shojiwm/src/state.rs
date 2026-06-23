@@ -249,6 +249,8 @@ pub struct ShojiWM {
     pub tearing_control_state: crate::protocols::tearing_control::TearingControlManagerState,
     pub foreign_toplevel_list_state:
         smithay::wayland::foreign_toplevel_list::ForeignToplevelListState,
+    pub wlr_foreign_toplevel_manager_state:
+        crate::wlr_foreign_toplevel::WlrForeignToplevelManagerState,
     pub image_capture_source_state: smithay::wayland::image_capture_source::ImageCaptureSourceState,
     pub output_capture_source_state:
         smithay::wayland::image_capture_source::OutputCaptureSourceState,
@@ -588,7 +590,11 @@ impl ShojiWM {
             return;
         };
 
-        keyboard.set_focus(self, Option::<WlSurface>::None, SERIAL_COUNTER.next_serial());
+        keyboard.set_focus(
+            self,
+            Option::<WlSurface>::None,
+            SERIAL_COUNTER.next_serial(),
+        );
         keyboard.set_focus(self, Some(focus), SERIAL_COUNTER.next_serial());
     }
 
@@ -626,6 +632,8 @@ impl ShojiWM {
             crate::protocols::tearing_control::TearingControlManagerState::new::<Self>(&dh);
         let foreign_toplevel_list_state =
             smithay::wayland::foreign_toplevel_list::ForeignToplevelListState::new::<Self>(&dh);
+        let wlr_foreign_toplevel_manager_state =
+            crate::wlr_foreign_toplevel::WlrForeignToplevelManagerState::new::<Self>(&dh);
         let image_capture_source_state =
             smithay::wayland::image_capture_source::ImageCaptureSourceState::new();
         let output_capture_source_state =
@@ -802,6 +810,7 @@ impl ShojiWM {
             screencopy_state,
             tearing_control_state,
             foreign_toplevel_list_state,
+            wlr_foreign_toplevel_manager_state,
             image_capture_source_state,
             output_capture_source_state,
             toplevel_capture_source_state,
@@ -1265,8 +1274,7 @@ impl ShojiWM {
                 ) {
                     warn!(
                         ?error,
-                        client_is_xwayland_bridge,
-                        "failed to insert wayland client"
+                        client_is_xwayland_bridge, "failed to insert wayland client"
                     );
                     return;
                 }
@@ -2494,13 +2502,7 @@ impl ShojiWM {
         if let Some(focus) = self
             .layer_surface_under_with_policy(&layers, &output_geo, pos, upper_layers, true)
             .or_else(|| {
-                self.layer_surface_under_with_policy(
-                    &layers,
-                    &output_geo,
-                    pos,
-                    upper_layers,
-                    false,
-                )
+                self.layer_surface_under_with_policy(&layers, &output_geo, pos, upper_layers, false)
             })
         {
             return Some(focus);

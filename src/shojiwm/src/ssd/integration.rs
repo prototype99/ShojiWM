@@ -2025,10 +2025,7 @@ impl ShojiWM {
                 &mut self.configured_layer_effects,
                 &live_layer_ids,
             );
-            retain_effect_texture_cache_for_live_ids(
-                &mut self.layer_effect_cache,
-                &live_layer_ids,
-            );
+            retain_effect_texture_cache_for_live_ids(&mut self.layer_effect_cache, &live_layer_ids);
             return Ok(());
         }
         let sync_started_at = Instant::now();
@@ -2076,10 +2073,7 @@ impl ShojiWM {
                     .insert(assignment.layer_id, effects);
             }
         }
-        retain_effect_assignments_for_live_ids(
-            &mut self.configured_layer_effects,
-            &live_layer_ids,
-        );
+        retain_effect_assignments_for_live_ids(&mut self.configured_layer_effects, &live_layer_ids);
         let live_layer_prefixes = snapshots
             .iter()
             .map(|snapshot| format!("{}@", snapshot.id))
@@ -2143,10 +2137,7 @@ impl ShojiWM {
                 &mut self.configured_popup_effects,
                 &live_popup_ids,
             );
-            retain_effect_texture_cache_for_live_ids(
-                &mut self.popup_effect_cache,
-                &live_popup_ids,
-            );
+            retain_effect_texture_cache_for_live_ids(&mut self.popup_effect_cache, &live_popup_ids);
             return Ok(());
         }
         self.sync_runtime_display_state();
@@ -2172,10 +2163,7 @@ impl ShojiWM {
                     .insert(assignment.popup_id, effects);
             }
         }
-        retain_effect_assignments_for_live_ids(
-            &mut self.configured_popup_effects,
-            &live_popup_ids,
-        );
+        retain_effect_assignments_for_live_ids(&mut self.configured_popup_effects, &live_popup_ids);
         self.popup_effect_evaluation_cache.insert(
             output_name.to_string(),
             EffectEvaluationCacheEntry {
@@ -3984,6 +3972,7 @@ impl ShojiWM {
             .retain(|window_id| live_window_ids.contains(window_id));
         self.runtime_poll_dirty = !self.runtime_dirty_window_ids.is_empty();
         self.async_asset_dirty = false;
+        self.sync_wlr_foreign_toplevel_states();
 
         Ok(())
     }
@@ -4646,17 +4635,11 @@ impl ShojiWM {
     }
 }
 
-fn layer_effect_evaluation_signature(
-    output_name: &str,
-    snapshots: &[WaylandLayerSnapshot],
-) -> u64 {
+fn layer_effect_evaluation_signature(output_name: &str, snapshots: &[WaylandLayerSnapshot]) -> u64 {
     effect_evaluation_signature(output_name, snapshots, |snapshot| snapshot.id.as_str())
 }
 
-fn popup_effect_evaluation_signature(
-    output_name: &str,
-    snapshots: &[WaylandPopupSnapshot],
-) -> u64 {
+fn popup_effect_evaluation_signature(output_name: &str, snapshots: &[WaylandPopupSnapshot]) -> u64 {
     effect_evaluation_signature(output_name, snapshots, |snapshot| snapshot.id.as_str())
 }
 

@@ -933,8 +933,7 @@ impl ShojiWM {
                 continue;
             };
             let window_popups: Vec<_> =
-                smithay::desktop::PopupManager::popups_for_surface(toplevel.wl_surface())
-                    .collect();
+                smithay::desktop::PopupManager::popups_for_surface(toplevel.wl_surface()).collect();
             if window_popups.is_empty() {
                 continue;
             }

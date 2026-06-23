@@ -538,9 +538,8 @@ fn composed_window_popup_scene_elements(
         crate::backend::shader_effect::ShaderEffectElementState,
     >,
 ) -> Vec<WinitRenderElements> {
-    let groups = window_render::window_popup_groups(
-        window, renderer, location, output_geo, scale, alpha,
-    );
+    let groups =
+        window_render::window_popup_groups(window, renderer, location, output_geo, scale, alpha);
     if groups.is_empty() {
         return Vec::new();
     }

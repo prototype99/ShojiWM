@@ -46,11 +46,12 @@ impl ShojiWM {
         let (title, app_id) = read_title_app_id(window);
         let handle = self
             .foreign_toplevel_list_state
-            .new_toplevel::<Self>(title, app_id);
+            .new_toplevel::<Self>(title.clone(), app_id.clone());
         // `done` lets any already-connected clients finalize the initial
         // burst of {title, app_id} events.
         handle.send_done();
         window.user_data().insert_if_missing(|| handle);
+        self.install_wlr_foreign_toplevel(window, &title, &app_id);
     }
 
     /// Re-read title/app_id from the window and push any changes to the
@@ -64,6 +65,7 @@ impl ShojiWM {
         let title_changed = handle.title() != title;
         let app_id_changed = handle.app_id() != app_id;
         if !title_changed && !app_id_changed {
+            self.sync_wlr_foreign_toplevel(window, &title, &app_id);
             return;
         }
         if title_changed {
@@ -73,6 +75,7 @@ impl ShojiWM {
             handle.send_app_id(&app_id);
         }
         handle.send_done();
+        self.sync_wlr_foreign_toplevel(window, &title, &app_id);
     }
 
     /// Announce the toplevel as closed and drop our reference. Safe to call
@@ -82,6 +85,7 @@ impl ShojiWM {
             return;
         };
         self.foreign_toplevel_list_state.remove_toplevel(&handle);
+        self.remove_wlr_foreign_toplevel(window);
         // We can't remove from UserDataMap, but the handle is now inert so
         // subsequent sync_foreign_toplevel calls are harmless no-ops.
         let _ = window;
