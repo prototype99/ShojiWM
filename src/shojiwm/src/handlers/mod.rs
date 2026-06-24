@@ -28,6 +28,7 @@ use smithay::wayland::background_effect::{Capability, ExtBackgroundEffectHandler
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, ImportNotifier};
 use smithay::wayland::fractional_scale::{with_fractional_scale, FractionalScaleHandler};
 use smithay::wayland::input_method::{InputMethodHandler, PopupSurface};
+use smithay::wayland::idle_notify::{IdleNotifierHandler, IdleNotifierState};
 use smithay::wayland::shell::kde::decoration::KdeDecorationHandler;
 use smithay::wayland::selection::data_device::{
     set_data_device_focus, DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
@@ -160,6 +161,12 @@ impl PointerConstraintsHandler for ShojiWM {
 impl ForeignToplevelListHandler for ShojiWM {
     fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
         &mut self.foreign_toplevel_list_state
+    }
+}
+
+impl IdleNotifierHandler for ShojiWM {
+    fn idle_notifier_state(&mut self) -> &mut IdleNotifierState<Self> {
+        &mut self.idle_notifier_state
     }
 }
 

@@ -72,6 +72,20 @@ fn stack_hit_debug_enabled() -> bool {
 }
 
 impl ShojiWM {
+    fn input_event_counts_as_idle_activity<I: InputBackend>(event: &InputEvent<I>) -> bool {
+        !matches!(
+            event,
+            InputEvent::DeviceAdded { .. }
+                | InputEvent::DeviceRemoved { .. }
+                | InputEvent::Special(_)
+        )
+    }
+
+    fn notify_idle_activity(&mut self) {
+        let seat = self.seat.clone();
+        self.idle_notifier_state.notify_activity(&seat);
+    }
+
     fn forward_locked_keyboard_event<I: InputBackend>(
         &mut self,
         event: &I::KeyboardKeyEvent,
@@ -268,6 +282,10 @@ impl ShojiWM {
     }
 
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
+        if Self::input_event_counts_as_idle_activity(&event) {
+            self.notify_idle_activity();
+        }
+
         match event {
             InputEvent::Keyboard { event, .. } => {
                 let device = event.device();

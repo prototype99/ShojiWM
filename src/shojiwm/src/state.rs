@@ -54,6 +54,7 @@ use smithay::{
         fifo::FifoManagerState,
         fixes::FixesState,
         fractional_scale::FractionalScaleManagerState,
+        idle_notify::IdleNotifierState,
         input_method::InputMethodManagerState,
         output::OutputManagerState,
         pointer_constraints::PointerConstraintsState,
@@ -259,6 +260,7 @@ pub struct ShojiWM {
     pub toplevel_capture_source_state:
         smithay::wayland::image_capture_source::ToplevelCaptureSourceState,
     pub image_copy_capture_state: smithay::wayland::image_copy_capture::ImageCopyCaptureState,
+    pub idle_notifier_state: IdleNotifierState<ShojiWM>,
     pub session_lock_state: SessionLockManagerState,
     pub session_lock_active: bool,
     pub session_lock_surfaces: HashMap<String, LockSurface>,
@@ -717,7 +719,7 @@ impl ShojiWM {
         keyboard.set_focus(self, Some(focus), SERIAL_COUNTER.next_serial());
     }
 
-    pub fn new(event_loop: &mut EventLoop<Self>, display: Display<Self>) -> Self {
+    pub fn new(event_loop: &mut EventLoop<'static, Self>, display: Display<Self>) -> Self {
         let start_time = std::time::Instant::now();
 
         let dh = display.handle();
@@ -761,6 +763,7 @@ impl ShojiWM {
             smithay::wayland::image_capture_source::ToplevelCaptureSourceState::new::<Self>(&dh);
         let image_copy_capture_state =
             smithay::wayland::image_copy_capture::ImageCopyCaptureState::new::<Self>(&dh);
+        let idle_notifier_state = IdleNotifierState::new(&dh, event_loop.handle());
         let session_lock_state = SessionLockManagerState::new::<Self, _>(&dh, |_| true);
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
         let fixes_state = FixesState::new::<Self>(&dh);
@@ -935,6 +938,7 @@ impl ShojiWM {
             output_capture_source_state,
             toplevel_capture_source_state,
             image_copy_capture_state,
+            idle_notifier_state,
             session_lock_state,
             session_lock_active: false,
             session_lock_surfaces: HashMap::new(),
@@ -1358,7 +1362,7 @@ impl ShojiWM {
 
     fn init_wayland_listener(
         display: Display<ShojiWM>,
-        event_loop: &mut EventLoop<Self>,
+        event_loop: &mut EventLoop<'static, Self>,
     ) -> OsString {
         // Creates a new listening socket, automatically choosing the next available `wayland` socket name.
         let listening_socket = ListeningSocketSource::new_auto().unwrap();
@@ -1574,7 +1578,7 @@ impl ShojiWM {
         }
     }
 
-    fn register_runtime_wake_signal(event_loop: &mut EventLoop<Self>) {
+    fn register_runtime_wake_signal(event_loop: &mut EventLoop<'static, Self>) {
         use calloop::signals::{Signal, Signals};
 
         let signals = match Signals::new(&[Signal::SIGUSR1]) {
@@ -1595,7 +1599,7 @@ impl ShojiWM {
         }
     }
 
-    fn init_runtime_scheduler(event_loop: &mut EventLoop<Self>) {
+    fn init_runtime_scheduler(event_loop: &mut EventLoop<'static, Self>) {
         let loop_handle = event_loop.handle();
         loop_handle
             .insert_source(Timer::immediate(), |_, _, state| {
