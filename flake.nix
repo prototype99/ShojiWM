@@ -66,6 +66,7 @@
               systemd
               libinput
               mesa
+              libglvnd
               libgbm
               pixman
               seatd
@@ -103,6 +104,7 @@
                 systemd
                 libinput
                 mesa
+                libglvnd
                 libgbm
                 pixman
                 seatd

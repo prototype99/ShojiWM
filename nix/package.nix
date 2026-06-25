@@ -12,6 +12,7 @@
   systemd,
   libinput,
   mesa,
+  libglvnd,
   libgbm ? mesa,
   mesaDrivers ? (mesa.drivers or mesa),
   pixman,
@@ -81,6 +82,7 @@ let
     systemd
     libinput
     mesa
+    libglvnd
     libgbm
     pixman
     seatd
@@ -130,6 +132,7 @@ rustPlatform.buildRustPackage {
     systemd
     libinput
     mesa
+    libglvnd
     libgbm
     pixman
     seatd
