@@ -12,7 +12,7 @@
   systemd,
   libinput,
   mesa,
-  libseat,
+  seatd,
   pipewire,
   libdrm,
   dbus,
@@ -99,7 +99,7 @@ rustPlatform.buildRustPackage {
     systemd
     libinput
     mesa
-    libseat
+    seatd
     pipewire
     libdrm
   ];

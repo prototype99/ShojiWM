@@ -69,7 +69,7 @@
                 systemd
                 libinput
                 mesa
-                libseat
+                seatd
                 pipewire
                 libdrm
                 dbus
