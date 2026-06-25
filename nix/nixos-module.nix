@@ -11,12 +11,14 @@ let
   cfg = config.programs.shojiwm;
   system = pkgs.stdenv.hostPlatform.system;
   defaultPackage = self.packages.${system}.default;
+  defaultXwayland = pkgs.xwayland or (pkgs.xorg.xwayland or null);
   defaultSatellite = pkgs.xwayland-satellite or null;
   gtkPortal = pkgs.xdg-desktop-portal-gtk or null;
 
   shojiPackage =
     if cfg.package ? override then
       cfg.package.override {
+        xwayland = defaultXwayland;
         xwaylandSatellite =
           if cfg.xwaylandSatellite.enable then cfg.xwaylandSatellite.package else null;
       }
@@ -85,8 +87,8 @@ in
     environment.systemPackages =
       [
         shojiPackage
-        pkgs.xorg.xwayland
       ]
+      ++ lib.optional (defaultXwayland != null) defaultXwayland
       ++ lib.optional (cfg.xwaylandSatellite.enable && cfg.xwaylandSatellite.package != null)
         cfg.xwaylandSatellite.package
       ++ lib.optional (cfg.portal.enable && cfg.portal.gtkFallback && gtkPortal != null) gtkPortal;

@@ -21,10 +21,11 @@
         system:
         let
           pkgs = pkgsFor system;
+          xwayland = pkgs.xwayland or (pkgs.xorg.xwayland or null);
           xwaylandSatellite = pkgs.xwayland-satellite or null;
         in
         rec {
-          shojiwm = pkgs.callPackage ./nix/package.nix { inherit xwaylandSatellite; };
+          shojiwm = pkgs.callPackage ./nix/package.nix { inherit xwayland xwaylandSatellite; };
           default = shojiwm;
         }
       );
@@ -50,6 +51,7 @@
         system:
         let
           pkgs = pkgsFor system;
+          xwayland = pkgs.xwayland or (pkgs.xorg.xwayland or null);
           xwaylandSatellite = pkgs.xwayland-satellite or null;
         in
         {
@@ -73,8 +75,8 @@
                 pipewire
                 libdrm
                 dbus
-                xorg.xwayland
               ]
+              ++ lib.optional (xwayland != null) xwayland
               ++ lib.optional (xwaylandSatellite != null) xwaylandSatellite;
 
             SHOJI_XWAYLAND_SATELLITE_PATH = lib.optionalString (

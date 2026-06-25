@@ -16,7 +16,7 @@
   pipewire,
   libdrm,
   dbus,
-  xorg,
+  xwayland ? null,
   xwaylandSatellite ? null,
 }:
 
@@ -67,9 +67,9 @@ let
   runtimeBinPath =
     [
       nodejs_22
-      xorg.xwayland
       dbus
     ]
+    ++ lib.optional (xwayland != null) xwayland
     ++ lib.optional (xwaylandSatellite != null) xwaylandSatellite;
 in
 rustPlatform.buildRustPackage {
