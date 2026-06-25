@@ -895,12 +895,15 @@ impl ShojiWM {
         // Get the loop signal, used to stop the event loop
         let loop_signal = event_loop.get_signal();
         let runtime_paths = crate::install_paths::decoration_runtime_paths();
-        let evaluator = NodeDecorationEvaluator::for_paths(
+        let mut evaluator = NodeDecorationEvaluator::for_paths(
             runtime_paths.tsx_program,
             runtime_paths.script_path,
             runtime_paths.config_path,
         )
         .with_working_dir(runtime_paths.working_dir);
+        if let Some(runtime_package_dir) = runtime_paths.runtime_package_dir {
+            evaluator = evaluator.with_runtime_package_dir(runtime_package_dir);
+        }
         let config_error_report = match evaluator.preload() {
             Ok(()) => None,
             Err(error) => {

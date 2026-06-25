@@ -2,7 +2,7 @@ use std::{
     ffi::OsString,
     io::{BufRead, BufReader, Read, Write},
     os::unix::net::{UnixListener, UnixStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
@@ -642,6 +642,7 @@ pub enum DecorationEvaluationError {
 pub struct NodeDecorationEvaluator {
     program: PathBuf,
     base_args: Vec<OsString>,
+    runtime_package_dir: Option<PathBuf>,
     script_path: PathBuf,
     config_path: PathBuf,
     working_dir: Option<PathBuf>,
@@ -677,6 +678,7 @@ struct NodeDecorationRuntime {
     connection: RuntimeConnection,
     next_request_id: u64,
     stderr_log: Arc<Mutex<String>>,
+    runtime_tsconfig_path: Option<PathBuf>,
 }
 
 enum RuntimeConnection {
@@ -1420,6 +1422,7 @@ impl std::fmt::Debug for NodeDecorationEvaluator {
         f.debug_struct("NodeDecorationEvaluator")
             .field("program", &self.program)
             .field("base_args", &self.base_args)
+            .field("runtime_package_dir", &self.runtime_package_dir)
             .field("script_path", &self.script_path)
             .field("config_path", &self.config_path)
             .field("working_dir", &self.working_dir)
@@ -1440,6 +1443,7 @@ impl NodeDecorationEvaluator {
         Self {
             program,
             base_args: Vec::new(),
+            runtime_package_dir: None,
             script_path: PathBuf::from("tools/decoration-runtime.ts"),
             config_path,
             working_dir: None,
@@ -1460,6 +1464,7 @@ impl NodeDecorationEvaluator {
         Self {
             program: program.into(),
             base_args: Vec::new(),
+            runtime_package_dir: None,
             script_path: script_path.into(),
             config_path: config_path.into(),
             working_dir: None,
@@ -1477,6 +1482,11 @@ impl NodeDecorationEvaluator {
         self
     }
 
+    pub fn with_runtime_package_dir(mut self, package_dir: impl Into<PathBuf>) -> Self {
+        self.runtime_package_dir = Some(package_dir.into());
+        self
+    }
+
     pub fn with_command(
         program: impl Into<PathBuf>,
         base_args: Vec<OsString>,
@@ -1486,6 +1496,7 @@ impl NodeDecorationEvaluator {
         Self {
             program: program.into(),
             base_args,
+            runtime_package_dir: None,
             script_path: script_path.into(),
             config_path: config_path.into(),
             working_dir: None,
@@ -1496,6 +1507,52 @@ impl NodeDecorationEvaluator {
             pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
             async_event_sender: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn write_runtime_tsconfig(&self) -> Result<Option<PathBuf>, DecorationEvaluationError> {
+        let Some(package_dir) = &self.runtime_package_dir else {
+            return Ok(None);
+        };
+
+        let working_dir = self
+            .working_dir
+            .as_deref()
+            .or_else(|| self.config_path.parent())
+            .unwrap_or_else(|| Path::new("."));
+        let user_tsconfig = working_dir.join("tsconfig.json");
+        let mut config = serde_json::json!({
+            "compilerOptions": {
+                "paths": {
+                    "shoji_wm": [
+                        package_dir.join("src/index.ts").display().to_string()
+                    ],
+                    "shoji_wm/*": [
+                        package_dir.join("src/*").display().to_string()
+                    ]
+                }
+            }
+        });
+
+        if user_tsconfig.exists() {
+            config["extends"] = serde_json::Value::String(user_tsconfig.display().to_string());
+        }
+
+        let timestamp_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tsconfig_path = std::env::temp_dir().join(format!(
+            "shojiwm-runtime-tsconfig-{}-{timestamp_ns}.json",
+            std::process::id()
+        ));
+        let contents = serde_json::to_vec_pretty(&config).map_err(|error| {
+            DecorationEvaluationError::RuntimeProtocol(format!(
+                "failed to serialize runtime tsconfig: {error}"
+            ))
+        })?;
+        std::fs::write(&tsconfig_path, contents)?;
+
+        Ok(Some(tsconfig_path))
     }
 
     fn apply_runtime_wake_pid_to_command(&self, command: &mut Command) {
@@ -1534,6 +1591,7 @@ impl NodeDecorationEvaluator {
         Self {
             program: self.program.clone(),
             base_args: self.base_args.clone(),
+            runtime_package_dir: self.runtime_package_dir.clone(),
             script_path: self.script_path.clone(),
             config_path: self.config_path.clone(),
             working_dir: self.working_dir.clone(),
@@ -1791,8 +1849,13 @@ impl NodeDecorationEvaluator {
     }
 
     fn spawn_stdio_runtime(&self) -> Result<NodeDecorationRuntime, DecorationEvaluationError> {
+        let runtime_tsconfig_path = self.write_runtime_tsconfig()?;
         let mut command = Command::new(&self.program);
         apply_decoration_runtime_node_options(&mut command);
+        if let Some(tsconfig_path) = &runtime_tsconfig_path {
+            command.arg("--tsconfig");
+            command.arg(tsconfig_path);
+        }
         command.args(&self.base_args);
         command.arg(&self.script_path);
         command.arg(&self.config_path);
@@ -1821,11 +1884,13 @@ impl NodeDecorationEvaluator {
             },
             next_request_id: 1,
             stderr_log,
+            runtime_tsconfig_path,
         })
     }
 
     fn spawn_uds_runtime(&self) -> Result<NodeDecorationRuntime, DecorationEvaluationError> {
         debug!("spawning node decoration runtime over uds");
+        let runtime_tsconfig_path = self.write_runtime_tsconfig()?;
         let socket_path = std::env::temp_dir().join(format!(
             "shojiwm-decoration-runtime-{}-{}.sock",
             std::process::id(),
@@ -1840,6 +1905,10 @@ impl NodeDecorationEvaluator {
 
         let mut command = Command::new(&self.program);
         apply_decoration_runtime_node_options(&mut command);
+        if let Some(tsconfig_path) = &runtime_tsconfig_path {
+            command.arg("--tsconfig");
+            command.arg(tsconfig_path);
+        }
         command.args(&self.base_args);
         command.arg(&self.script_path);
         command.arg(&self.config_path);
@@ -1899,6 +1968,7 @@ impl NodeDecorationEvaluator {
             },
             next_request_id: 1,
             stderr_log,
+            runtime_tsconfig_path,
         })
     }
 
@@ -2265,6 +2335,7 @@ impl Clone for NodeDecorationEvaluator {
         Self {
             program: self.program.clone(),
             base_args: self.base_args.clone(),
+            runtime_package_dir: self.runtime_package_dir.clone(),
             script_path: self.script_path.clone(),
             config_path: self.config_path.clone(),
             working_dir: self.working_dir.clone(),
@@ -2526,6 +2597,9 @@ impl Drop for NodeDecorationRuntime {
         let _ = self.child.wait();
         if let RuntimeConnection::Uds { socket_path, .. } = &self.connection {
             let _ = std::fs::remove_file(socket_path);
+        }
+        if let Some(runtime_tsconfig_path) = &self.runtime_tsconfig_path {
+            let _ = std::fs::remove_file(runtime_tsconfig_path);
         }
     }
 }
