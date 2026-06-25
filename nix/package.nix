@@ -48,8 +48,7 @@ let
     pname = "shojiwm-typescript-runtime";
     inherit version src;
 
-    # Replace this with the value printed by the first Nix build.
-    npmDepsHash = lib.fakeHash;
+    npmDepsHash = "sha256-FFyvtOiLBlufFsHF0wENj0xRkzEyTafaBzKJZWFXmqg=";
 
     dontNpmBuild = true;
 
