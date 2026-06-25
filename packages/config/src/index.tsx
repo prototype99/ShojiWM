@@ -946,3 +946,5 @@ const MinimizeButton = ({ window }: { window: WaylandWindow }) => {
     </Box>
   );
 };
+
+export default COMPOSITOR;

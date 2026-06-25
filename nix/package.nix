@@ -249,7 +249,10 @@ else
 fi
 
 mkdir -p "\$user_config_dir/node_modules"
-ln -sfn "$out/lib/shojiwm/packages/shoji_wm" "\$user_config_dir/node_modules/shoji_wm"
+if [ -e "\$user_config_dir/node_modules/shoji_wm" ] || [ -L "\$user_config_dir/node_modules/shoji_wm" ]; then
+  rm -rf "\$user_config_dir/node_modules/shoji_wm"
+fi
+ln -s "$out/lib/shojiwm/node_modules/shoji_wm" "\$user_config_dir/node_modules/shoji_wm"
 
 if [ "\$created_config" = 1 ] || [ ! -e "\$user_config_dir/package.json" ]; then
   cat > "\$user_config_dir/package.json" <<'PACKAGE_JSON'
