@@ -73,6 +73,19 @@ let
     ]
     ++ lib.optional (xwayland != null) xwayland
     ++ lib.optional (xwaylandSatellite != null) xwaylandSatellite;
+
+  runtimeLibraryPath = lib.makeLibraryPath [
+    wayland
+    libxkbcommon
+    systemd
+    libinput
+    mesa
+    libgbm
+    pixman
+    seatd
+    pipewire
+    libdrm
+  ];
 in
 rustPlatform.buildRustPackage {
   pname = "shojiwm";
@@ -137,10 +150,14 @@ rustPlatform.buildRustPackage {
       --set-default SHOJI_RUNTIME_DIR "$out/lib/shojiwm" \
       --set-default SHOJI_TSX "$out/lib/shojiwm/node_modules/.bin/tsx" \
       --prefix PATH : "${lib.makeBinPath runtimeBinPath}" \
+      --prefix LD_LIBRARY_PATH : "${runtimeLibraryPath}" \
       ${lib.optionalString (xwaylandSatellite != null) ''
         --set-default SHOJI_XWAYLAND_SATELLITE_PATH "${xwaylandSatellite}/bin/xwayland-satellite" \
       ''}
       --set-default SHOJI_DECORATION_RUNTIME "$out/lib/shojiwm/tools/decoration-runtime.ts"
+
+    wrapProgram "$out/bin/xdg-desktop-portal-shojiwm" \
+      --prefix LD_LIBRARY_PATH : "${runtimeLibraryPath}"
 
     install -Dm644 /dev/stdin "$out/share/wayland-sessions/shojiwm.desktop" <<EOF
 [Desktop Entry]

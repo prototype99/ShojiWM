@@ -57,6 +57,21 @@
           libgbm = pkgs.libgbm or pkgs.mesa;
           xwayland = pkgs.xwayland or (pkgs.xorg.xwayland or null);
           xwaylandSatellite = pkgs.xwayland-satellite or null;
+          runtimeLibraryPath = lib.makeLibraryPath (
+            with pkgs;
+            [
+              wayland
+              libxkbcommon
+              systemd
+              libinput
+              mesa
+              libgbm
+              pixman
+              seatd
+              pipewire
+              libdrm
+            ]
+          );
         in
         {
           default = pkgs.mkShell {
@@ -88,6 +103,8 @@
             SHOJI_XWAYLAND_SATELLITE_PATH = lib.optionalString (
               xwaylandSatellite != null
             ) "${xwaylandSatellite}/bin/xwayland-satellite";
+
+            LD_LIBRARY_PATH = runtimeLibraryPath;
 
             shellHook = ''
               echo "ShojiWM development shell"
