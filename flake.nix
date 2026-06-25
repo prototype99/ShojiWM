@@ -55,6 +55,7 @@
         let
           pkgs = pkgsFor system;
           libgbm = pkgs.libgbm or pkgs.mesa;
+          mesaDrivers = pkgs.mesa.drivers or pkgs.mesa;
           xwayland = pkgs.xwayland or (pkgs.xorg.xwayland or null);
           xwaylandSatellite = pkgs.xwayland-satellite or null;
           runtimeLibraryPath = lib.makeLibraryPath (
@@ -72,6 +73,18 @@
               libdrm
             ]
           );
+          gbmBackendsPath = lib.makeSearchPath "lib/gbm" [
+            mesaDrivers
+            pkgs.mesa
+          ];
+          driDriversPath = lib.makeSearchPath "lib/dri" [
+            mesaDrivers
+            pkgs.mesa
+          ];
+          eglVendorLibraryDirs = lib.makeSearchPath "share/glvnd/egl_vendor.d" [
+            mesaDrivers
+            pkgs.mesa
+          ];
         in
         {
           default = pkgs.mkShell {
@@ -105,6 +118,9 @@
             ) "${xwaylandSatellite}/bin/xwayland-satellite";
 
             LD_LIBRARY_PATH = runtimeLibraryPath;
+            GBM_BACKENDS_PATH = gbmBackendsPath;
+            LIBGL_DRIVERS_PATH = driDriversPath;
+            __EGL_VENDOR_LIBRARY_DIRS = eglVendorLibraryDirs;
 
             shellHook = ''
               echo "ShojiWM development shell"

@@ -13,6 +13,7 @@
   libinput,
   mesa,
   libgbm ? mesa,
+  mesaDrivers ? (mesa.drivers or mesa),
   pixman,
   seatd,
   pipewire,
@@ -86,6 +87,21 @@ let
     pipewire
     libdrm
   ];
+
+  gbmBackendsPath = lib.makeSearchPath "lib/gbm" [
+    mesaDrivers
+    mesa
+  ];
+
+  driDriversPath = lib.makeSearchPath "lib/dri" [
+    mesaDrivers
+    mesa
+  ];
+
+  eglVendorLibraryDirs = lib.makeSearchPath "share/glvnd/egl_vendor.d" [
+    mesaDrivers
+    mesa
+  ];
 in
 rustPlatform.buildRustPackage {
   pname = "shojiwm";
@@ -151,13 +167,19 @@ rustPlatform.buildRustPackage {
       --set-default SHOJI_TSX "$out/lib/shojiwm/node_modules/.bin/tsx" \
       --prefix PATH : "${lib.makeBinPath runtimeBinPath}" \
       --prefix LD_LIBRARY_PATH : "${runtimeLibraryPath}" \
+      --suffix GBM_BACKENDS_PATH : "${gbmBackendsPath}" \
+      --suffix LIBGL_DRIVERS_PATH : "${driDriversPath}" \
+      --suffix __EGL_VENDOR_LIBRARY_DIRS : "${eglVendorLibraryDirs}" \
       ${lib.optionalString (xwaylandSatellite != null) ''
         --set-default SHOJI_XWAYLAND_SATELLITE_PATH "${xwaylandSatellite}/bin/xwayland-satellite" \
       ''}
       --set-default SHOJI_DECORATION_RUNTIME "$out/lib/shojiwm/tools/decoration-runtime.ts"
 
     wrapProgram "$out/bin/xdg-desktop-portal-shojiwm" \
-      --prefix LD_LIBRARY_PATH : "${runtimeLibraryPath}"
+      --prefix LD_LIBRARY_PATH : "${runtimeLibraryPath}" \
+      --suffix GBM_BACKENDS_PATH : "${gbmBackendsPath}" \
+      --suffix LIBGL_DRIVERS_PATH : "${driDriversPath}" \
+      --suffix __EGL_VENDOR_LIBRARY_DIRS : "${eglVendorLibraryDirs}"
 
     install -Dm644 /dev/stdin "$out/share/wayland-sessions/shojiwm.desktop" <<EOF
 [Desktop Entry]

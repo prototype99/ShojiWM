@@ -95,6 +95,8 @@ in
 
     services.displayManager.sessionPackages = [ shojiPackage ];
 
+    hardware.graphics.enable = true;
+
     xdg.portal = lib.mkIf cfg.portal.enable {
       enable = true;
       extraPortals =
