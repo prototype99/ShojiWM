@@ -254,8 +254,7 @@ if [ -e "\$user_config_dir/node_modules/shoji_wm" ] || [ -L "\$user_config_dir/n
 fi
 ln -s "$out/lib/shojiwm/node_modules/shoji_wm" "\$user_config_dir/node_modules/shoji_wm"
 
-if [ "\$created_config" = 1 ] || [ ! -e "\$user_config_dir/package.json" ]; then
-  cat > "\$user_config_dir/package.json" <<'PACKAGE_JSON'
+cat > "\$user_config_dir/package.json" <<'PACKAGE_JSON'
 {
   "name": "shojiwm-user-config",
   "private": true,
@@ -265,10 +264,8 @@ if [ "\$created_config" = 1 ] || [ ! -e "\$user_config_dir/package.json" ]; then
   }
 }
 PACKAGE_JSON
-fi
 
-if [ "\$created_config" = 1 ] || [ ! -e "\$user_config_dir/tsconfig.json" ]; then
-  cat > "\$user_config_dir/tsconfig.json" <<'TSCONFIG_JSON'
+cat > "\$user_config_dir/tsconfig.json" <<'TSCONFIG_JSON'
 {
   "compilerOptions": {
     "target": "ES2022",
@@ -282,7 +279,6 @@ if [ "\$created_config" = 1 ] || [ ! -e "\$user_config_dir/tsconfig.json" ]; the
   }
 }
 TSCONFIG_JSON
-fi
 
 echo "ShojiWM config is ready."
 EOF

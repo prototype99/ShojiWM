@@ -27,7 +27,6 @@ pub struct DecorationRuntimePaths {
     pub tsx_program: PathBuf,
     pub script_path: PathBuf,
     pub config_path: PathBuf,
-    pub runtime_package_dir: Option<PathBuf>,
 }
 
 static RUNTIME_PATH_OPTIONS: OnceLock<RuntimePathOptions> = OnceLock::new();
@@ -78,7 +77,6 @@ fn development_paths(options: &RuntimePathOptions) -> DecorationRuntimePaths {
             .clone()
             .or_else(|| std::env::var_os("SHOJI_CONFIG").map(PathBuf::from))
             .unwrap_or_else(|| repo_root.join("packages/config/src/index.tsx")),
-        runtime_package_dir: None,
     }
 }
 
@@ -116,7 +114,6 @@ fn installed_paths(options: &RuntimePathOptions) -> DecorationRuntimePaths {
             .or_else(|| std::env::var_os("SHOJI_DECORATION_RUNTIME").map(PathBuf::from))
             .unwrap_or_else(|| runtime_dir.join("tools/decoration-runtime.ts")),
         config_path,
-        runtime_package_dir: Some(runtime_dir.join("node_modules/shoji_wm")),
     }
 }
 
