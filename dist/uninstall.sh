@@ -36,7 +36,7 @@ sudo rm -rf \
 
 if [[ $REMOVE_USER_CONFIG -eq 1 ]]; then
     echo ">> removing user config at $XDG_CONFIG_HOME/shojiwm"
-    rm -rf "$CONFIG_HOME/shojiwm"
+    rm -rf "$XDG_CONFIG_HOME/shojiwm"
 fi
 
 echo "done."
