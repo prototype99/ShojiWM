@@ -1839,6 +1839,7 @@ fn render_surface(
         .cloned()
         .collect();
     let session_lock_surface_for_output = state.session_lock_surface_for_output(&output);
+    let mut newly_ready_initial_focus_window_ids = Vec::new();
     let captured_blink_damage = {
         let window_source_damage_snapshot = state.window_source_damage.clone();
         let ShojiWM {
@@ -4539,7 +4540,9 @@ fn render_surface(
                 scene_elements.extend(behind_effects);
             }
 
-            windows_ready_for_decoration.insert(window_id.clone());
+            if windows_ready_for_decoration.insert(window_id.clone()) {
+                newly_ready_initial_focus_window_ids.push(window_id.clone());
+            }
 
             if let Some(decoration) = window_decorations.get(window)
                 && let Some(live_snapshot) = live_window_snapshots.get_mut(&decoration.snapshot.id)
@@ -5487,6 +5490,20 @@ fn render_surface(
 
         captured_blink_damage
     };
+
+    for window_id in newly_ready_initial_focus_window_ids {
+        if !state.pending_initial_focus_window_ids.contains(&window_id) {
+            continue;
+        }
+        let window = state
+            .space
+            .elements()
+            .find(|window| state.snapshot_window(window).id == window_id)
+            .cloned();
+        if let Some(window) = window {
+            state.apply_pending_initial_focus_for_window(&window_id, &window);
+        }
+    }
 
     if let Some(damage) = captured_blink_damage.as_deref() {
         state.record_damage_blink(&output, damage);

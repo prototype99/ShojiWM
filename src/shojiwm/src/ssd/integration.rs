@@ -28,8 +28,8 @@ use super::{
     DecorationEvaluationResult, DecorationEvaluator, DecorationHandlerInvocation,
     DecorationHitTestResult, DecorationSchedulerTick, DecorationTree, LayerEffectEvaluationResult,
     LogicalPoint, LogicalRect, PopupEffectEvaluationResult, StaticDecorationEvaluator,
-    WaylandLayerSnapshot, WaylandPopupSnapshot, WaylandWindowSnapshot, WindowEffectConfig,
-    WindowPositionSnapshot, WindowTransform, reapply_tree_preserving_layout,
+    WaylandLayerSnapshot, WaylandPopupSnapshot, WaylandWindowAction, WaylandWindowSnapshot,
+    WindowEffectConfig, WindowPositionSnapshot, WindowTransform, reapply_tree_preserving_layout,
     window_model::{
         ManagedWindowAnimationEasingSnapshot, ManagedWindowAnimationMode,
         ManagedWindowAnimationSnapshot, ManagedWindowPointAnimationSnapshot,
@@ -1373,6 +1373,13 @@ impl ShojiWM {
         // (`space.elements().find(...)`) succeeds.
         if !evaluation.actions.is_empty() {
             let actions = std::mem::take(&mut evaluation.actions);
+            for action in actions
+                .iter()
+                .filter(|action| matches!(action.action, WaylandWindowAction::Focus))
+            {
+                self.pending_initial_focus_window_ids
+                    .insert(action.window_id.clone());
+            }
             self.apply_runtime_window_actions(actions);
         }
         self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();

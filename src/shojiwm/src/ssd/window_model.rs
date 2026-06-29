@@ -629,9 +629,18 @@ impl ShojiWM {
 
             (role.title.clone().unwrap_or_default(), role.app_id.clone())
         });
+        let initial_configure_sent = toplevel.is_initial_configure_sent();
         let (min_size, max_size) = with_states(toplevel.wl_surface(), |states| {
             let mut guard = states.cached_state.get::<SurfaceCachedState>();
-            let data = guard.current();
+            let data = if initial_configure_sent {
+                guard.current()
+            } else {
+                // Before the first configure the client may already have
+                // double-buffered min/max size constraints. Those constraints
+                // are not committed yet, but they are exactly what initial
+                // placement needs to decide whether a window is tileable.
+                guard.pending()
+            };
             (data.min_size, data.max_size)
         });
         let size_constraints = window_size_constraints(min_size, max_size);
@@ -648,7 +657,7 @@ impl ShojiWM {
             .and_then(|keyboard| keyboard.current_focus());
         let is_focused = focused_surface
             .as_ref()
-            .is_some_and(|focused| focused == &toplevel.wl_surface().clone());
+            .is_some_and(|focused| self.surface_belongs_to_window(window, focused));
         let (_pending_activated, is_maximized, is_fullscreen) =
             toplevel.with_pending_state(|state| {
                 (
@@ -748,10 +757,9 @@ impl ShojiWM {
             .seat
             .get_keyboard()
             .and_then(|keyboard| keyboard.current_focus());
-        let is_focused = match (focused_surface.as_ref(), x11.wl_surface()) {
-            (Some(focused), Some(wl)) => focused == &wl,
-            _ => false,
-        };
+        let is_focused = focused_surface
+            .as_ref()
+            .is_some_and(|focused| self.surface_belongs_to_window(window, focused));
 
         let position = self
             .space

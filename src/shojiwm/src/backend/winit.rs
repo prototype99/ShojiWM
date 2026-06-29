@@ -1610,9 +1610,9 @@ pub fn init_winit(
                                 );
                             }
 
-                            state
-                                .windows_ready_for_decoration
-                                .insert(window_id.clone());
+                            if state.windows_ready_for_decoration.insert(window_id.clone()) {
+                                state.apply_pending_initial_focus_for_window(&window_id, window);
+                            }
 
                             if let Some(decoration) = state.window_decorations.get(window)
                                 && let Some(live_snapshot) = state

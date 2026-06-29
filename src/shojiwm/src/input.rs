@@ -837,7 +837,12 @@ impl ShojiWM {
                             &window,
                         )
                     {
-                        self.focus_window(&window, serial);
+                        let focus_surface = self
+                            .pointer_contents
+                            .surface
+                            .as_ref()
+                            .map(|(surface, _)| surface.clone());
+                        self.focus_window_at_surface(&window, focus_surface.as_ref(), serial);
                         pointer.button(
                             self,
                             &ButtonEvent {
@@ -890,7 +895,12 @@ impl ShojiWM {
                             &window,
                         )
                     {
-                        self.focus_window(&window, serial);
+                        let focus_surface = self
+                            .pointer_contents
+                            .surface
+                            .as_ref()
+                            .map(|(surface, _)| surface.clone());
+                        self.focus_window_at_surface(&window, focus_surface.as_ref(), serial);
 
                         match hit {
                             DecorationHitTestResult::Action(WindowAction::Close) => {
@@ -1142,7 +1152,12 @@ impl ShojiWM {
                             &window,
                         )
                     {
-                        self.focus_window(&window, serial);
+                        let focus_surface = self
+                            .pointer_contents
+                            .surface
+                            .as_ref()
+                            .map(|(surface, _)| surface.clone());
+                        self.focus_window_at_surface(&window, focus_surface.as_ref(), serial);
                     } else if let Some(layer) = layer_under_pointer {
                         if layer.can_receive_keyboard_focus() {
                             self.focus_layer_surface_if_on_demand(Some(layer));
@@ -1431,6 +1446,8 @@ impl ShojiWM {
                 self.complete_window_snapshot_trackers
                     .remove(&runtime_action.window_id);
                 self.windows_ready_for_decoration
+                    .remove(&runtime_action.window_id);
+                self.pending_initial_focus_window_ids
                     .remove(&runtime_action.window_id);
                 self.pending_xdg_state_configure_window_ids
                     .remove(&runtime_action.window_id);
@@ -2320,6 +2337,28 @@ impl ShojiWM {
     }
 
     pub(crate) fn focus_window(&mut self, window: &smithay::desktop::Window, serial: Serial) {
+        self.focus_window_at_surface(window, None, serial);
+    }
+
+    pub(crate) fn apply_pending_initial_focus_for_window(
+        &mut self,
+        window_id: &str,
+        window: &smithay::desktop::Window,
+    ) {
+        if !self.pending_initial_focus_window_ids.remove(window_id) {
+            return;
+        }
+
+        let serial = SERIAL_COUNTER.next_serial();
+        self.focus_window(window, serial);
+    }
+
+    pub(crate) fn focus_window_at_surface(
+        &mut self,
+        window: &smithay::desktop::Window,
+        surface: Option<&smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+        serial: Serial,
+    ) {
         let started_at = Instant::now();
         let window_id = window
             .toplevel()
@@ -2335,12 +2374,13 @@ impl ShojiWM {
             self.space.raise_element(window, true);
         }
         self.update_xwayland_refresh_override_for_window(window, "window-focus");
-        self.set_window_keyboard_focus_target(Some(window));
+        self.set_window_keyboard_focus_target_surface(window, surface);
         self.focus_layer_surface_if_on_demand(None);
         self.update_keyboard_focus(serial);
         self.sync_wlr_foreign_toplevel_states();
         debug!(
             window_id,
+            focus_surface_id = surface.map(|surface| surface.id().protocol_id()),
             elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0,
             "focus_window finished"
         );

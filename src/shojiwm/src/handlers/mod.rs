@@ -95,6 +95,7 @@ impl SeatHandler for ShojiWM {
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        self.sync_window_keyboard_focus_from_surface(focused);
         let dh = &self.display_handle;
         let client = focused.and_then(|s| dh.get_client(s.id()).ok());
         set_data_device_focus(dh, seat, client.clone());
@@ -197,6 +198,7 @@ impl SessionLockHandler for ShojiWM {
     fn lock(&mut self, confirmation: SessionLocker) {
         self.session_lock_active = true;
         self.layer_shell_on_demand_focus = None;
+        self.window_keyboard_focus_owner = None;
         self.window_keyboard_focus = None;
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.set_focus(
@@ -472,11 +474,7 @@ impl XdgActivationHandler for ShojiWM {
         let window = self
             .space
             .elements()
-            .find(|candidate| {
-                candidate
-                    .toplevel()
-                    .is_some_and(|toplevel| toplevel.wl_surface() == &surface)
-            })
+            .find(|candidate| self.surface_belongs_to_window(candidate, &surface))
             .cloned();
 
         if let Some(window) = window {
@@ -491,7 +489,7 @@ impl XdgActivationHandler for ShojiWM {
             {
                 self.space.raise_element(&window, true);
             }
-            self.set_window_keyboard_focus_target(Some(&window));
+            self.set_window_keyboard_focus_target_surface(&window, Some(&surface));
             self.focus_layer_surface_if_on_demand(None);
             self.update_keyboard_focus(Serial::from(0));
             self.schedule_redraw();

@@ -374,6 +374,8 @@ pub struct ShojiWM {
     pub decoration_active_target: Option<TrackedDecorationInteractionTarget>,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
     pub pending_layer_surfaces: Vec<PendingLayerSurface>,
+    pub pending_initial_focus_window_ids: HashSet<String>,
+    pub window_keyboard_focus_owner: Option<WlSurface>,
     pub window_keyboard_focus: Option<WlSurface>,
     pub mapped_on_demand_layer_surfaces: HashSet<u32>,
     pub force_full_damage: bool,
@@ -654,13 +656,85 @@ impl ShojiWM {
         }
     }
 
+    fn window_root_surface(window: &Window) -> Option<WlSurface> {
+        if let Some(toplevel) = window.toplevel() {
+            return Some(toplevel.wl_surface().clone());
+        }
+        window.x11_surface().and_then(|x11| x11.wl_surface())
+    }
+
+    fn keyboard_focus_surface_root(surface: &WlSurface) -> WlSurface {
+        let mut root = surface.clone();
+        while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
+            root = parent;
+        }
+        root
+    }
+
+    fn window_matches_root_surface(window: &Window, root: &WlSurface) -> bool {
+        window
+            .toplevel()
+            .is_some_and(|toplevel| toplevel.wl_surface() == root)
+            || window
+                .x11_surface()
+                .and_then(|x11| x11.wl_surface())
+                .as_ref()
+                == Some(root)
+    }
+
+    pub fn surface_belongs_to_window(&self, window: &Window, surface: &WlSurface) -> bool {
+        let mut root = Self::keyboard_focus_surface_root(surface);
+        if let Some(popup_root) = self
+            .popups
+            .find_popup(surface)
+            .or_else(|| self.popups.find_popup(&root))
+            .and_then(|popup| find_popup_root_surface(&popup).ok())
+        {
+            root = popup_root;
+        }
+        Self::window_matches_root_surface(window, &root)
+    }
+
     pub fn set_window_keyboard_focus_target(&mut self, window: Option<&Window>) {
-        self.window_keyboard_focus = window.and_then(|window| {
-            if let Some(toplevel) = window.toplevel() {
-                return Some(toplevel.wl_surface().clone());
-            }
-            window.x11_surface().and_then(|x11| x11.wl_surface())
-        });
+        if let Some(window) = window {
+            self.set_window_keyboard_focus_target_surface(window, None);
+        } else {
+            self.window_keyboard_focus_owner = None;
+            self.window_keyboard_focus = None;
+        }
+    }
+
+    pub fn set_window_keyboard_focus_target_surface(
+        &mut self,
+        window: &Window,
+        surface: Option<&WlSurface>,
+    ) {
+        let root = Self::window_root_surface(window);
+        let focus = surface
+            .filter(|surface| self.surface_belongs_to_window(window, surface))
+            .cloned()
+            .or_else(|| root.clone());
+
+        self.window_keyboard_focus_owner = root;
+        self.window_keyboard_focus = focus;
+    }
+
+    pub fn sync_window_keyboard_focus_from_surface(&mut self, surface: Option<&WlSurface>) {
+        let Some(surface) = surface else {
+            self.window_keyboard_focus_owner = None;
+            self.window_keyboard_focus = None;
+            return;
+        };
+
+        let owner_root = self
+            .space
+            .elements()
+            .find(|window| self.surface_belongs_to_window(window, surface))
+            .and_then(Self::window_root_surface);
+        if owner_root.is_some() {
+            self.window_keyboard_focus_owner = owner_root;
+            self.window_keyboard_focus = Some(surface.clone());
+        }
     }
 
     pub fn focus_layer_surface_if_on_demand(&mut self, layer: Option<LayerSurface>) {
@@ -719,20 +793,30 @@ impl ShojiWM {
         }
 
         if let Some(surface) = self.window_keyboard_focus.as_ref() {
-            let still_mapped = self.space.elements().any(|window| {
-                if window
-                    .toplevel()
-                    .is_some_and(|toplevel| toplevel.wl_surface() == surface)
-                {
-                    return true;
-                }
-                window
-                    .x11_surface()
-                    .and_then(|x11| x11.wl_surface())
-                    .as_ref()
-                    == Some(surface)
+            let owner_root = self.window_keyboard_focus_owner.clone().or_else(|| {
+                self.space
+                    .elements()
+                    .find(|window| self.surface_belongs_to_window(window, surface))
+                    .and_then(Self::window_root_surface)
             });
-            if !still_mapped {
+            let owner_still_mapped = owner_root.as_ref().is_some_and(|owner| {
+                self.space
+                    .elements()
+                    .any(|window| Self::window_matches_root_surface(window, owner))
+            });
+            let focus_still_valid = surface.alive()
+                && self
+                    .space
+                    .elements()
+                    .any(|window| self.surface_belongs_to_window(window, surface));
+
+            if owner_still_mapped {
+                if !focus_still_valid {
+                    self.window_keyboard_focus = owner_root.clone();
+                }
+                self.window_keyboard_focus_owner = owner_root;
+            } else {
+                self.window_keyboard_focus_owner = None;
                 self.window_keyboard_focus = None;
             }
         }
@@ -746,16 +830,27 @@ impl ShojiWM {
 
         self.prune_keyboard_focus_targets();
 
-        let desired_focus = self
-            .exclusive_layer_focus_surface()
-            .or_else(|| {
+        let exclusive_layer_focus = self.exclusive_layer_focus_surface();
+        let on_demand_layer_focus = exclusive_layer_focus
+            .is_none()
+            .then(|| {
                 self.layer_shell_on_demand_focus
                     .as_ref()
                     .map(|layer| layer.wl_surface().clone())
             })
+            .flatten();
+        let layer_has_focus = exclusive_layer_focus.is_some() || on_demand_layer_focus.is_some();
+        let desired_focus = exclusive_layer_focus
+            .or(on_demand_layer_focus)
             .or_else(|| self.window_keyboard_focus.clone());
 
-        let focused_window_surface = desired_focus.as_ref();
+        let focused_window_surface = (!layer_has_focus)
+            .then(|| {
+                self.window_keyboard_focus_owner
+                    .as_ref()
+                    .or(desired_focus.as_ref())
+            })
+            .flatten();
 
         for candidate in self.space.elements() {
             let should_activate = if let Some(toplevel) = candidate.toplevel() {
@@ -783,12 +878,34 @@ impl ShojiWM {
             != desired_focus.as_ref().map(|surface| surface.id());
 
         if focus_changed {
-            self.seat
-                .get_keyboard()
-                .unwrap()
-                .set_focus(self, desired_focus, serial);
-            self.schedule_redraw();
+            if self.should_defer_initial_keyboard_focus(desired_focus.as_ref()) {
+                self.schedule_redraw();
+            } else {
+                self.seat
+                    .get_keyboard()
+                    .unwrap()
+                    .set_focus(self, desired_focus, serial);
+                self.schedule_redraw();
+            }
         }
+    }
+
+    fn should_defer_initial_keyboard_focus(&self, focus: Option<&WlSurface>) -> bool {
+        if self.pending_initial_focus_window_ids.is_empty() {
+            return false;
+        }
+        let Some(focus) = focus else {
+            return false;
+        };
+
+        self.space.elements().any(|window| {
+            if !self.surface_belongs_to_window(window, focus) {
+                return false;
+            }
+            let window_id = self.snapshot_window(window).id;
+            self.pending_initial_focus_window_ids.contains(&window_id)
+                && !self.windows_ready_for_decoration.contains(&window_id)
+        })
     }
 
     pub fn refresh_keyboard_focus_for_keymap_change(&mut self) {
@@ -1125,6 +1242,8 @@ impl ShojiWM {
             decoration_active_target: None,
             layer_shell_on_demand_focus: None,
             pending_layer_surfaces: Vec::new(),
+            pending_initial_focus_window_ids: HashSet::new(),
+            window_keyboard_focus_owner: None,
             window_keyboard_focus: None,
             mapped_on_demand_layer_surfaces: Default::default(),
             force_full_damage,
