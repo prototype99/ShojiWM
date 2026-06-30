@@ -2950,7 +2950,10 @@ export class Workspace {
     }
     this.windows.push(window);
     const restored = this.restoredWindowStateById.get(window.id);
-    this.activeWindowId = restored ? this.activeWindowId : window.id;
+    const isTileableInCurrentMode = !this.isTiled || this.shouldTile(window);
+    if (!restored && isTileableInCurrentMode) {
+      this.activeWindowId = window.id;
+    }
     if (restored) {
       window.cancelAnimation();
       hotReloadDebug("workspace-add-restored-cancel-animation", {
@@ -3854,15 +3857,47 @@ export class Workspace {
     if (tileable.length === 0) {
       return;
     }
-    const currentIndex = Math.max(
-      0,
-      tileable.findIndex((window) => window.id === this.activeWindowId),
+    const activeIndex = tileable.findIndex(
+      (window) => window.id === this.activeWindowId,
     );
+    const fallbackIndex = this.focusFallbackTileIndex(tileable, direction);
+    const currentIndex =
+      activeIndex >= 0
+        ? activeIndex
+        : (fallbackIndex ?? (direction < 0 ? tileable.length : -1));
     const nextIndex = clamp(currentIndex + direction, 0, tileable.length - 1);
     this.activeWindowId = tileable[nextIndex].id;
     this.scrollToWindow(tileable[nextIndex]);
     this.applyLayout();
     this.focusActiveWindow();
+  }
+
+  private focusFallbackTileIndex(
+    tileable: WaylandWindow[],
+    direction: -1 | 1,
+  ): number | undefined {
+    const focused = this.focusedWindow();
+    if (!focused || this.shouldTile(focused)) {
+      return undefined;
+    }
+
+    const focusedCenter = rectCenterX(focused.state[WINDOW_STATE_RECT]());
+    const candidates = tileable
+      .map((window, index) => ({
+        index,
+        center: rectCenterX(window.state[WINDOW_STATE_RECT]()),
+      }))
+      .filter(({ center }) =>
+        direction < 0 ? center < focusedCenter : center > focusedCenter,
+      );
+    if (candidates.length === 0) {
+      return undefined;
+    }
+
+    candidates.sort((a, b) =>
+      direction < 0 ? b.center - a.center : a.center - b.center,
+    );
+    return candidates[0].index - direction;
   }
 
   public focusActiveWindow() {
@@ -4407,6 +4442,10 @@ function managedRectContainsPoint(
     y >= top &&
     y < top + read(rect.height)
   );
+}
+
+function rectCenterX(rect: ManagedWindowRect): number {
+  return read(rect.x) + read(rect.width) / 2;
 }
 
 function insetRect(
