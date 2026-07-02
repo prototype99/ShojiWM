@@ -56,6 +56,7 @@ COMPOSITOR.env.publish();
 
 const HYBRID_WINDOW_MANAGER = new HybridWindowManager(naturalRootRect);
 const HOT_RELOAD_WINDOW_MANAGER_STATE = "config.hybrid-window-manager";
+const FULLSCREEN_Z_INDEX = 2_000_000_000;
 
 COMPOSITOR.onDisable((event) => {
   if (event.isReloading) {
@@ -759,7 +760,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
     return (
       <ManagedWindow
         rect={managedRect}
-        zIndex={HYBRID_WINDOW_MANAGER.getWindowZIndex(window)}
+        zIndex={FULLSCREEN_Z_INDEX}
         visibleOutputs={window.state[WINDOW_STATE_VISIBLE_OUTPUTS]}
         opacity={workspaceOpacity}
         forceRectSize={forceRectSize}
