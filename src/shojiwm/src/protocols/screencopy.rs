@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -323,7 +325,7 @@ where
             // OBS-side consumption is slow enough to back-pressure the PipeWire
             // buffer pool and cap effective fps at ~19. Setting SHOJI_SCREENCOPY_NO_DMABUF=1
             // forces clients onto the SHM fallback, which uses an uncompressed buffer.
-            if std::env::var_os("SHOJI_SCREENCOPY_NO_DMABUF").is_none() {
+            if screencopy_dmabuf_advertising_enabled() {
                 frame.linux_dmabuf(
                     Fourcc::Xrgb8888 as u32,
                     buffer_size.w as u32,
@@ -352,6 +354,61 @@ where
             state.queues.remove(manager);
         }
     }
+}
+
+fn screencopy_dmabuf_advertising_enabled() -> bool {
+    if std::env::var_os("SHOJI_SCREENCOPY_NO_DMABUF").is_some()
+        || std::env::var_os("SHOJI_SCREENCAST_NO_DMABUF").is_some()
+    {
+        return false;
+    }
+
+    if std::env::var_os("SHOJI_SCREENCOPY_FORCE_DMABUF").is_some()
+        || std::env::var_os("SHOJI_SCREENCAST_FORCE_DMABUF").is_some()
+    {
+        return true;
+    }
+
+    !*NVIDIA_DRM_DEVICE_HAS_CONNECTED_OUTPUT.get_or_init(nvidia_drm_device_has_connected_output)
+}
+
+static NVIDIA_DRM_DEVICE_HAS_CONNECTED_OUTPUT: OnceLock<bool> = OnceLock::new();
+
+fn nvidia_drm_device_has_connected_output() -> bool {
+    let Ok(entries) = fs::read_dir("/sys/class/drm") else {
+        return false;
+    };
+
+    entries.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+
+        // Connector directories are named like `card2-HDMI-A-1`; plain DRM
+        // nodes (`card2`, `renderD128`) do not have a connector status file.
+        if !name.starts_with("card") || !name.contains('-') {
+            return false;
+        }
+
+        let connector_path = entry.path();
+        let Ok(status) = fs::read_to_string(connector_path.join("status")) else {
+            return false;
+        };
+        if status.trim() != "connected" {
+            return false;
+        }
+
+        let Some(card_name) = name.split('-').next() else {
+            return false;
+        };
+        let vendor_path = Path::new("/sys/class/drm")
+            .join(card_name)
+            .join("device/vendor");
+        fs::read_to_string(vendor_path)
+            .ok()
+            .is_some_and(|vendor| vendor.trim().eq_ignore_ascii_case("0x10de"))
+    })
 }
 
 pub trait ScreencopyHandler {
@@ -460,6 +517,19 @@ where
         let size = info.buffer_size;
 
         let buffer = if let Ok(dmabuf) = dmabuf::get_dmabuf(&buffer) {
+            if !screencopy_dmabuf_advertising_enabled() {
+                trace!("screencopy client supplied DMA-BUF while DMA-BUF capture is disabled");
+                frame.failed();
+                let state = state.screencopy_state();
+                let Some(queue) = state.queues.get_mut(manager) else {
+                    return;
+                };
+                queue.remove_frame(frame);
+                if queue.is_empty() && !manager.is_alive() {
+                    state.queues.remove(manager);
+                }
+                return;
+            }
             if dmabuf.format().code == Fourcc::Xrgb8888
                 && dmabuf.width() == size.w as u32
                 && dmabuf.height() == size.h as u32

@@ -84,10 +84,10 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Cursor;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -316,25 +316,37 @@ fn run(
             .map(|tx| tx.send(Err("compositor doesn't expose wl_shm".into())));
         return Err("no wl_shm".into());
     }
-    state.gbm = match init_gbm_device() {
-        Ok(Some(device)) if state.dmabuf.is_some() => {
-            tracing::info!(
-                backend = device.backend_name(),
-                "screencast: DMA-BUF capture enabled"
-            );
-            Some(device)
-        }
-        Ok(Some(_)) => {
-            tracing::info!("screencast: zwp_linux_dmabuf_v1 missing; using SHM capture");
-            None
-        }
-        Ok(None) => {
-            tracing::info!("screencast: no render node found; using SHM capture");
-            None
-        }
-        Err(e) => {
-            tracing::warn!("screencast: failed to initialize GBM ({e}); using SHM capture");
-            None
+    state.gbm = if screencast_dmabuf_disabled_by_env() {
+        tracing::info!("screencast: DMA-BUF capture disabled by environment; using SHM capture");
+        None
+    } else if !screencast_dmabuf_force_enabled() && nvidia_drm_device_has_connected_output() {
+        tracing::warn!(
+            "screencast: connected NVIDIA output detected; using SHM capture for output screencast"
+        );
+        None
+    } else {
+        match init_gbm_device() {
+            Ok(Some(device)) if state.dmabuf.is_some() => {
+                tracing::info!(
+                    backend = device.backend_name(),
+                    "screencast: DMA-BUF capture enabled"
+                );
+                Some(device)
+            }
+            Ok(Some(_)) => {
+                tracing::info!("screencast: zwp_linux_dmabuf_v1 missing; using SHM capture");
+                None
+            }
+            Ok(None) => {
+                tracing::info!(
+                    "screencast: no usable DMA-BUF render node found; using SHM capture"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!("screencast: failed to initialize GBM ({e}); using SHM capture");
+                None
+            }
         }
     };
     if state.target_output.is_none() {
@@ -1050,6 +1062,13 @@ fn init_gbm_device() -> Result<Option<GbmDevice<File>>, Box<dyn std::error::Erro
         };
         match GbmDevice::new(file) {
             Ok(device) => {
+                if nvidia_dmabuf_disabled_for_node(&path) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "screencast: NVIDIA DMA-BUF output capture is disabled; using SHM capture"
+                    );
+                    return Ok(None);
+                }
                 tracing::info!(path = %path.display(), "screencast: opened GBM render node");
                 return Ok(Some(device));
             }
@@ -1060,6 +1079,66 @@ fn init_gbm_device() -> Result<Option<GbmDevice<File>>, Box<dyn std::error::Erro
     }
 
     Ok(None)
+}
+
+fn screencast_dmabuf_disabled_by_env() -> bool {
+    std::env::var_os("SHOJI_SCREENCAST_NO_DMABUF").is_some()
+        || std::env::var_os("SHOJI_SCREENCOPY_NO_DMABUF").is_some()
+}
+
+fn screencast_dmabuf_force_enabled() -> bool {
+    std::env::var_os("SHOJI_SCREENCAST_FORCE_DMABUF").is_some()
+        || std::env::var_os("SHOJI_SCREENCOPY_FORCE_DMABUF").is_some()
+}
+
+fn nvidia_dmabuf_disabled_for_node(path: &Path) -> bool {
+    if screencast_dmabuf_force_enabled() {
+        return false;
+    }
+    drm_vendor_for_node(path).is_some_and(|vendor| vendor.eq_ignore_ascii_case("0x10de"))
+}
+
+fn drm_vendor_for_node(path: &Path) -> Option<String> {
+    let node = path.file_name()?.to_str()?;
+    let vendor_path = Path::new("/sys/class/drm").join(node).join("device/vendor");
+    fs::read_to_string(vendor_path)
+        .ok()
+        .map(|vendor| vendor.trim().to_owned())
+}
+
+fn nvidia_drm_device_has_connected_output() -> bool {
+    let Ok(entries) = fs::read_dir("/sys/class/drm") else {
+        return false;
+    };
+
+    entries.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+
+        if !name.starts_with("card") || !name.contains('-') {
+            return false;
+        }
+
+        let connector_path = entry.path();
+        let Ok(status) = fs::read_to_string(connector_path.join("status")) else {
+            return false;
+        };
+        if status.trim() != "connected" {
+            return false;
+        }
+
+        let Some(card_name) = name.split('-').next() else {
+            return false;
+        };
+        let vendor_path = Path::new("/sys/class/drm")
+            .join(card_name)
+            .join("device/vendor");
+        fs::read_to_string(vendor_path)
+            .ok()
+            .is_some_and(|vendor| vendor.trim().eq_ignore_ascii_case("0x10de"))
+    })
 }
 
 // ─── POD builders ─────────────────────────────────────────────────────────
