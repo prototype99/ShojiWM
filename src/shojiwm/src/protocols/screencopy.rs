@@ -1,8 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -363,52 +361,7 @@ fn screencopy_dmabuf_advertising_enabled() -> bool {
         return false;
     }
 
-    if std::env::var_os("SHOJI_SCREENCOPY_FORCE_DMABUF").is_some()
-        || std::env::var_os("SHOJI_SCREENCAST_FORCE_DMABUF").is_some()
-    {
-        return true;
-    }
-
-    !*NVIDIA_DRM_DEVICE_HAS_CONNECTED_OUTPUT.get_or_init(nvidia_drm_device_has_connected_output)
-}
-
-static NVIDIA_DRM_DEVICE_HAS_CONNECTED_OUTPUT: OnceLock<bool> = OnceLock::new();
-
-fn nvidia_drm_device_has_connected_output() -> bool {
-    let Ok(entries) = fs::read_dir("/sys/class/drm") else {
-        return false;
-    };
-
-    entries.filter_map(Result::ok).any(|entry| {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            return false;
-        };
-
-        // Connector directories are named like `card2-HDMI-A-1`; plain DRM
-        // nodes (`card2`, `renderD128`) do not have a connector status file.
-        if !name.starts_with("card") || !name.contains('-') {
-            return false;
-        }
-
-        let connector_path = entry.path();
-        let Ok(status) = fs::read_to_string(connector_path.join("status")) else {
-            return false;
-        };
-        if status.trim() != "connected" {
-            return false;
-        }
-
-        let Some(card_name) = name.split('-').next() else {
-            return false;
-        };
-        let vendor_path = Path::new("/sys/class/drm")
-            .join(card_name)
-            .join("device/vendor");
-        fs::read_to_string(vendor_path)
-            .ok()
-            .is_some_and(|vendor| vendor.trim().eq_ignore_ascii_case("0x10de"))
-    })
+    true
 }
 
 pub trait ScreencopyHandler {

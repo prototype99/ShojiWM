@@ -215,7 +215,7 @@ impl ScreenCast {
             Some(Selection::Output(out)) => {
                 let framerate = {
                     let hz = (out.refresh_mhz as f32 / 1000.0).round() as u32;
-                    hz.clamp(30, 120)
+                    hz.max(30)
                 };
                 let spec = StreamSpec {
                     output_name: out.name.clone(),

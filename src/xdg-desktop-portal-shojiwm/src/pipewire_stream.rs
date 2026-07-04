@@ -88,6 +88,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Cursor;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -98,8 +99,9 @@ use drm_fourcc::{DrmFourcc, DrmModifier};
 use gbm::{BufferObject, BufferObjectFlags, Device as GbmDevice};
 use pipewire as pw;
 use pw::spa;
+use pw::spa::pod::deserialize::PodDeserializer;
 use pw::spa::pod::serialize::PodSerializer;
-use pw::spa::pod::{ChoiceValue, Object, Pod, Property, Value};
+use pw::spa::pod::{ChoiceValue, Object, Pod, PodPropFlags, Property, PropertyFlags, Value};
 use pw::spa::support::system::IoFlags;
 use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle};
 use spa::sys as spa_sys;
@@ -178,6 +180,9 @@ struct AppState {
     shm: Option<wl_shm::WlShm>,
     dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
     gbm: Option<GbmDevice<File>>,
+    dmabuf_modifiers: Vec<DrmModifier>,
+    negotiated_dmabuf_modifier: Option<DrmModifier>,
+    dmabuf_failed: bool,
 
     // PipeWire stream (cloneable Rc handle)
     stream: Option<pw::stream::StreamRc>,
@@ -280,6 +285,9 @@ fn run(
         shm: None,
         dmabuf: None,
         gbm: None,
+        dmabuf_modifiers: Vec::new(),
+        negotiated_dmabuf_modifier: None,
+        dmabuf_failed: false,
         stream: None,
         pw_buffer_slots: HashMap::new(),
         pw_buffer_stride: HashMap::new(),
@@ -319,13 +327,8 @@ fn run(
     state.gbm = if screencast_dmabuf_disabled_by_env() {
         tracing::info!("screencast: DMA-BUF capture disabled by environment; using SHM capture");
         None
-    } else if !screencast_dmabuf_force_enabled() && nvidia_drm_device_has_connected_output() {
-        tracing::warn!(
-            "screencast: connected NVIDIA output detected; using SHM capture for output screencast"
-        );
-        None
     } else {
-        match init_gbm_device() {
+        match init_gbm_device_for_output(&spec.output_name) {
             Ok(Some(device)) if state.dmabuf.is_some() => {
                 tracing::info!(
                     backend = device.backend_name(),
@@ -377,10 +380,14 @@ fn run(
     let s_state = state_rc.clone();
     let s_add = state_rc.clone();
     let s_remove = state_rc.clone();
+    let s_param = state_rc.clone();
     let _listener = stream
         .add_local_listener_with_user_data(())
         .state_changed(move |stream, _ud, old, new| {
             s_state.borrow_mut().on_state_changed(stream, old, new);
+        })
+        .param_changed(move |stream, _ud, id, param| {
+            s_param.borrow_mut().on_param_changed(stream, id, param);
         })
         .add_buffer(move |stream, _ud, buffer| {
             s_add.borrow_mut().on_add_buffer(stream, buffer);
@@ -396,12 +403,27 @@ fn run(
         .register()?;
 
     // Negotiate format + buffer params.
-    let format_bytes = build_video_format_param(&spec)?;
-    let buffers_bytes = build_buffers_param(&spec, state_rc.borrow().gbm.is_some())?;
-    let format_pod = Pod::from_bytes(&format_bytes).ok_or("format POD parse failed".to_string())?;
-    let buffers_pod =
-        Pod::from_bytes(&buffers_bytes).ok_or("buffers POD parse failed".to_string())?;
-    let mut params = [format_pod, buffers_pod];
+    let dmabuf_modifiers = {
+        let state = state_rc.borrow();
+        state.usable_dmabuf_modifiers()
+    };
+    if !dmabuf_modifiers.is_empty() {
+        tracing::info!(
+            count = dmabuf_modifiers.len(),
+            modifiers = ?dmabuf_modifiers
+                .iter()
+                .map(|modifier| format!("{:#x}", u64::from(*modifier)))
+                .collect::<Vec<_>>(),
+            "screencast: advertising DMA-BUF modifiers to PipeWire"
+        );
+    }
+    let mut param_bytes = build_video_format_params(&spec, &dmabuf_modifiers, false)?;
+    let buffers_bytes = build_buffers_param(&spec, !dmabuf_modifiers.is_empty())?;
+    param_bytes.push(buffers_bytes);
+    let mut params = Vec::with_capacity(param_bytes.len());
+    for bytes in &param_bytes {
+        params.push(Pod::from_bytes(bytes).ok_or("PipeWire POD parse failed".to_string())?);
+    }
     stream.connect(
         spa::utils::Direction::Output,
         None,
@@ -572,13 +594,33 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for AppState {
 
 impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for AppState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
-        _: zwp_linux_dmabuf_v1::Event,
+        event: zwp_linux_dmabuf_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        match event {
+            zwp_linux_dmabuf_v1::Event::Modifier {
+                format,
+                modifier_hi,
+                modifier_lo,
+            } if format == DrmFourcc::Xrgb8888 as u32 => {
+                let modifier = DrmModifier::from(((modifier_hi as u64) << 32) | modifier_lo as u64);
+                if !state.dmabuf_modifiers.contains(&modifier) {
+                    state.dmabuf_modifiers.push(modifier);
+                }
+            }
+            zwp_linux_dmabuf_v1::Event::Format { format }
+                if format == DrmFourcc::Xrgb8888 as u32 =>
+            {
+                if !state.dmabuf_modifiers.contains(&DrmModifier::Invalid) {
+                    state.dmabuf_modifiers.push(DrmModifier::Invalid);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -660,6 +702,105 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for AppState {
 // ─── AppState behaviour ──────────────────────────────────────────────────
 
 impl AppState {
+    fn usable_dmabuf_modifiers(&self) -> Vec<DrmModifier> {
+        let Some(gbm) = self.gbm.as_ref() else {
+            return Vec::new();
+        };
+        let mut modifiers = self.dmabuf_modifiers.clone();
+        if modifiers.is_empty() {
+            modifiers.push(DrmModifier::Linear);
+        }
+        modifiers
+            .into_iter()
+            .filter(|modifier| {
+                *modifier == DrmModifier::Invalid
+                    || gbm
+                        .format_modifier_plane_count(DrmFourcc::Xrgb8888, *modifier)
+                        .unwrap_or(0)
+                        > 0
+            })
+            .collect()
+    }
+
+    fn on_param_changed(&mut self, stream: &pw::stream::Stream, id: u32, param: Option<&Pod>) {
+        if id != spa_sys::SPA_PARAM_Format {
+            return;
+        }
+        let Some(param) = param else {
+            return;
+        };
+        let Some(modifier_param) = parse_pipewire_modifier_param(param) else {
+            return;
+        };
+
+        if modifier_param.dont_fixate {
+            let Some(modifier) = self.choose_working_dmabuf_modifier(&modifier_param.modifiers)
+            else {
+                tracing::warn!(
+                    requested = ?modifier_param
+                        .modifiers
+                        .iter()
+                        .map(|modifier| format!("{:#x}", u64::from(*modifier)))
+                        .collect::<Vec<_>>(),
+                    "screencast: no PipeWire-requested DMA-BUF modifier can be allocated; falling back to SHM"
+                );
+                self.dmabuf_failed = true;
+                if let Err(e) = self.update_pipewire_params(stream, &[]) {
+                    tracing::warn!(
+                        "screencast: failed to update PipeWire params for SHM fallback: {e}"
+                    );
+                }
+                return;
+            };
+
+            self.negotiated_dmabuf_modifier = Some(modifier);
+            tracing::info!(
+                modifier = format!("{:#x}", u64::from(modifier)),
+                "screencast: fixating DMA-BUF modifier"
+            );
+            if let Err(e) = self.update_pipewire_params(stream, &[modifier]) {
+                tracing::warn!("screencast: failed to fixate PipeWire DMA-BUF modifier: {e}");
+                self.dmabuf_failed = true;
+            }
+        } else if let Some(modifier) = modifier_param.modifiers.first().copied() {
+            self.negotiated_dmabuf_modifier = Some(modifier);
+            tracing::info!(
+                modifier = format!("{:#x}", u64::from(modifier)),
+                "screencast: PipeWire selected DMA-BUF modifier"
+            );
+        }
+    }
+
+    fn choose_working_dmabuf_modifier(&self, modifiers: &[DrmModifier]) -> Option<DrmModifier> {
+        let gbm = self.gbm.as_ref()?;
+        for modifier in modifiers {
+            if create_screencast_bo(gbm, self.spec.width, self.spec.height, *modifier)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return Some(*modifier);
+            }
+        }
+        None
+    }
+
+    fn update_pipewire_params(
+        &self,
+        stream: &pw::stream::Stream,
+        modifiers: &[DrmModifier],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut param_bytes = build_video_format_params(&self.spec, modifiers, true)?;
+        let buffers_bytes = build_buffers_param(&self.spec, !modifiers.is_empty())?;
+        param_bytes.push(buffers_bytes);
+        let mut params = Vec::with_capacity(param_bytes.len());
+        for bytes in &param_bytes {
+            params.push(Pod::from_bytes(bytes).ok_or("PipeWire POD parse failed".to_string())?);
+        }
+        stream.update_params(&mut params)?;
+        Ok(())
+    }
+
     fn on_state_changed(
         &mut self,
         stream: &pw::stream::Stream,
@@ -769,7 +910,7 @@ impl AppState {
         let allows_dmabuf = data_types & dmabuf_flag != 0 || data_types == spa_sys::SPA_DATA_DmaBuf;
         let allows_memfd = data_types & memfd_flag != 0 || data_types == spa_sys::SPA_DATA_MemFd;
 
-        if allows_dmabuf {
+        if allows_dmabuf && !self.dmabuf_failed {
             match self.create_dmabuf_slot() {
                 Ok(Some(slot)) => return Ok(slot),
                 Ok(None) if !allows_memfd => {
@@ -799,17 +940,18 @@ impl AppState {
             return Ok(None);
         };
 
-        let flags = BufferObjectFlags::RENDERING | BufferObjectFlags::LINEAR;
+        let flags = BufferObjectFlags::RENDERING;
         if !gbm.is_format_supported(DrmFourcc::Xrgb8888, flags) {
             return Ok(None);
         }
 
-        let bo = gbm.create_buffer_object::<()>(
-            self.spec.width,
-            self.spec.height,
-            DrmFourcc::Xrgb8888,
-            flags,
-        )?;
+        let modifier = self
+            .negotiated_dmabuf_modifier
+            .unwrap_or(DrmModifier::Linear);
+        let Some(bo) = create_screencast_bo(gbm, self.spec.width, self.spec.height, modifier)?
+        else {
+            return Ok(None);
+        };
         if bo.plane_count() != 1 {
             return Err(format!(
                 "expected single-plane XRGB8888 BO, got {}",
@@ -819,12 +961,12 @@ impl AppState {
         }
         let stride = bo.stride_for_plane(0) as i32;
         let size = stride as usize * self.spec.height as usize;
-        let modifier = u64::from(DrmModifier::Linear);
+        let modifier = u64::from(bo.modifier());
         let modifier_hi = (modifier >> 32) as u32;
         let modifier_lo = (modifier & 0xffff_ffff) as u32;
 
-        let wl_fd = bo.fd()?;
-        let fd_for_pw = bo.fd()?;
+        let wl_fd = bo.fd_for_plane(0)?;
+        let fd_for_pw = bo.fd_for_plane(0)?;
         let params = dmabuf.create_params(&self.qh, ());
         params.add(
             wl_fd.as_fd(),
@@ -1017,7 +1159,14 @@ impl AppState {
 
         self.frames_completed += 1;
         if self.last_log_at.elapsed() >= std::time::Duration::from_secs(2) {
-            tracing::info!(frames = self.frames_completed, "screencast: frames queued");
+            let elapsed = self.last_log_at.elapsed().as_secs_f64();
+            let effective_fps = self.frames_completed as f64 / elapsed.max(0.001);
+            tracing::info!(
+                frames = self.frames_completed,
+                effective_fps,
+                "screencast: frames queued"
+            );
+            self.frames_completed = 0;
             self.last_log_at = std::time::Instant::now();
         }
 
@@ -1048,12 +1197,67 @@ impl AppState {
     }
 }
 
-fn init_gbm_device() -> Result<Option<GbmDevice<File>>, Box<dyn std::error::Error + Send + Sync>> {
+fn create_screencast_bo(
+    gbm: &GbmDevice<File>,
+    width: u32,
+    height: u32,
+    modifier: DrmModifier,
+) -> Result<Option<BufferObject<()>>, Box<dyn std::error::Error + Send + Sync>> {
+    let flags = BufferObjectFlags::RENDERING;
+
+    if modifier == DrmModifier::Invalid {
+        match gbm.create_buffer_object::<()>(width, height, DrmFourcc::Xrgb8888, flags) {
+            Ok(bo) => return Ok(Some(bo)),
+            Err(e) => {
+                tracing::warn!(
+                    "screencast: implicit DMA-BUF allocation failed ({e}); falling back to SHM"
+                );
+            }
+        }
+    } else {
+        match gbm.create_buffer_object_with_modifiers2::<()>(
+            width,
+            height,
+            DrmFourcc::Xrgb8888,
+            [modifier].into_iter(),
+            flags,
+        ) {
+            Ok(bo) => return Ok(Some(bo)),
+            Err(e) => {
+                tracing::warn!(
+                    modifier = format!("{:#x}", u64::from(modifier)),
+                    "screencast: DMA-BUF allocation failed ({e}); falling back to SHM"
+                );
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn init_gbm_device_for_output(
+    output_name: &str,
+) -> Result<Option<GbmDevice<File>>, Box<dyn std::error::Error + Send + Sync>> {
     let mut candidates = Vec::new();
     if let Ok(path) = std::env::var("SHOJI_SCREENCAST_RENDER_NODE") {
         candidates.push(PathBuf::from(path));
     }
+    if let Some(path) = render_node_for_output(output_name) {
+        tracing::info!(
+            output = output_name,
+            path = %path.display(),
+            "screencast: selected output-matched render node"
+        );
+        candidates.push(path);
+    } else if !screencast_dmabuf_force_enabled() && nvidia_drm_device_has_connected_output() {
+        tracing::warn!(
+            output = output_name,
+            "screencast: connected NVIDIA output detected but no matching render node was found; using SHM capture"
+        );
+        return Ok(None);
+    }
     candidates.extend((128..200).map(|idx| PathBuf::from(format!("/dev/dri/renderD{idx}"))));
+    dedup_paths(&mut candidates);
 
     for path in candidates {
         let file = match OpenOptions::new().read(true).write(true).open(&path) {
@@ -1062,13 +1266,6 @@ fn init_gbm_device() -> Result<Option<GbmDevice<File>>, Box<dyn std::error::Erro
         };
         match GbmDevice::new(file) {
             Ok(device) => {
-                if nvidia_dmabuf_disabled_for_node(&path) {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "screencast: NVIDIA DMA-BUF output capture is disabled; using SHM capture"
-                    );
-                    return Ok(None);
-                }
                 tracing::info!(path = %path.display(), "screencast: opened GBM render node");
                 return Ok(Some(device));
             }
@@ -1081,6 +1278,18 @@ fn init_gbm_device() -> Result<Option<GbmDevice<File>>, Box<dyn std::error::Erro
     Ok(None)
 }
 
+fn dedup_paths(paths: &mut Vec<PathBuf>) {
+    let mut seen = Vec::<PathBuf>::new();
+    paths.retain(|path| {
+        if seen.iter().any(|seen_path| seen_path == path) {
+            false
+        } else {
+            seen.push(path.clone());
+            true
+        }
+    });
+}
+
 fn screencast_dmabuf_disabled_by_env() -> bool {
     std::env::var_os("SHOJI_SCREENCAST_NO_DMABUF").is_some()
         || std::env::var_os("SHOJI_SCREENCOPY_NO_DMABUF").is_some()
@@ -1089,21 +1298,6 @@ fn screencast_dmabuf_disabled_by_env() -> bool {
 fn screencast_dmabuf_force_enabled() -> bool {
     std::env::var_os("SHOJI_SCREENCAST_FORCE_DMABUF").is_some()
         || std::env::var_os("SHOJI_SCREENCOPY_FORCE_DMABUF").is_some()
-}
-
-fn nvidia_dmabuf_disabled_for_node(path: &Path) -> bool {
-    if screencast_dmabuf_force_enabled() {
-        return false;
-    }
-    drm_vendor_for_node(path).is_some_and(|vendor| vendor.eq_ignore_ascii_case("0x10de"))
-}
-
-fn drm_vendor_for_node(path: &Path) -> Option<String> {
-    let node = path.file_name()?.to_str()?;
-    let vendor_path = Path::new("/sys/class/drm").join(node).join("device/vendor");
-    fs::read_to_string(vendor_path)
-        .ok()
-        .map(|vendor| vendor.trim().to_owned())
 }
 
 fn nvidia_drm_device_has_connected_output() -> bool {
@@ -1141,69 +1335,216 @@ fn nvidia_drm_device_has_connected_output() -> bool {
     })
 }
 
+fn render_node_for_output(output_name: &str) -> Option<PathBuf> {
+    let card_name = card_name_for_connected_output(output_name)?;
+    let card_device =
+        fs::canonicalize(Path::new("/sys/class/drm").join(&card_name).join("device")).ok()?;
+
+    let entries = fs::read_dir("/sys/class/drm").ok()?;
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("renderD") {
+            continue;
+        }
+
+        let Ok(render_device) = fs::canonicalize(entry.path().join("device")) else {
+            continue;
+        };
+        if render_device == card_device {
+            return Some(Path::new("/dev/dri").join(name));
+        }
+    }
+
+    None
+}
+
+fn card_name_for_connected_output(output_name: &str) -> Option<String> {
+    let entries = fs::read_dir("/sys/class/drm").ok()?;
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+
+        let Some((card_name, connector_name)) = split_drm_connector_name(name) else {
+            continue;
+        };
+        if connector_name != output_name {
+            continue;
+        }
+
+        let status = fs::read_to_string(entry.path().join("status")).ok()?;
+        if status.trim() == "connected" {
+            return Some(card_name.to_owned());
+        }
+    }
+
+    None
+}
+
+fn split_drm_connector_name(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("card")?;
+    let dash = rest.find('-')?;
+    let card_len = "card".len() + dash;
+    Some((&name[..card_len], &name[card_len + 1..]))
+}
+
 // ─── POD builders ─────────────────────────────────────────────────────────
+
+fn build_video_format_params(
+    spec: &StreamSpec,
+    modifiers: &[DrmModifier],
+    fixated: bool,
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut params = Vec::new();
+    if !modifiers.is_empty() {
+        params.push(build_video_format_param(spec, Some((modifiers, fixated)))?);
+    }
+    params.push(build_video_format_param(spec, None)?);
+    Ok(params)
+}
 
 fn build_video_format_param(
     spec: &StreamSpec,
+    modifiers: Option<(&[DrmModifier], bool)>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let max_framerate = Fraction {
         num: spec.framerate.max(1),
         denom: 1,
     };
-    let preferred_framerate = Fraction {
-        num: spec.framerate.max(1).min(60),
-        denom: 1,
-    };
+    let mut properties = vec![
+        Property::new(
+            spa_sys::SPA_FORMAT_mediaType,
+            Value::Id(Id(spa_sys::SPA_MEDIA_TYPE_video)),
+        ),
+        Property::new(
+            spa_sys::SPA_FORMAT_mediaSubtype,
+            Value::Id(Id(spa_sys::SPA_MEDIA_SUBTYPE_raw)),
+        ),
+        Property::new(
+            spa_sys::SPA_FORMAT_VIDEO_format,
+            Value::Id(Id(spa_sys::SPA_VIDEO_FORMAT_BGRx)),
+        ),
+    ];
+    if let Some((modifiers, fixated)) = modifiers
+        && let Some(default) = modifiers.first()
+    {
+        if fixated {
+            properties.push(Property {
+                key: spa_sys::SPA_FORMAT_VIDEO_modifier,
+                flags: PropertyFlags::MANDATORY,
+                value: Value::Long(u64::from(*default) as i64),
+            });
+        } else {
+            properties.push(Property {
+                key: spa_sys::SPA_FORMAT_VIDEO_modifier,
+                flags: PropertyFlags::MANDATORY | PropertyFlags::DONT_FIXATE,
+                value: Value::Choice(ChoiceValue::Long(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Enum {
+                        default: u64::from(*default) as i64,
+                        alternatives: modifiers
+                            .iter()
+                            .map(|modifier| u64::from(*modifier) as i64)
+                            .collect(),
+                    },
+                ))),
+            });
+        }
+    }
+    properties.extend([
+        Property::new(
+            spa_sys::SPA_FORMAT_VIDEO_size,
+            Value::Rectangle(Rectangle {
+                width: spec.width,
+                height: spec.height,
+            }),
+        ),
+        Property::new(
+            spa_sys::SPA_FORMAT_VIDEO_framerate,
+            Value::Fraction(Fraction { num: 0, denom: 1 }),
+        ),
+        Property::new(
+            spa_sys::SPA_FORMAT_VIDEO_maxFramerate,
+            Value::Choice(ChoiceValue::Fraction(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Range {
+                    default: max_framerate,
+                    min: Fraction { num: 1, denom: 1 },
+                    max: max_framerate,
+                },
+            ))),
+        ),
+    ]);
     let obj = Value::Object(Object {
         type_: spa_sys::SPA_TYPE_OBJECT_Format,
         id: spa_sys::SPA_PARAM_EnumFormat,
-        properties: vec![
-            Property::new(
-                spa_sys::SPA_FORMAT_mediaType,
-                Value::Id(Id(spa_sys::SPA_MEDIA_TYPE_video)),
-            ),
-            Property::new(
-                spa_sys::SPA_FORMAT_mediaSubtype,
-                Value::Id(Id(spa_sys::SPA_MEDIA_SUBTYPE_raw)),
-            ),
-            Property::new(
-                spa_sys::SPA_FORMAT_VIDEO_format,
-                Value::Id(Id(spa_sys::SPA_VIDEO_FORMAT_BGRx)),
-            ),
-            Property::new(
-                spa_sys::SPA_FORMAT_VIDEO_size,
-                Value::Rectangle(Rectangle {
-                    width: spec.width,
-                    height: spec.height,
-                }),
-            ),
-            Property::new(
-                spa_sys::SPA_FORMAT_VIDEO_framerate,
-                Value::Choice(ChoiceValue::Fraction(Choice(
-                    ChoiceFlags::empty(),
-                    ChoiceEnum::Range {
-                        default: preferred_framerate,
-                        min: Fraction { num: 0, denom: 1 },
-                        max: max_framerate,
-                    },
-                ))),
-            ),
-            Property::new(
-                spa_sys::SPA_FORMAT_VIDEO_maxFramerate,
-                Value::Choice(ChoiceValue::Fraction(Choice(
-                    ChoiceFlags::empty(),
-                    ChoiceEnum::Range {
-                        default: preferred_framerate,
-                        min: Fraction { num: 0, denom: 1 },
-                        max: max_framerate,
-                    },
-                ))),
-            ),
-        ],
+        properties,
     });
     Ok(PodSerializer::serialize(Cursor::new(Vec::new()), &obj)?
         .0
         .into_inner())
+}
+
+struct PipewireModifierParam {
+    modifiers: Vec<DrmModifier>,
+    dont_fixate: bool,
+}
+
+fn parse_pipewire_modifier_param(param: &Pod) -> Option<PipewireModifierParam> {
+    let obj = param.as_object().ok()?;
+    let prop = obj.find_prop(Id(spa_sys::SPA_FORMAT_VIDEO_modifier))?;
+    let dont_fixate = prop.flags().contains(PodPropFlags::DONT_FIXATE);
+    let ptr = NonNull::new(prop.value().as_raw_ptr())?;
+    let value: Value = unsafe { PodDeserializer::deserialize_ptr(ptr).ok()? };
+    let mut modifiers = Vec::new();
+    match value {
+        Value::Long(modifier) => {
+            push_unique_modifier(&mut modifiers, modifier);
+        }
+        Value::Choice(ChoiceValue::Long(Choice(_, choice))) => match choice {
+            ChoiceEnum::None(modifier) => {
+                push_unique_modifier(&mut modifiers, modifier);
+            }
+            ChoiceEnum::Enum {
+                default,
+                alternatives,
+            } => {
+                push_unique_modifier(&mut modifiers, default);
+                for modifier in alternatives {
+                    push_unique_modifier(&mut modifiers, modifier);
+                }
+            }
+            ChoiceEnum::Range { default, .. } | ChoiceEnum::Step { default, .. } => {
+                push_unique_modifier(&mut modifiers, default);
+            }
+            ChoiceEnum::Flags { default, flags } => {
+                push_unique_modifier(&mut modifiers, default);
+                for modifier in flags {
+                    push_unique_modifier(&mut modifiers, modifier);
+                }
+            }
+        },
+        _ => return None,
+    }
+    if modifiers.is_empty() {
+        None
+    } else {
+        Some(PipewireModifierParam {
+            modifiers,
+            dont_fixate,
+        })
+    }
+}
+
+fn push_unique_modifier(modifiers: &mut Vec<DrmModifier>, modifier: i64) {
+    let modifier = DrmModifier::from(modifier as u64);
+    if !modifiers.contains(&modifier) {
+        modifiers.push(modifier);
+    }
 }
 
 fn build_buffers_param(
