@@ -258,7 +258,7 @@ COMPOSITOR.process.service("cliphist-image", {
 });
 
 COMPOSITOR.key.bind("terminal", "Super+T", () => {
-  COMPOSITOR.process.spawn({ command: ["kitty"] });
+  COMPOSITOR.process.spawn({ command: ["rio"] });
 });
 
 COMPOSITOR.key.bind("chrome", "Super+B", () => {
