@@ -909,10 +909,20 @@ pub fn device_added(
         render_formats,
     );
 
+    let supports_fp16 = crate::backend::hdr_pipeline::probe_fp16_render_support(
+        &mut renderer
+    );
+    info!(
+        ?node,
+        supports_fp16,
+        "probed fp16 render target support"
+    );
+
     let backend = BackendData {
         drm_scanner: DrmScanner::new(),
         drm_output_manager,
         renderer,
+        supports_fp16,
         surfaces: HashMap::new(),
     };
     state.tty_backends.insert(node.clone(), backend);
