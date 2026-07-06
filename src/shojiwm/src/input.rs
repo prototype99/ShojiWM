@@ -881,6 +881,18 @@ impl ShojiWM {
                             .as_ref()
                             .map(|(surface, _)| surface.clone());
                         self.focus_window_at_surface(&window, focus_surface.as_ref(), serial);
+
+                        //temporarily move the pointer focus off the client to prevent click passthrough
+                        pointer.motion(
+                            self,
+                            None,
+                            &MotionEvent {
+                                location: pointer.current_location(),
+                                serial,
+                                time: event.time_msec(),
+                            },
+                        );
+
                         pointer.button(
                             self,
                             &ButtonEvent {
@@ -947,6 +959,17 @@ impl ShojiWM {
                             .as_ref()
                             .map(|(surface, _)| surface.clone());
                         self.focus_window_at_surface(&window, focus_surface.as_ref(), serial);
+
+                        //temporarily move the pointer focus off the client to prevent click passthrough
+                        pointer.motion(
+                            self,
+                            None,
+                            &MotionEvent {
+                                location: pointer.current_location(),
+                                serial,
+                                time: event.time_msec(),
+                            },
+                        );
 
                         pointer.button(
                             self,
