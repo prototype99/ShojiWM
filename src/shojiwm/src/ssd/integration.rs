@@ -2008,9 +2008,13 @@ impl ShojiWM {
         &mut self,
         output_name: &str,
     ) -> Result<(), DecorationEvaluationError> {
+        timescope::scope!("ssd refresh_layer_effects_for_output");
         let refresh_started_at = Instant::now();
         let snapshot_started_at = Instant::now();
-        let snapshots = self.snapshot_layers();
+        let snapshots = {
+            timescope::scope!("ssd layer snapshot");
+            self.snapshot_layers()
+        };
         let snapshot_elapsed_ms = snapshot_started_at.elapsed().as_secs_f64() * 1000.0;
         let output_layer_ids = snapshots
             .iter()
@@ -2039,9 +2043,11 @@ impl ShojiWM {
         self.sync_runtime_display_state();
         let sync_elapsed_ms = sync_started_at.elapsed().as_secs_f64() * 1000.0;
         let evaluate_started_at = Instant::now();
-        let evaluation =
+        let evaluation = {
+            timescope::scope!("ssd layer effect evaluate");
             self.decoration_evaluator
-                .evaluate_layer_effects(output_name, &snapshots, now_ms)?;
+                .evaluate_layer_effects(output_name, &snapshots, now_ms)?
+        };
         let evaluate_elapsed_ms = evaluate_started_at.elapsed().as_secs_f64() * 1000.0;
         let apply_started_at = Instant::now();
         self.consume_runtime_display_config(evaluation.display_config.clone());
@@ -2201,6 +2207,7 @@ impl ShojiWM {
         &mut self,
         target_output_name: Option<&str>,
     ) -> Result<(), DecorationEvaluationError> {
+        timescope::scope!("ssd refresh_window_decorations_for_output");
         let refresh_started_at = Instant::now();
         let spike_threshold_ms = animation_spike_threshold_ms();
         let force_runtime_reevaluate =
@@ -2228,12 +2235,21 @@ impl ShojiWM {
         let mut pending_event_config_updates = Vec::new();
         let mut pending_process_config_updates = Vec::new();
         let mut pending_process_actions = Vec::new();
-        self.sync_runtime_display_state();
-        let windows: Vec<Window> = self.space.elements().cloned().collect();
-        let live_window_ids = windows
-            .iter()
-            .map(|window| self.snapshot_window(window).id)
-            .collect::<std::collections::HashSet<_>>();
+        {
+            timescope::scope!("ssd sync runtime display state");
+            self.sync_runtime_display_state();
+        }
+        let windows: Vec<Window> = {
+            timescope::scope!("ssd collect windows");
+            self.space.elements().cloned().collect()
+        };
+        let live_window_ids = {
+            timescope::scope!("ssd collect live window ids");
+            windows
+                .iter()
+                .map(|window| self.snapshot_window(window).id)
+                .collect::<std::collections::HashSet<_>>()
+        };
         let window_count = windows.len();
         let mut rebuilt = 0usize;
         let mut relayout = 0usize;
@@ -2246,521 +2262,419 @@ impl ShojiWM {
         let now_ms = Duration::from(self.clock.now()).as_millis() as u64;
         let closing_active_count = self.closing_window_snapshots.len();
         let removed_windows_started_at = Instant::now();
-        let removed_windows = self
-            .window_decorations
-            .iter()
-            .filter(|(window, _)| !windows.contains(window))
-            .map(|(_, decoration)| {
-                (
-                    decoration.snapshot.id.clone(),
-                    decoration.layout.root.rect,
-                    decoration.visual_transform,
-                    decoration.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (window_id, root_rect, _previous_transform, decoration) in &removed_windows {
-            if self.closing_window_snapshots.contains_key(window_id) {
-                continue;
-            }
+        let removed_windows = {
+            timescope::scope!("ssd collect removed windows");
+            self.window_decorations
+                .iter()
+                .filter(|(window, _)| !windows.contains(window))
+                .map(|(_, decoration)| {
+                    (
+                        decoration.snapshot.id.clone(),
+                        decoration.layout.root.rect,
+                        decoration.visual_transform,
+                        decoration.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        {
+            timescope::scope!("ssd removed windows pass");
+            for (window_id, root_rect, _previous_transform, decoration) in &removed_windows {
+                if self.closing_window_snapshots.contains_key(window_id) {
+                    continue;
+                }
 
-            if !self.promote_window_to_closing_snapshot(window_id, decoration, now_ms)? {
-                self.decoration_evaluator.window_closed(window_id)?;
-                self.windows_ready_for_decoration.remove(window_id);
-                self.runtime_dirty_window_ids.remove(window_id);
-                self.runtime_managed_only_window_ids.remove(window_id);
-                self.snapshot_dirty_window_ids.remove(window_id);
-                self.live_window_snapshots.remove(window_id);
-                self.live_window_snapshot_trackers.remove(window_id);
-                self.pending_decoration_damage.push(*root_rect);
-            } else {
-                promoted_closing = promoted_closing.saturating_add(1);
+                if !self.promote_window_to_closing_snapshot(window_id, decoration, now_ms)? {
+                    self.decoration_evaluator.window_closed(window_id)?;
+                    self.windows_ready_for_decoration.remove(window_id);
+                    self.runtime_dirty_window_ids.remove(window_id);
+                    self.runtime_managed_only_window_ids.remove(window_id);
+                    self.snapshot_dirty_window_ids.remove(window_id);
+                    self.live_window_snapshots.remove(window_id);
+                    self.live_window_snapshot_trackers.remove(window_id);
+                    self.pending_decoration_damage.push(*root_rect);
+                } else {
+                    promoted_closing = promoted_closing.saturating_add(1);
+                }
             }
         }
-        self.window_decorations
-            .retain(|window, _| windows.contains(window));
-        self.window_primary_output_names
-            .retain(|window, _| windows.contains(window));
+        {
+            timescope::scope!("ssd retain live windows");
+            self.window_decorations
+                .retain(|window, _| windows.contains(window));
+            self.window_primary_output_names
+                .retain(|window, _| windows.contains(window));
+        }
         let removed_windows_elapsed_ms =
             removed_windows_started_at.elapsed().as_secs_f64() * 1000.0;
 
         let windows_pass_started_at = Instant::now();
-        for window in windows {
-            let primary_output_name = self.primary_output_name_for_window(&window);
-            let snapshot = self.snapshot_window(&window);
-            let snapshot_id = snapshot.id.clone();
-            let window_was_runtime_dirty = self.runtime_dirty_window_ids.contains(&snapshot_id);
-            let minimize_debug = minimize_debug_enabled();
-            if (runtime_dirty_debug_enabled() || minimize_debug) && window_was_runtime_dirty {
-                let cached_snapshot = self
-                    .window_decorations
-                    .get(&window)
-                    .map(|cached| &cached.snapshot);
-                let cached_state = self.window_decorations.get(&window).map(|cached| {
-                    (
-                        cached.managed_window.idle,
-                        cached.managed_window.visible,
-                        cached.managed_window.interactive,
-                        cached.managed_window_animation_active,
-                        cached.visual_transform.opacity,
-                        cached.static_managed_window.idle,
-                        cached.static_managed_window.visible,
-                        cached.static_visual_transform.opacity,
-                    )
-                });
-                info!(
-                    window_id = %snapshot_id,
-                    title = %snapshot.title,
-                    cached_title = ?cached_snapshot.map(|snapshot| snapshot.title.as_str()),
-                    app_id = ?snapshot.app_id,
-                    cached_app_id = ?cached_snapshot.and_then(|snapshot| snapshot.app_id.as_deref()),
-                    runtime_managed_only = self.runtime_managed_only_window_ids.contains(&snapshot_id),
-                    target_output = ?target_output_name,
-                    cached_state = ?cached_state,
-                    "runtime dirty debug: refresh candidate"
-                );
-            }
-            let should_process = should_process_window_for_refresh(
-                primary_output_name.as_deref(),
-                target_output_name,
-                force_async_asset_refresh,
-                force_output_animation_reevaluate,
-                force_runtime_reevaluate,
-                window_was_runtime_dirty,
-            );
-            if !should_process {
+        {
+            timescope::scope!("ssd windows pass");
+            for window in windows {
+                timescope::scope!("ssd window refresh");
+                let primary_output_name = {
+                    timescope::scope!("ssd window primary output");
+                    self.primary_output_name_for_window(&window)
+                };
+                let snapshot = {
+                    timescope::scope!("ssd window snapshot");
+                    self.snapshot_window(&window)
+                };
+                let snapshot_id = snapshot.id.clone();
+                let window_was_runtime_dirty = {
+                    timescope::scope!("ssd window dirty lookup");
+                    self.runtime_dirty_window_ids.contains(&snapshot_id)
+                };
+                let minimize_debug = minimize_debug_enabled();
                 if (runtime_dirty_debug_enabled() || minimize_debug) && window_was_runtime_dirty {
+                    let cached_snapshot = self
+                        .window_decorations
+                        .get(&window)
+                        .map(|cached| &cached.snapshot);
+                    let cached_state = self.window_decorations.get(&window).map(|cached| {
+                        (
+                            cached.managed_window.idle,
+                            cached.managed_window.visible,
+                            cached.managed_window.interactive,
+                            cached.managed_window_animation_active,
+                            cached.visual_transform.opacity,
+                            cached.static_managed_window.idle,
+                            cached.static_managed_window.visible,
+                            cached.static_visual_transform.opacity,
+                        )
+                    });
                     info!(
                         window_id = %snapshot_id,
                         title = %snapshot.title,
-                        primary_output = ?primary_output_name,
+                        cached_title = ?cached_snapshot.map(|snapshot| snapshot.title.as_str()),
+                        app_id = ?snapshot.app_id,
+                        cached_app_id = ?cached_snapshot.and_then(|snapshot| snapshot.app_id.as_deref()),
+                        runtime_managed_only = self.runtime_managed_only_window_ids.contains(&snapshot_id),
                         target_output = ?target_output_name,
-                        "runtime dirty debug: refresh candidate skipped"
+                        cached_state = ?cached_state,
+                        "runtime dirty debug: refresh candidate"
                     );
                 }
-                continue;
-            }
-            if let Some(primary_output_name) = primary_output_name {
-                self.window_primary_output_names
-                    .insert(window.clone(), primary_output_name);
-            }
-            let (client_rect, client_rect_source) = match self.window_client_rect(&window) {
-                Some(rect) => (rect, "live"),
-                None => {
-                    let cached_client_rect = self
-                        .window_decorations
-                        .get(&window)
-                        .map(|cached| cached.client_rect);
-                    if window_was_runtime_dirty
-                        || force_runtime_reevaluate
-                        || force_output_animation_reevaluate
-                    {
-                        if let Some(rect) = cached_client_rect {
-                            if runtime_dirty_debug_enabled() || minimize_debug {
-                                info!(
-                                    window_id = %snapshot_id,
-                                    title = %snapshot.title,
-                                    cached_client_rect = ?rect,
-                                    window_was_runtime_dirty,
-                                    force_runtime_reevaluate,
-                                    force_output_animation_reevaluate,
-                                    "runtime dirty debug: using cached client rect"
-                                );
-                            }
-                            (rect, "cached")
-                        } else {
-                            if runtime_dirty_debug_enabled() || minimize_debug {
-                                info!(
-                                    window_id = %snapshot_id,
-                                    title = %snapshot.title,
-                                    window_was_runtime_dirty,
-                                    force_runtime_reevaluate,
-                                    force_output_animation_reevaluate,
-                                    "runtime dirty debug: skipped missing live and cached client rect"
-                                );
-                            }
-                            continue;
-                        }
-                    } else {
-                        if runtime_dirty_debug_enabled() || minimize_debug {
-                            info!(
-                                window_id = %snapshot_id,
-                                title = %snapshot.title,
-                                window_was_runtime_dirty,
-                                force_runtime_reevaluate,
-                                force_output_animation_reevaluate,
-                                "runtime dirty debug: skipped missing live client rect"
-                            );
-                        }
-                        continue;
-                    }
-                }
-            };
-            let layout_scale = self.decoration_layout_scale_for_window(&window);
-            let window_raster_scale = self.decoration_raster_scale_for_window(&window);
-            let cached_effective_client_rect = self
-                .window_decorations
-                .get(&window)
-                .map(|cached| {
-                    // Fast path: when the cache is coherent
-                    // (`client_rect_potentially_stale == false`),
-                    // `managed_client_rect_for_state(cached.tree,
-                    // cached.managed_window, _, cached.layout_scale)` is
-                    // *by construction* equal to `cached.client_rect` — the
-                    // function's result for managed windows depends only on
-                    // `(tree, managed_window.rect, scale)`, all of which are
-                    // exactly the inputs the cached rect was derived from,
-                    // and for unmanaged windows the function returns the
-                    // fallback (which `snapshot_changed` would have caught
-                    // separately). Skipping it avoids the up-to-4-iteration
-                    // probe-layout loop per window per redraw, which was
-                    // the dominant CPU cost during heavy client commits
-                    // (ufo-test at 4K@120Hz: ~25% of CPU in the SSD layout
-                    // path).
-                    if !cached.client_rect_potentially_stale
-                        && cached.snapshot.position == snapshot.position
-                    {
-                        return Ok(cached.client_rect);
-                    }
-                    managed_client_rect_for_state(
-                        &cached.tree,
-                        &cached.managed_window,
-                        client_rect,
-                        cached.layout_scale,
+                let should_process = {
+                    timescope::scope!("ssd window process filter");
+                    should_process_window_for_refresh(
+                        primary_output_name.as_deref(),
+                        target_output_name,
+                        force_async_asset_refresh,
+                        force_output_animation_reevaluate,
+                        force_runtime_reevaluate,
+                        window_was_runtime_dirty,
                     )
-                })
-                .transpose()?
-                .unwrap_or(client_rect);
-            let had_cached_decoration = self.window_decorations.contains_key(&window);
-            let runtime_state_changed = self
-                .window_decorations
-                .get(&window)
-                .map(|cached| window_snapshot_requires_runtime_refresh(&cached.snapshot, &snapshot))
-                .unwrap_or(false);
-            let snapshot_changed = self
-                .window_decorations
-                .get(&window)
-                .map(|cached| window_snapshot_requires_rebuild(&cached.snapshot, &snapshot))
-                .unwrap_or(true);
-
-            let runtime_dirty = force_runtime_reevaluate
-                || force_output_animation_reevaluate
-                || runtime_state_changed
-                || window_was_runtime_dirty;
-            let force_full_cached_reevaluation = force_runtime_reevaluate
-                || (window_was_runtime_dirty
-                    && !self.runtime_managed_only_window_ids.contains(&snapshot_id));
-            if (runtime_dirty_debug_enabled() || minimize_debug)
-                && (window_was_runtime_dirty || runtime_dirty)
-            {
-                info!(
-                    window_id = %snapshot_id,
-                    title = %snapshot.title,
-                    client_rect_source,
-                    had_cached_decoration,
-                    snapshot_changed,
-                    runtime_dirty,
-                    runtime_state_changed,
-                    window_was_runtime_dirty,
-                    cached_effective_client_rect = ?cached_effective_client_rect,
-                    "runtime dirty debug: refresh branch decision"
-                );
-            }
-            if !had_cached_decoration || snapshot_changed {
-                let started_at = Instant::now();
-                let previous_root = self.window_decorations.get(&window).map(|cached| {
-                    transformed_root_rect(cached.layout.root.rect, cached.visual_transform)
-                });
-                let evaluate_started_at = Instant::now();
-                let mut evaluation = match self
-                    .decoration_evaluator
-                    .evaluate_window(&snapshot, now_ms)
-                {
-                    Ok(evaluation) => evaluation,
-                    Err(error) => {
-                        warn!(
-                            window_id = snapshot.id,
-                            title = snapshot.title,
-                            app_id = snapshot.app_id,
-                            ?error,
-                            "decoration runtime evaluation failed, falling back to static decoration"
+                };
+                if !should_process {
+                    if (runtime_dirty_debug_enabled() || minimize_debug) && window_was_runtime_dirty
+                    {
+                        info!(
+                            window_id = %snapshot_id,
+                            title = %snapshot.title,
+                            primary_output = ?primary_output_name,
+                            target_output = ?target_output_name,
+                            "runtime dirty debug: refresh candidate skipped"
                         );
-                        StaticDecorationEvaluator.evaluate_window(&snapshot, now_ms)?
+                    }
+                    continue;
+                }
+                if let Some(primary_output_name) = primary_output_name {
+                    self.window_primary_output_names
+                        .insert(window.clone(), primary_output_name);
+                }
+                let (client_rect, client_rect_source) = {
+                    timescope::scope!("ssd window client rect");
+                    match self.window_client_rect(&window) {
+                        Some(rect) => (rect, "live"),
+                        None => {
+                            let cached_client_rect = self
+                                .window_decorations
+                                .get(&window)
+                                .map(|cached| cached.client_rect);
+                            if window_was_runtime_dirty
+                                || force_runtime_reevaluate
+                                || force_output_animation_reevaluate
+                            {
+                                if let Some(rect) = cached_client_rect {
+                                    if runtime_dirty_debug_enabled() || minimize_debug {
+                                        info!(
+                                            window_id = %snapshot_id,
+                                            title = %snapshot.title,
+                                            cached_client_rect = ?rect,
+                                            window_was_runtime_dirty,
+                                            force_runtime_reevaluate,
+                                            force_output_animation_reevaluate,
+                                            "runtime dirty debug: using cached client rect"
+                                        );
+                                    }
+                                    (rect, "cached")
+                                } else {
+                                    if runtime_dirty_debug_enabled() || minimize_debug {
+                                        info!(
+                                            window_id = %snapshot_id,
+                                            title = %snapshot.title,
+                                            window_was_runtime_dirty,
+                                            force_runtime_reevaluate,
+                                            force_output_animation_reevaluate,
+                                            "runtime dirty debug: skipped missing live and cached client rect"
+                                        );
+                                    }
+                                    continue;
+                                }
+                            } else {
+                                if runtime_dirty_debug_enabled() || minimize_debug {
+                                    info!(
+                                        window_id = %snapshot_id,
+                                        title = %snapshot.title,
+                                        window_was_runtime_dirty,
+                                        force_runtime_reevaluate,
+                                        force_output_animation_reevaluate,
+                                        "runtime dirty debug: skipped missing live client rect"
+                                    );
+                                }
+                                continue;
+                            }
+                        }
                     }
                 };
-                let evaluate_ms = evaluate_started_at.elapsed().as_secs_f64() * 1000.0;
-                pending_display_config_updates.push(evaluation.display_config.clone());
-                pending_key_binding_config_updates.push(evaluation.key_binding_config.clone());
-                pending_pointer_config_updates.push(evaluation.pointer_config.clone());
-                pending_input_config_updates.push(evaluation.input_config.clone());
-                pending_event_config_updates.push(evaluation.event_config.clone());
-                pending_process_config_updates.push(evaluation.process_config.clone());
-                pending_process_actions.extend(evaluation.process_actions.clone());
-                pre_advance_actions.extend(std::mem::take(&mut evaluation.actions));
-                let tree = DecorationTree::new(evaluation.node);
-                let previous_animation_state =
-                    self.window_decorations.get(&window).and_then(|cached| {
-                        cached.managed_window_animation_active.then(|| {
-                            (
-                                cached.managed_window.clone(),
-                                cached.visual_transform,
-                                cached.last_configured_client_size,
+                let layout_scale = {
+                    timescope::scope!("ssd window layout scale");
+                    self.decoration_layout_scale_for_window(&window)
+                };
+                let window_raster_scale = {
+                    timescope::scope!("ssd window raster scale");
+                    self.decoration_raster_scale_for_window(&window)
+                };
+                let cached_effective_client_rect = {
+                    timescope::scope!("ssd window effective client rect");
+                    self.window_decorations
+                        .get(&window)
+                        .map(|cached| {
+                            // Fast path: when the cache is coherent
+                            // (`client_rect_potentially_stale == false`),
+                            // `managed_client_rect_for_state(cached.tree,
+                            // cached.managed_window, _, cached.layout_scale)` is
+                            // *by construction* equal to `cached.client_rect` — the
+                            // function's result for managed windows depends only on
+                            // `(tree, managed_window.rect, scale)`, all of which are
+                            // exactly the inputs the cached rect was derived from,
+                            // and for unmanaged windows the function returns the
+                            // fallback (which `snapshot_changed` would have caught
+                            // separately). Skipping it avoids the up-to-4-iteration
+                            // probe-layout loop per window per redraw, which was
+                            // the dominant CPU cost during heavy client commits
+                            // (ufo-test at 4K@120Hz: ~25% of CPU in the SSD layout
+                            // path).
+                            if !cached.client_rect_potentially_stale
+                                && cached.snapshot.position == snapshot.position
+                            {
+                                return Ok(cached.client_rect);
+                            }
+                            managed_client_rect_for_state(
+                                &cached.tree,
+                                &cached.managed_window,
+                                client_rect,
+                                cached.layout_scale,
                             )
                         })
-                    });
-                let layout_managed_window = previous_animation_state
-                    .as_ref()
-                    .map(|(managed_window, _, _)| managed_window)
-                    .unwrap_or(&evaluation.managed_window);
-                let layout_client_rect = managed_client_rect_for_state(
-                    &tree,
-                    layout_managed_window,
-                    client_rect,
-                    layout_scale,
-                )?;
-                let layout_started_at = Instant::now();
-                let layout = tree
-                    .layout_for_client_with_scale(layout_client_rect, layout_scale)
-                    .map_err(super::DecorationEvaluationError::Layout)?;
-                let layout_ms = layout_started_at.elapsed().as_secs_f64() * 1000.0;
-                push_damage_pair(
-                    &mut self.pending_decoration_damage,
-                    previous_root,
-                    transformed_root_rect(layout.root.rect, evaluation.transform),
-                );
-                let previous_text_buffers = self
-                    .window_decorations
-                    .get(&window)
-                    .map(|cached| cached.text_buffers.clone())
-                    .unwrap_or_default();
-                let clip_started_at = Instant::now();
-                let shared_edges = build_shared_edge_geometry_map(&layout);
-                let content_clip = content_clip_for_layout(&tree, &layout, &shared_edges);
-                let clip_ms = clip_started_at.elapsed().as_secs_f64() * 1000.0;
-                let order_started_at = Instant::now();
-                let order_map = build_render_order_map(&layout);
-                let order_ms = order_started_at.elapsed().as_secs_f64() * 1000.0;
-                let buffers_started_at = Instant::now();
-                let buffers = build_cached_buffers(&layout, &order_map);
-                let buffers_ms = buffers_started_at.elapsed().as_secs_f64() * 1000.0;
-                let shader_started_at = Instant::now();
-                let mut shader_buffers = build_shader_buffers(&layout, &order_map);
-                let shader_ms = shader_started_at.elapsed().as_secs_f64() * 1000.0;
-                let text_started_at = Instant::now();
-                let text_buffers = build_text_buffers_with_fallback(
-                    &layout,
-                    &order_map,
-                    window_raster_scale,
-                    &mut self.text_rasterizer,
-                    &previous_text_buffers,
-                );
-                let text_ms = text_started_at.elapsed().as_secs_f64() * 1000.0;
-                let icon_started_at = Instant::now();
-                let icon_buffers = build_icon_buffers(
-                    &layout,
-                    &order_map,
-                    window_raster_scale,
-                    &snapshot,
-                    &mut self.icon_rasterizer,
-                );
-                let icon_ms = icon_started_at.elapsed().as_secs_f64() * 1000.0;
-                let finalize_started_at = Instant::now();
-                if let Some(previous) = self.window_decorations.get(&window) {
-                    freeze_manual_shader_buffers(&previous.shader_buffers, &mut shader_buffers);
-                }
-                self.suggested_window_offset = suggested_window_offset(&layout);
-                let finalize_ms = finalize_started_at.elapsed().as_secs_f64() * 1000.0;
-                rebuilt += 1;
-                record_managed_rect_path_event(ManagedRectPathEvent::FullRebuild);
-                if evaluation.managed_window.managed && evaluation.managed_window.rect.is_some() {
-                    managed_rect_apply_window_ids.insert(snapshot.id.clone());
-                }
-                let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
-                debug!(
-                    window_id = snapshot.id,
-                    title = snapshot.title,
-                    text_buffer_count = text_buffers.len(),
-                    elapsed_ms,
-                    "rebuilt window decoration tree"
-                );
-                log_animation_window_refresh_timing(
-                    "rebuild",
-                    &snapshot,
-                    elapsed_ms,
-                    evaluate_ms,
-                    layout_ms,
-                    clip_ms,
-                    order_ms,
-                    buffers_ms,
-                    shader_ms,
-                    text_ms,
-                    icon_ms,
-                    finalize_ms,
-                    0,
-                    None,
-                    None,
-                );
-                log_decoration_refresh("rebuild", &snapshot, layout_client_rect, &layout, &buffers);
-                let caches = self
-                    .window_decorations
-                    .remove(&window)
-                    .map(|cached| {
-                        (
-                            cached.rounded_cache,
-                            cached.shader_cache,
-                            cached.backdrop_cache,
-                            cached.window_effect_cache,
-                        )
-                    })
-                    .unwrap_or_default();
-                let (rounded_cache, shader_cache, backdrop_cache, window_effect_cache) = caches;
-                let static_transform = evaluation.transform;
-                let static_managed = evaluation.managed_window.clone();
-                let (
-                    visual_transform,
-                    managed_window,
-                    managed_window_animation_active,
-                    last_configured_client_size,
-                ) = previous_animation_state
-                    .map(
-                        |(managed_window, visual_transform, last_configured_client_size)| {
-                            (
-                                visual_transform,
-                                managed_window,
-                                true,
-                                last_configured_client_size,
-                            )
-                        },
-                    )
-                    .unwrap_or((static_transform, evaluation.managed_window, false, None));
-                self.window_decorations.insert(
-                    window,
-                    WindowDecorationState {
-                        snapshot,
-                        tree,
-                        layout,
-                        layout_scale,
-                        client_rect: layout_client_rect,
-                        client_rect_potentially_stale: false,
-                        visual_transform,
-                        managed_window,
-                        managed_window_animation_active,
-                        last_configured_client_size,
-                        static_visual_transform: static_transform,
-                        static_managed_window: static_managed,
-                        window_effects: evaluation.window_effects,
-                        content_clip,
-                        buffers,
-                        shader_buffers,
-                        text_buffers,
-                        icon_buffers,
-                        rounded_cache,
-                        shader_cache,
-                        backdrop_cache,
-                        window_effect_cache,
-                    },
-                );
-                self.schedule_redraw();
-                self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
-                animation_active_for_target |= evaluation.next_poll_in_ms == Some(0);
-            } else if let Some(cached) = self.window_decorations.get_mut(&window) {
-                if cached.client_rect != cached_effective_client_rect
-                    && !runtime_dirty
-                    && !force_async_asset_refresh
-                    && cached.client_rect.width == cached_effective_client_rect.width
-                    && cached.client_rect.height == cached_effective_client_rect.height
+                        .transpose()?
+                        .unwrap_or(client_rect)
+                };
+                let had_cached_decoration = {
+                    timescope::scope!("ssd window cache lookup");
+                    self.window_decorations.contains_key(&window)
+                };
+                let (runtime_state_changed, snapshot_changed) = {
+                    timescope::scope!("ssd window snapshot diff");
+                    let runtime_state_changed = self
+                        .window_decorations
+                        .get(&window)
+                        .map(|cached| {
+                            window_snapshot_requires_runtime_refresh(&cached.snapshot, &snapshot)
+                        })
+                        .unwrap_or(false);
+                    let snapshot_changed = self
+                        .window_decorations
+                        .get(&window)
+                        .map(|cached| window_snapshot_requires_rebuild(&cached.snapshot, &snapshot))
+                        .unwrap_or(true);
+                    (runtime_state_changed, snapshot_changed)
+                };
+
+                let runtime_dirty = force_runtime_reevaluate
+                    || force_output_animation_reevaluate
+                    || runtime_state_changed
+                    || window_was_runtime_dirty;
+                let force_full_cached_reevaluation = force_runtime_reevaluate
+                    || (window_was_runtime_dirty
+                        && !self.runtime_managed_only_window_ids.contains(&snapshot_id));
+                if (runtime_dirty_debug_enabled() || minimize_debug)
+                    && (window_was_runtime_dirty || runtime_dirty)
                 {
-                    let previous_root =
-                        transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
-                    let dx = cached_effective_client_rect.x - cached.client_rect.x;
-                    let dy = cached_effective_client_rect.y - cached.client_rect.y;
-                    translate_cached_decoration_position(
-                        cached,
-                        dx,
-                        dy,
-                        cached_effective_client_rect,
+                    info!(
+                        window_id = %snapshot_id,
+                        title = %snapshot.title,
+                        client_rect_source,
+                        had_cached_decoration,
+                        snapshot_changed,
+                        runtime_dirty,
+                        runtime_state_changed,
+                        window_was_runtime_dirty,
+                        cached_effective_client_rect = ?cached_effective_client_rect,
+                        "runtime dirty debug: refresh branch decision"
                     );
-                    cached.snapshot = snapshot;
-                    let next_root =
-                        transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
-                    push_damage_pair(
-                        &mut self.pending_decoration_damage,
-                        Some(previous_root),
-                        next_root,
-                    );
-                    self.schedule_redraw();
-                    record_managed_rect_path_event(ManagedRectPathEvent::RefreshPositionTranslate);
-                } else if cached.client_rect != cached_effective_client_rect
-                    && !runtime_dirty
-                    && !force_async_asset_refresh
-                {
+                }
+                if !had_cached_decoration || snapshot_changed {
                     let started_at = Instant::now();
-                    let finalize_ms = 0.0;
-                    let previous_root =
-                        transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
+                    let previous_root = self.window_decorations.get(&window).map(|cached| {
+                        transformed_root_rect(cached.layout.root.rect, cached.visual_transform)
+                    });
+                    let evaluate_started_at = Instant::now();
+                    let mut evaluation = {
+                        timescope::scope!("ssd window evaluate");
+                        match self.decoration_evaluator.evaluate_window(&snapshot, now_ms) {
+                            Ok(evaluation) => evaluation,
+                            Err(error) => {
+                                warn!(
+                                    window_id = snapshot.id,
+                                    title = snapshot.title,
+                                    app_id = snapshot.app_id,
+                                    ?error,
+                                    "decoration runtime evaluation failed, falling back to static decoration"
+                                );
+                                StaticDecorationEvaluator.evaluate_window(&snapshot, now_ms)?
+                            }
+                        }
+                    };
+                    let evaluate_ms = evaluate_started_at.elapsed().as_secs_f64() * 1000.0;
+                    pending_display_config_updates.push(evaluation.display_config.clone());
+                    pending_key_binding_config_updates.push(evaluation.key_binding_config.clone());
+                    pending_pointer_config_updates.push(evaluation.pointer_config.clone());
+                    pending_input_config_updates.push(evaluation.input_config.clone());
+                    pending_event_config_updates.push(evaluation.event_config.clone());
+                    pending_process_config_updates.push(evaluation.process_config.clone());
+                    pending_process_actions.extend(evaluation.process_actions.clone());
+                    pre_advance_actions.extend(std::mem::take(&mut evaluation.actions));
+                    let tree = DecorationTree::new(evaluation.node);
+                    let previous_animation_state =
+                        self.window_decorations.get(&window).and_then(|cached| {
+                            cached.managed_window_animation_active.then(|| {
+                                (
+                                    cached.managed_window.clone(),
+                                    cached.visual_transform,
+                                    cached.last_configured_client_size,
+                                )
+                            })
+                        });
+                    let layout_managed_window = previous_animation_state
+                        .as_ref()
+                        .map(|(managed_window, _, _)| managed_window)
+                        .unwrap_or(&evaluation.managed_window);
+                    let layout_client_rect = managed_client_rect_for_state(
+                        &tree,
+                        layout_managed_window,
+                        client_rect,
+                        layout_scale,
+                    )?;
                     let layout_started_at = Instant::now();
-                    cached.layout = cached
-                        .tree
-                        .layout_for_client_with_scale(cached_effective_client_rect, layout_scale)
-                        .map_err(super::DecorationEvaluationError::Layout)?;
+                    let layout = {
+                        timescope::scope!("ssd window layout");
+                        tree.layout_for_client_with_scale(layout_client_rect, layout_scale)
+                            .map_err(super::DecorationEvaluationError::Layout)?
+                    };
                     let layout_ms = layout_started_at.elapsed().as_secs_f64() * 1000.0;
-                    cached.layout_scale = layout_scale;
                     push_damage_pair(
                         &mut self.pending_decoration_damage,
-                        Some(previous_root),
-                        transformed_root_rect(cached.layout.root.rect, cached.visual_transform),
+                        previous_root,
+                        transformed_root_rect(layout.root.rect, evaluation.transform),
                     );
-                    cached.client_rect = cached_effective_client_rect;
-                    cached.client_rect_potentially_stale = false;
-                    cached.snapshot = snapshot;
+                    let previous_text_buffers = self
+                        .window_decorations
+                        .get(&window)
+                        .map(|cached| cached.text_buffers.clone())
+                        .unwrap_or_default();
                     let clip_started_at = Instant::now();
-                    let shared_edges = build_shared_edge_geometry_map(&cached.layout);
-                    cached.content_clip =
-                        content_clip_for_layout(&cached.tree, &cached.layout, &shared_edges);
+                    let content_clip = {
+                        timescope::scope!("ssd window clip");
+                        let shared_edges = build_shared_edge_geometry_map(&layout);
+                        content_clip_for_layout(&tree, &layout, &shared_edges)
+                    };
                     let clip_ms = clip_started_at.elapsed().as_secs_f64() * 1000.0;
                     let order_started_at = Instant::now();
-                    let order_map = build_render_order_map(&cached.layout);
+                    let order_map = {
+                        timescope::scope!("ssd window render order");
+                        build_render_order_map(&layout)
+                    };
                     let order_ms = order_started_at.elapsed().as_secs_f64() * 1000.0;
                     let buffers_started_at = Instant::now();
-                    cached.buffers = build_cached_buffers(&cached.layout, &order_map);
+                    let buffers = {
+                        timescope::scope!("ssd window cached buffers");
+                        build_cached_buffers(&layout, &order_map)
+                    };
                     let buffers_ms = buffers_started_at.elapsed().as_secs_f64() * 1000.0;
                     let shader_started_at = Instant::now();
-                    cached.shader_buffers = build_shader_buffers(&cached.layout, &order_map);
+                    let mut shader_buffers = {
+                        timescope::scope!("ssd window shader buffers");
+                        build_shader_buffers(&layout, &order_map)
+                    };
                     let shader_ms = shader_started_at.elapsed().as_secs_f64() * 1000.0;
                     let text_started_at = Instant::now();
-                    let previous_text_buffers = cached.text_buffers.clone();
-                    cached.text_buffers = build_text_buffers_with_fallback(
-                        &cached.layout,
-                        &order_map,
-                        window_raster_scale,
-                        &mut self.text_rasterizer,
-                        &previous_text_buffers,
-                    );
+                    let text_buffers = {
+                        timescope::scope!("ssd window text buffers");
+                        build_text_buffers_with_fallback(
+                            &layout,
+                            &order_map,
+                            window_raster_scale,
+                            &mut self.text_rasterizer,
+                            &previous_text_buffers,
+                        )
+                    };
                     let text_ms = text_started_at.elapsed().as_secs_f64() * 1000.0;
                     let icon_started_at = Instant::now();
-                    cached.icon_buffers = build_icon_buffers(
-                        &cached.layout,
-                        &order_map,
-                        window_raster_scale,
-                        &cached.snapshot,
-                        &mut self.icon_rasterizer,
-                    );
+                    let icon_buffers = {
+                        timescope::scope!("ssd window icon buffers");
+                        build_icon_buffers(
+                            &layout,
+                            &order_map,
+                            window_raster_scale,
+                            &snapshot,
+                            &mut self.icon_rasterizer,
+                        )
+                    };
                     let icon_ms = icon_started_at.elapsed().as_secs_f64() * 1000.0;
-                    self.suggested_window_offset = suggested_window_offset(&cached.layout);
-                    relayout += 1;
+                    let finalize_started_at = Instant::now();
+                    {
+                        timescope::scope!("ssd window finalize rebuild");
+                        if let Some(previous) = self.window_decorations.get(&window) {
+                            freeze_manual_shader_buffers(
+                                &previous.shader_buffers,
+                                &mut shader_buffers,
+                            );
+                        }
+                        self.suggested_window_offset = suggested_window_offset(&layout);
+                    }
+                    let finalize_ms = finalize_started_at.elapsed().as_secs_f64() * 1000.0;
+                    rebuilt += 1;
+                    record_managed_rect_path_event(ManagedRectPathEvent::FullRebuild);
+                    if evaluation.managed_window.managed && evaluation.managed_window.rect.is_some()
+                    {
+                        managed_rect_apply_window_ids.insert(snapshot.id.clone());
+                    }
                     let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
                     debug!(
-                        window_id = cached.snapshot.id,
-                        title = cached.snapshot.title,
-                        text_buffer_count = cached.text_buffers.len(),
+                        window_id = snapshot.id,
+                        title = snapshot.title,
+                        text_buffer_count = text_buffers.len(),
                         elapsed_ms,
-                        "recomputed window decoration layout"
+                        "rebuilt window decoration tree"
                     );
                     log_animation_window_refresh_timing(
-                        "relayout",
-                        &cached.snapshot,
+                        "rebuild",
+                        &snapshot,
                         elapsed_ms,
-                        0.0,
+                        evaluate_ms,
                         layout_ms,
                         clip_ms,
                         order_ms,
@@ -2774,75 +2688,253 @@ impl ShojiWM {
                         None,
                     );
                     log_decoration_refresh(
-                        "relayout",
-                        &cached.snapshot,
-                        cached_effective_client_rect,
-                        &cached.layout,
-                        &cached.buffers,
+                        "rebuild",
+                        &snapshot,
+                        layout_client_rect,
+                        &layout,
+                        &buffers,
+                    );
+                    let caches = self
+                        .window_decorations
+                        .remove(&window)
+                        .map(|cached| {
+                            (
+                                cached.rounded_cache,
+                                cached.shader_cache,
+                                cached.backdrop_cache,
+                                cached.window_effect_cache,
+                            )
+                        })
+                        .unwrap_or_default();
+                    let (rounded_cache, shader_cache, backdrop_cache, window_effect_cache) = caches;
+                    let static_transform = evaluation.transform;
+                    let static_managed = evaluation.managed_window.clone();
+                    let (
+                        visual_transform,
+                        managed_window,
+                        managed_window_animation_active,
+                        last_configured_client_size,
+                    ) = previous_animation_state
+                        .map(
+                            |(managed_window, visual_transform, last_configured_client_size)| {
+                                (
+                                    visual_transform,
+                                    managed_window,
+                                    true,
+                                    last_configured_client_size,
+                                )
+                            },
+                        )
+                        .unwrap_or((static_transform, evaluation.managed_window, false, None));
+                    self.window_decorations.insert(
+                        window,
+                        WindowDecorationState {
+                            snapshot,
+                            tree,
+                            layout,
+                            layout_scale,
+                            client_rect: layout_client_rect,
+                            client_rect_potentially_stale: false,
+                            visual_transform,
+                            managed_window,
+                            managed_window_animation_active,
+                            last_configured_client_size,
+                            static_visual_transform: static_transform,
+                            static_managed_window: static_managed,
+                            window_effects: evaluation.window_effects,
+                            content_clip,
+                            buffers,
+                            shader_buffers,
+                            text_buffers,
+                            icon_buffers,
+                            rounded_cache,
+                            shader_cache,
+                            backdrop_cache,
+                            window_effect_cache,
+                        },
                     );
                     self.schedule_redraw();
-                    record_managed_rect_path_event(ManagedRectPathEvent::RefreshSizeRelayout);
-                } else if runtime_dirty {
-                    let started_at = Instant::now();
-                    let previous_root =
-                        transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
-                    if runtime_dirty_debug_enabled() || minimize_debug {
-                        info!(
-                            window_id = %snapshot_id,
-                            title = %snapshot.title,
-                            cached_title = %cached.snapshot.title,
-                            runtime_state_changed,
-                            window_was_runtime_dirty,
-                            force_runtime_reevaluate,
-                            force_full_cached_reevaluation,
-                            force_output_animation_reevaluate,
-                            force_async_asset_refresh,
-                            client_rect_source,
-                            cached_dynamic_idle = cached.managed_window.idle,
-                            cached_dynamic_visible = cached.managed_window.visible,
-                            cached_dynamic_interactive = cached.managed_window.interactive,
-                            cached_animation_active = cached.managed_window_animation_active,
-                            cached_dynamic_opacity = cached.visual_transform.opacity,
-                            cached_static_idle = cached.static_managed_window.idle,
-                            cached_static_visible = cached.static_managed_window.visible,
-                            cached_static_opacity = cached.static_visual_transform.opacity,
-                            "runtime dirty debug: evaluating cached window"
-                        );
-                    }
-                    let evaluate_started_at = Instant::now();
-                    let mut evaluation = if runtime_state_changed && !force_full_cached_reevaluation
+                    self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
+                    animation_active_for_target |= evaluation.next_poll_in_ms == Some(0);
+                } else if let Some(cached) = self.window_decorations.get_mut(&window) {
+                    if cached.client_rect != cached_effective_client_rect
+                        && !runtime_dirty
+                        && !force_async_asset_refresh
+                        && cached.client_rect.width == cached_effective_client_rect.width
+                        && cached.client_rect.height == cached_effective_client_rect.height
                     {
-                        match self.decoration_evaluator.evaluate_window(&snapshot, now_ms) {
-                            Ok(evaluation) => evaluation.into(),
-                            Err(error) => {
-                                warn!(
-                                    window_id = snapshot.id,
-                                    title = snapshot.title,
-                                    app_id = snapshot.app_id,
-                                    ?error,
-                                    "decoration runtime evaluation failed during runtime state update, falling back to static decoration"
-                                );
-                                StaticDecorationEvaluator
-                                    .evaluate_window(&snapshot, now_ms)?
-                                    .into()
-                            }
+                        let previous_root =
+                            transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
+                        let dx = cached_effective_client_rect.x - cached.client_rect.x;
+                        let dy = cached_effective_client_rect.y - cached.client_rect.y;
+                        translate_cached_decoration_position(
+                            cached,
+                            dx,
+                            dy,
+                            cached_effective_client_rect,
+                        );
+                        cached.snapshot = snapshot;
+                        let next_root =
+                            transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
+                        push_damage_pair(
+                            &mut self.pending_decoration_damage,
+                            Some(previous_root),
+                            next_root,
+                        );
+                        self.schedule_redraw();
+                        record_managed_rect_path_event(
+                            ManagedRectPathEvent::RefreshPositionTranslate,
+                        );
+                    } else if cached.client_rect != cached_effective_client_rect
+                        && !runtime_dirty
+                        && !force_async_asset_refresh
+                    {
+                        let started_at = Instant::now();
+                        let finalize_ms = 0.0;
+                        let previous_root =
+                            transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
+                        let layout_started_at = Instant::now();
+                        cached.layout = {
+                            timescope::scope!("ssd window layout");
+                            cached
+                                .tree
+                                .layout_for_client_with_scale(
+                                    cached_effective_client_rect,
+                                    layout_scale,
+                                )
+                                .map_err(super::DecorationEvaluationError::Layout)?
+                        };
+                        let layout_ms = layout_started_at.elapsed().as_secs_f64() * 1000.0;
+                        cached.layout_scale = layout_scale;
+                        push_damage_pair(
+                            &mut self.pending_decoration_damage,
+                            Some(previous_root),
+                            transformed_root_rect(cached.layout.root.rect, cached.visual_transform),
+                        );
+                        cached.client_rect = cached_effective_client_rect;
+                        cached.client_rect_potentially_stale = false;
+                        cached.snapshot = snapshot;
+                        let clip_started_at = Instant::now();
+                        {
+                            timescope::scope!("ssd window clip");
+                            let shared_edges = build_shared_edge_geometry_map(&cached.layout);
+                            cached.content_clip = content_clip_for_layout(
+                                &cached.tree,
+                                &cached.layout,
+                                &shared_edges,
+                            );
                         }
-                    } else {
-                        match self.decoration_evaluator.evaluate_cached_window(
-                            &snapshot.id,
-                            Some(&snapshot),
-                            now_ms,
-                            force_full_cached_reevaluation,
-                        ) {
-                            Ok(evaluation) => evaluation,
-                            Err(error) => {
-                                warn!(
-                                    window_id = snapshot.id,
-                                    title = snapshot.title,
-                                    app_id = snapshot.app_id,
-                                    ?error,
-                                    "cached decoration runtime evaluation failed during transform update, falling back to full evaluation"
-                                );
+                        let clip_ms = clip_started_at.elapsed().as_secs_f64() * 1000.0;
+                        let order_started_at = Instant::now();
+                        let order_map = {
+                            timescope::scope!("ssd window render order");
+                            build_render_order_map(&cached.layout)
+                        };
+                        let order_ms = order_started_at.elapsed().as_secs_f64() * 1000.0;
+                        let buffers_started_at = Instant::now();
+                        cached.buffers = {
+                            timescope::scope!("ssd window cached buffers");
+                            build_cached_buffers(&cached.layout, &order_map)
+                        };
+                        let buffers_ms = buffers_started_at.elapsed().as_secs_f64() * 1000.0;
+                        let shader_started_at = Instant::now();
+                        cached.shader_buffers = {
+                            timescope::scope!("ssd window shader buffers");
+                            build_shader_buffers(&cached.layout, &order_map)
+                        };
+                        let shader_ms = shader_started_at.elapsed().as_secs_f64() * 1000.0;
+                        let text_started_at = Instant::now();
+                        let previous_text_buffers = cached.text_buffers.clone();
+                        cached.text_buffers = {
+                            timescope::scope!("ssd window text buffers");
+                            build_text_buffers_with_fallback(
+                                &cached.layout,
+                                &order_map,
+                                window_raster_scale,
+                                &mut self.text_rasterizer,
+                                &previous_text_buffers,
+                            )
+                        };
+                        let text_ms = text_started_at.elapsed().as_secs_f64() * 1000.0;
+                        let icon_started_at = Instant::now();
+                        cached.icon_buffers = {
+                            timescope::scope!("ssd window icon buffers");
+                            build_icon_buffers(
+                                &cached.layout,
+                                &order_map,
+                                window_raster_scale,
+                                &cached.snapshot,
+                                &mut self.icon_rasterizer,
+                            )
+                        };
+                        let icon_ms = icon_started_at.elapsed().as_secs_f64() * 1000.0;
+                        self.suggested_window_offset = suggested_window_offset(&cached.layout);
+                        relayout += 1;
+                        let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+                        debug!(
+                            window_id = cached.snapshot.id,
+                            title = cached.snapshot.title,
+                            text_buffer_count = cached.text_buffers.len(),
+                            elapsed_ms,
+                            "recomputed window decoration layout"
+                        );
+                        log_animation_window_refresh_timing(
+                            "relayout",
+                            &cached.snapshot,
+                            elapsed_ms,
+                            0.0,
+                            layout_ms,
+                            clip_ms,
+                            order_ms,
+                            buffers_ms,
+                            shader_ms,
+                            text_ms,
+                            icon_ms,
+                            finalize_ms,
+                            0,
+                            None,
+                            None,
+                        );
+                        log_decoration_refresh(
+                            "relayout",
+                            &cached.snapshot,
+                            cached_effective_client_rect,
+                            &cached.layout,
+                            &cached.buffers,
+                        );
+                        self.schedule_redraw();
+                        record_managed_rect_path_event(ManagedRectPathEvent::RefreshSizeRelayout);
+                    } else if runtime_dirty {
+                        let started_at = Instant::now();
+                        let previous_root =
+                            transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
+                        if runtime_dirty_debug_enabled() || minimize_debug {
+                            info!(
+                                window_id = %snapshot_id,
+                                title = %snapshot.title,
+                                cached_title = %cached.snapshot.title,
+                                runtime_state_changed,
+                                window_was_runtime_dirty,
+                                force_runtime_reevaluate,
+                                force_full_cached_reevaluation,
+                                force_output_animation_reevaluate,
+                                force_async_asset_refresh,
+                                client_rect_source,
+                                cached_dynamic_idle = cached.managed_window.idle,
+                                cached_dynamic_visible = cached.managed_window.visible,
+                                cached_dynamic_interactive = cached.managed_window.interactive,
+                                cached_animation_active = cached.managed_window_animation_active,
+                                cached_dynamic_opacity = cached.visual_transform.opacity,
+                                cached_static_idle = cached.static_managed_window.idle,
+                                cached_static_visible = cached.static_managed_window.visible,
+                                cached_static_opacity = cached.static_visual_transform.opacity,
+                                "runtime dirty debug: evaluating cached window"
+                            );
+                        }
+                        let evaluate_started_at = Instant::now();
+                        let mut evaluation = {
+                            timescope::scope!("ssd window runtime evaluate");
+                            if runtime_state_changed && !force_full_cached_reevaluation {
                                 match self.decoration_evaluator.evaluate_window(&snapshot, now_ms) {
                                     Ok(evaluation) => evaluation.into(),
                                     Err(error) => {
@@ -2851,338 +2943,558 @@ impl ShojiWM {
                                             title = snapshot.title,
                                             app_id = snapshot.app_id,
                                             ?error,
-                                            "decoration runtime evaluation failed during transform update, falling back to static decoration"
+                                            "decoration runtime evaluation failed during runtime state update, falling back to static decoration"
                                         );
                                         StaticDecorationEvaluator
                                             .evaluate_window(&snapshot, now_ms)?
                                             .into()
                                     }
                                 }
+                            } else {
+                                match self.decoration_evaluator.evaluate_cached_window(
+                                    &snapshot.id,
+                                    Some(&snapshot),
+                                    now_ms,
+                                    force_full_cached_reevaluation,
+                                ) {
+                                    Ok(evaluation) => evaluation,
+                                    Err(error) => {
+                                        warn!(
+                                            window_id = snapshot.id,
+                                            title = snapshot.title,
+                                            app_id = snapshot.app_id,
+                                            ?error,
+                                            "cached decoration runtime evaluation failed during transform update, falling back to full evaluation"
+                                        );
+                                        match self
+                                            .decoration_evaluator
+                                            .evaluate_window(&snapshot, now_ms)
+                                        {
+                                            Ok(evaluation) => evaluation.into(),
+                                            Err(error) => {
+                                                warn!(
+                                                    window_id = snapshot.id,
+                                                    title = snapshot.title,
+                                                    app_id = snapshot.app_id,
+                                                    ?error,
+                                                    "decoration runtime evaluation failed during transform update, falling back to static decoration"
+                                                );
+                                                StaticDecorationEvaluator
+                                                    .evaluate_window(&snapshot, now_ms)?
+                                                    .into()
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                        }
-                    };
-                    let evaluate_ms = evaluate_started_at.elapsed().as_secs_f64() * 1000.0;
-                    if runtime_dirty_debug_enabled() || minimize_debug {
-                        info!(
-                            window_id = %snapshot_id,
-                            title = %snapshot.title,
-                            managed_window_only = evaluation.managed_window_only,
-                            dirty_node_ids = ?evaluation.dirty_node_ids,
-                            action_count = evaluation.actions.len(),
-                            action_kinds = ?evaluation
-                                .actions
-                                .iter()
-                                .map(|action| (&action.action, action.channel.as_deref(), action.animation.as_ref().map(|animation| animation.channel.as_str())))
-                                .collect::<Vec<_>>(),
-                            next_idle = evaluation.managed_window.idle,
-                            next_visible = evaluation.managed_window.visible,
-                            next_interactive = evaluation.managed_window.interactive,
-                            next_transform_opacity = evaluation.transform.opacity,
-                            next_poll_in_ms = ?evaluation.next_poll_in_ms,
-                            "runtime dirty debug: cached evaluation result"
-                        );
-                    }
-                    pending_display_config_updates.push(evaluation.display_config.clone());
-                    pending_key_binding_config_updates.push(evaluation.key_binding_config.clone());
-                    pending_pointer_config_updates.push(evaluation.pointer_config.clone());
-                    pending_input_config_updates.push(evaluation.input_config.clone());
-                    pending_event_config_updates.push(evaluation.event_config.clone());
-                    pending_process_config_updates.push(evaluation.process_config.clone());
-                    pending_process_actions.extend(evaluation.process_actions.clone());
-                    pre_advance_actions.extend(std::mem::take(&mut evaluation.actions));
-                    if evaluation.managed_window_only {
-                        if runtime_dirty_debug_enabled() {
+                        };
+                        let evaluate_ms = evaluate_started_at.elapsed().as_secs_f64() * 1000.0;
+                        if runtime_dirty_debug_enabled() || minimize_debug {
                             info!(
                                 window_id = %snapshot_id,
                                 title = %snapshot.title,
-                                cached_title = %cached.snapshot.title,
-                                text_buffers = ?label_debug_enabled().then(|| summarize_text_buffers(&cached.text_buffers)),
-                                "runtime dirty debug: managed-window-only result"
+                                managed_window_only = evaluation.managed_window_only,
+                                dirty_node_ids = ?evaluation.dirty_node_ids,
+                                action_count = evaluation.actions.len(),
+                                action_kinds = ?evaluation
+                                    .actions
+                                    .iter()
+                                    .map(|action| (&action.action, action.channel.as_deref(), action.animation.as_ref().map(|animation| animation.channel.as_str())))
+                                    .collect::<Vec<_>>(),
+                                next_idle = evaluation.managed_window.idle,
+                                next_visible = evaluation.managed_window.visible,
+                                next_interactive = evaluation.managed_window.interactive,
+                                next_transform_opacity = evaluation.transform.opacity,
+                                next_poll_in_ms = ?evaluation.next_poll_in_ms,
+                                "runtime dirty debug: cached evaluation result"
                             );
                         }
+                        pending_display_config_updates.push(evaluation.display_config.clone());
+                        pending_key_binding_config_updates
+                            .push(evaluation.key_binding_config.clone());
+                        pending_pointer_config_updates.push(evaluation.pointer_config.clone());
+                        pending_input_config_updates.push(evaluation.input_config.clone());
+                        pending_event_config_updates.push(evaluation.event_config.clone());
+                        pending_process_config_updates.push(evaluation.process_config.clone());
+                        pending_process_actions.extend(evaluation.process_actions.clone());
+                        pre_advance_actions.extend(std::mem::take(&mut evaluation.actions));
+                        if evaluation.managed_window_only {
+                            if runtime_dirty_debug_enabled() {
+                                info!(
+                                    window_id = %snapshot_id,
+                                    title = %snapshot.title,
+                                    cached_title = %cached.snapshot.title,
+                                    text_buffers = ?label_debug_enabled().then(|| summarize_text_buffers(&cached.text_buffers)),
+                                    "runtime dirty debug: managed-window-only result"
+                                );
+                            }
 
-                        let has_active_animation = cached.managed_window_animation_active;
+                            let has_active_animation = cached.managed_window_animation_active;
 
-                        let next_managed_window = evaluation.managed_window;
-                        let next_transform = evaluation.transform;
-                        let previous_dynamic_rect = cached.managed_window.rect;
-                        let previous_static_rect = cached.static_managed_window.rect;
-                        let previous_transform = cached.visual_transform;
-                        let previous_static_transform = cached.static_visual_transform;
+                            let next_managed_window = evaluation.managed_window;
+                            let next_transform = evaluation.transform;
+                            let previous_dynamic_rect = cached.managed_window.rect;
+                            let previous_static_rect = cached.static_managed_window.rect;
+                            let previous_transform = cached.visual_transform;
+                            let previous_static_transform = cached.static_visual_transform;
 
-                        cached.snapshot = snapshot;
-                        cached.static_managed_window = next_managed_window.clone();
-                        cached.static_visual_transform = next_transform;
-                        cached.window_effects = evaluation.window_effects;
-                        if managed_rect_debug_enabled() {
-                            info!(
-                                window_id = %snapshot_id,
-                                title = %cached.snapshot.title,
-                                has_active_animation,
-                                previous_dynamic_rect = ?previous_dynamic_rect,
-                                previous_static_rect = ?previous_static_rect,
-                                next_static_rect = ?cached.static_managed_window.rect,
-                                dynamic_rect_after_static_update = ?cached.managed_window.rect,
-                                previous_transform_translate_x = previous_transform.translate_x,
-                                previous_transform_translate_y = previous_transform.translate_y,
-                                previous_transform_scale_x = previous_transform.scale_x,
-                                previous_transform_scale_y = previous_transform.scale_y,
-                                previous_transform_opacity = previous_transform.opacity,
-                                previous_static_transform_translate_x = previous_static_transform.translate_x,
-                                previous_static_transform_translate_y = previous_static_transform.translate_y,
-                                next_static_transform_translate_x = cached.static_visual_transform.translate_x,
-                                next_static_transform_translate_y = cached.static_visual_transform.translate_y,
-                                dynamic_transform_translate_x = cached.visual_transform.translate_x,
-                                dynamic_transform_translate_y = cached.visual_transform.translate_y,
-                                "managed rect debug: managed-only state update"
+                            cached.snapshot = snapshot;
+                            cached.static_managed_window = next_managed_window.clone();
+                            cached.static_visual_transform = next_transform;
+                            cached.window_effects = evaluation.window_effects;
+                            if managed_rect_debug_enabled() {
+                                info!(
+                                    window_id = %snapshot_id,
+                                    title = %cached.snapshot.title,
+                                    has_active_animation,
+                                    previous_dynamic_rect = ?previous_dynamic_rect,
+                                    previous_static_rect = ?previous_static_rect,
+                                    next_static_rect = ?cached.static_managed_window.rect,
+                                    dynamic_rect_after_static_update = ?cached.managed_window.rect,
+                                    previous_transform_translate_x = previous_transform.translate_x,
+                                    previous_transform_translate_y = previous_transform.translate_y,
+                                    previous_transform_scale_x = previous_transform.scale_x,
+                                    previous_transform_scale_y = previous_transform.scale_y,
+                                    previous_transform_opacity = previous_transform.opacity,
+                                    previous_static_transform_translate_x = previous_static_transform.translate_x,
+                                    previous_static_transform_translate_y = previous_static_transform.translate_y,
+                                    next_static_transform_translate_x = cached.static_visual_transform.translate_x,
+                                    next_static_transform_translate_y = cached.static_visual_transform.translate_y,
+                                    dynamic_transform_translate_x = cached.visual_transform.translate_x,
+                                    dynamic_transform_translate_y = cached.visual_transform.translate_y,
+                                    "managed rect debug: managed-only state update"
+                                );
+                            }
+
+                            if has_active_animation {
+                                // 重要:
+                                // 現在の cached.managed_window / cached.visual_transform は
+                                // animation が生成した「今フレームの見た目」なので潰さない。
+                                //
+                                // refresh の最後で advance_managed_window_animations(now_ms) が走り、
+                                // static_managed_window / static_visual_transform から
+                                // 正しい animated state を再計算する。
+                                cached.client_rect_potentially_stale = true;
+
+                                runtime_dirty_updates = runtime_dirty_updates.saturating_add(1);
+                                record_managed_rect_path_event(
+                                    ManagedRectPathEvent::RuntimeManagedOnly,
+                                );
+                                managed_rect_apply_window_ids.insert(snapshot_id.clone());
+
+                                self.schedule_redraw();
+                                self.runtime_scheduler_enabled =
+                                    evaluation.next_poll_in_ms.is_some();
+                                animation_active_for_target |=
+                                    evaluation.next_poll_in_ms == Some(0);
+                                processed_runtime_dirty_window_ids.insert(snapshot_id);
+                                continue;
+                            }
+
+                            // animation が無い場合だけ dynamic state も更新する
+                            cached.managed_window = next_managed_window;
+                            cached.visual_transform = next_transform;
+                            if managed_rect_debug_enabled() {
+                                info!(
+                                    window_id = %snapshot_id,
+                                    title = %cached.snapshot.title,
+                                    dynamic_rect_after_update = ?cached.managed_window.rect,
+                                    dynamic_transform_translate_x = cached.visual_transform.translate_x,
+                                    dynamic_transform_translate_y = cached.visual_transform.translate_y,
+                                    dynamic_transform_scale_x = cached.visual_transform.scale_x,
+                                    dynamic_transform_scale_y = cached.visual_transform.scale_y,
+                                    dynamic_transform_opacity = cached.visual_transform.opacity,
+                                    "managed rect debug: managed-only dynamic committed"
+                                );
+                            }
+
+                            let next_root = transformed_root_rect(
+                                cached.layout.root.rect,
+                                cached.visual_transform,
                             );
-                        }
-
-                        if has_active_animation {
-                            // 重要:
-                            // 現在の cached.managed_window / cached.visual_transform は
-                            // animation が生成した「今フレームの見た目」なので潰さない。
-                            //
-                            // refresh の最後で advance_managed_window_animations(now_ms) が走り、
-                            // static_managed_window / static_visual_transform から
-                            // 正しい animated state を再計算する。
-                            cached.client_rect_potentially_stale = true;
-
+                            push_damage_pair(
+                                &mut self.pending_decoration_damage,
+                                Some(previous_root),
+                                next_root,
+                            );
+                            let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+                            log_animation_window_refresh_timing(
+                                "managed-window-only",
+                                &cached.snapshot,
+                                elapsed_ms,
+                                evaluate_ms,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0,
+                                Some(false),
+                                Some(true),
+                            );
                             runtime_dirty_updates = runtime_dirty_updates.saturating_add(1);
                             record_managed_rect_path_event(
                                 ManagedRectPathEvent::RuntimeManagedOnly,
                             );
                             managed_rect_apply_window_ids.insert(snapshot_id.clone());
-
+                            cached.client_rect_potentially_stale = false;
                             self.schedule_redraw();
                             self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
                             animation_active_for_target |= evaluation.next_poll_in_ms == Some(0);
                             processed_runtime_dirty_window_ids.insert(snapshot_id);
                             continue;
                         }
-
-                        // animation が無い場合だけ dynamic state も更新する
-                        cached.managed_window = next_managed_window;
-                        cached.visual_transform = next_transform;
-                        if managed_rect_debug_enabled() {
+                        let previous_transform = cached.visual_transform;
+                        let previous_layout = cached.layout.clone();
+                        let previous_buffers = cached.buffers.clone();
+                        let previous_shader_buffers = cached.shader_buffers.clone();
+                        let previous_text_buffers = cached.text_buffers.clone();
+                        let previous_icon_buffers = cached.icon_buffers.clone();
+                        let rebuild_started_at = Instant::now();
+                        let Some(evaluation_node) = evaluation.node else {
+                            return Err(DecorationEvaluationError::RuntimeProtocol(
+                                "cached evaluation returned no tree without managedWindowOnly"
+                                    .into(),
+                            ));
+                        };
+                        let next_tree = {
+                            timescope::scope!("ssd window build tree");
+                            DecorationTree::new(evaluation_node)
+                        };
+                        let next_transform = evaluation.transform;
+                        let next_managed_window = evaluation.managed_window;
+                        let next_window_effects = evaluation.window_effects;
+                        let dirty_node_ids = evaluation.dirty_node_ids;
+                        let tree_changed = {
+                            timescope::scope!("ssd window tree diff");
+                            next_tree != cached.tree
+                        };
+                        let label_debug = label_debug_enabled();
+                        let cached_label_summary =
+                            label_debug.then(|| summarize_tree_labels(&cached.tree));
+                        let next_label_summary =
+                            label_debug.then(|| summarize_tree_labels(&next_tree));
+                        let previous_text_summary =
+                            label_debug.then(|| summarize_text_buffers(&previous_text_buffers));
+                        if runtime_dirty_debug_enabled() {
                             info!(
                                 window_id = %snapshot_id,
-                                title = %cached.snapshot.title,
-                                dynamic_rect_after_update = ?cached.managed_window.rect,
-                                dynamic_transform_translate_x = cached.visual_transform.translate_x,
-                                dynamic_transform_translate_y = cached.visual_transform.translate_y,
-                                dynamic_transform_scale_x = cached.visual_transform.scale_x,
-                                dynamic_transform_scale_y = cached.visual_transform.scale_y,
-                                dynamic_transform_opacity = cached.visual_transform.opacity,
-                                "managed rect debug: managed-only dynamic committed"
+                                title = %snapshot.title,
+                                cached_title = %cached.snapshot.title,
+                                tree_changed,
+                                dirty_node_count = dirty_node_ids.len(),
+                                dirty_node_ids = ?dirty_node_ids,
+                                previous_text_count = previous_text_buffers.len(),
+                                cached_labels = ?cached_label_summary,
+                                next_labels = ?next_label_summary,
+                                previous_text_buffers = ?previous_text_summary,
+                                "runtime dirty debug: tree result"
                             );
                         }
+                        let mut layout_equivalent_state = None;
+                        cached.snapshot = snapshot;
+                        cached.static_managed_window = next_managed_window.clone();
 
-                        let next_root =
-                            transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
-                        push_damage_pair(
-                            &mut self.pending_decoration_damage,
-                            Some(previous_root),
-                            next_root,
-                        );
-                        let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
-                        log_animation_window_refresh_timing(
-                            "managed-window-only",
-                            &cached.snapshot,
-                            elapsed_ms,
-                            evaluate_ms,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0,
-                            Some(false),
-                            Some(true),
-                        );
-                        runtime_dirty_updates = runtime_dirty_updates.saturating_add(1);
-                        record_managed_rect_path_event(ManagedRectPathEvent::RuntimeManagedOnly);
-                        managed_rect_apply_window_ids.insert(snapshot_id.clone());
-                        cached.client_rect_potentially_stale = false;
-                        self.schedule_redraw();
-                        self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
-                        animation_active_for_target |= evaluation.next_poll_in_ms == Some(0);
-                        processed_runtime_dirty_window_ids.insert(snapshot_id);
-                        continue;
-                    }
-                    let previous_transform = cached.visual_transform;
-                    let previous_layout = cached.layout.clone();
-                    let previous_buffers = cached.buffers.clone();
-                    let previous_shader_buffers = cached.shader_buffers.clone();
-                    let previous_text_buffers = cached.text_buffers.clone();
-                    let previous_icon_buffers = cached.icon_buffers.clone();
-                    let rebuild_started_at = Instant::now();
-                    let Some(evaluation_node) = evaluation.node else {
-                        return Err(DecorationEvaluationError::RuntimeProtocol(
-                            "cached evaluation returned no tree without managedWindowOnly".into(),
-                        ));
-                    };
-                    let next_tree = DecorationTree::new(evaluation_node);
-                    let next_transform = evaluation.transform;
-                    let next_managed_window = evaluation.managed_window;
-                    let next_window_effects = evaluation.window_effects;
-                    let dirty_node_ids = evaluation.dirty_node_ids;
-                    let tree_changed = next_tree != cached.tree;
-                    let label_debug = label_debug_enabled();
-                    let cached_label_summary =
-                        label_debug.then(|| summarize_tree_labels(&cached.tree));
-                    let next_label_summary = label_debug.then(|| summarize_tree_labels(&next_tree));
-                    let previous_text_summary =
-                        label_debug.then(|| summarize_text_buffers(&previous_text_buffers));
-                    if runtime_dirty_debug_enabled() {
-                        info!(
-                            window_id = %snapshot_id,
-                            title = %snapshot.title,
-                            cached_title = %cached.snapshot.title,
-                            tree_changed,
-                            dirty_node_count = dirty_node_ids.len(),
-                            dirty_node_ids = ?dirty_node_ids,
-                            previous_text_count = previous_text_buffers.len(),
-                            cached_labels = ?cached_label_summary,
-                            next_labels = ?next_label_summary,
-                            previous_text_buffers = ?previous_text_summary,
-                            "runtime dirty debug: tree result"
-                        );
-                    }
-                    let mut layout_equivalent_state = None;
-                    cached.snapshot = snapshot;
-                    cached.static_managed_window = next_managed_window.clone();
+                        let has_active_animation = cached.managed_window_animation_active;
 
-                    let has_active_animation = cached.managed_window_animation_active;
-
-                    if !has_active_animation {
-                        cached.managed_window = next_managed_window;
-                    }
-                    cached.window_effects = next_window_effects;
-
-                    if !tree_changed {
                         if !has_active_animation {
-                            cached.visual_transform = next_transform;
+                            cached.managed_window = next_managed_window;
                         }
-                        cached.static_visual_transform = next_transform;
-                    } else {
-                        let layout_equivalent = cached.tree.root.layout_equivalent(&next_tree.root);
-                        layout_equivalent_state = Some(layout_equivalent);
-                        cached.tree = next_tree;
-                        if layout_equivalent {
-                            reapply_tree_preserving_layout(
-                                &mut cached.layout.root,
-                                &cached.tree.root,
-                                None,
-                                cached.layout_scale,
-                            );
-                            cached.layout.root.sync_root_bounds(cached.layout_scale);
-                            let shared_edges = build_shared_edge_geometry_map(&cached.layout);
-                            cached.content_clip = content_clip_for_layout(
-                                &cached.tree,
-                                &cached.layout,
-                                &shared_edges,
-                            );
-                            let order_map = build_render_order_map(&cached.layout);
-                            if dirty_node_ids.is_empty() {
-                                cached.buffers = build_cached_buffers(&cached.layout, &order_map);
-                                cached.shader_buffers =
-                                    build_shader_buffers(&cached.layout, &order_map);
-                                freeze_manual_shader_buffers(
-                                    &previous_shader_buffers,
-                                    &mut cached.shader_buffers,
-                                );
-                                cached.text_buffers = build_text_buffers_with_fallback(
-                                    &cached.layout,
-                                    &order_map,
-                                    window_raster_scale,
-                                    &mut self.text_rasterizer,
-                                    &previous_text_buffers,
-                                );
-                                cached.icon_buffers = build_icon_buffers(
-                                    &cached.layout,
-                                    &order_map,
-                                    window_raster_scale,
-                                    &cached.snapshot,
-                                    &mut self.icon_rasterizer,
-                                );
-                            } else {
-                                let (rebuilt_buffers, rebuilt_shader_buffers) =
-                                    rebuild_partial_buffers(
-                                        &cached.layout,
-                                        &order_map,
-                                        &dirty_node_ids,
+                        cached.window_effects = next_window_effects;
+
+                        if !tree_changed {
+                            if !has_active_animation {
+                                cached.visual_transform = next_transform;
+                            }
+                            cached.static_visual_transform = next_transform;
+                        } else {
+                            let layout_equivalent = {
+                                timescope::scope!("ssd window layout equivalent");
+                                cached.tree.root.layout_equivalent(&next_tree.root)
+                            };
+                            layout_equivalent_state = Some(layout_equivalent);
+                            cached.tree = next_tree;
+                            if layout_equivalent {
+                                {
+                                    timescope::scope!("ssd window reapply tree layout");
+                                    reapply_tree_preserving_layout(
+                                        &mut cached.layout.root,
+                                        &cached.tree.root,
+                                        None,
+                                        cached.layout_scale,
                                     );
-                                let mut merged_shader_buffers = merge_shader_buffers(
-                                    &previous_shader_buffers,
-                                    rebuilt_shader_buffers,
-                                    &dirty_node_ids,
-                                );
-                                freeze_manual_shader_buffers(
-                                    &previous_shader_buffers,
-                                    &mut merged_shader_buffers,
-                                );
-                                cached.buffers = merge_cached_buffers(
-                                    &previous_buffers,
-                                    rebuilt_buffers,
-                                    &dirty_node_ids,
-                                );
-                                cached.shader_buffers = merged_shader_buffers;
-                                cached.text_buffers = merge_text_buffers(
-                                    &previous_text_buffers,
-                                    rebuild_partial_text_buffers_with_fallback(
+                                    cached.layout.root.sync_root_bounds(cached.layout_scale);
+                                }
+                                {
+                                    timescope::scope!("ssd window clip");
+                                    let shared_edges =
+                                        build_shared_edge_geometry_map(&cached.layout);
+                                    cached.content_clip = content_clip_for_layout(
+                                        &cached.tree,
+                                        &cached.layout,
+                                        &shared_edges,
+                                    );
+                                }
+                                let order_map = {
+                                    timescope::scope!("ssd window render order");
+                                    build_render_order_map(&cached.layout)
+                                };
+                                if dirty_node_ids.is_empty() {
+                                    cached.buffers = {
+                                        timescope::scope!("ssd window cached buffers");
+                                        build_cached_buffers(&cached.layout, &order_map)
+                                    };
+                                    cached.shader_buffers = {
+                                        timescope::scope!("ssd window shader buffers");
+                                        build_shader_buffers(&cached.layout, &order_map)
+                                    };
+                                    {
+                                        timescope::scope!("ssd window freeze shader buffers");
+                                        freeze_manual_shader_buffers(
+                                            &previous_shader_buffers,
+                                            &mut cached.shader_buffers,
+                                        );
+                                    }
+                                    cached.text_buffers = {
+                                        timescope::scope!("ssd window text buffers");
+                                        build_text_buffers_with_fallback(
+                                            &cached.layout,
+                                            &order_map,
+                                            window_raster_scale,
+                                            &mut self.text_rasterizer,
+                                            &previous_text_buffers,
+                                        )
+                                    };
+                                    cached.icon_buffers = {
+                                        timescope::scope!("ssd window icon buffers");
+                                        build_icon_buffers(
+                                            &cached.layout,
+                                            &order_map,
+                                            window_raster_scale,
+                                            &cached.snapshot,
+                                            &mut self.icon_rasterizer,
+                                        )
+                                    };
+                                } else {
+                                    let (rebuilt_buffers, rebuilt_shader_buffers) = {
+                                        timescope::scope!("ssd window partial buffers");
+                                        rebuild_partial_buffers(
+                                            &cached.layout,
+                                            &order_map,
+                                            &dirty_node_ids,
+                                        )
+                                    };
+                                    let mut merged_shader_buffers = {
+                                        timescope::scope!("ssd window merge shader buffers");
+                                        merge_shader_buffers(
+                                            &previous_shader_buffers,
+                                            rebuilt_shader_buffers,
+                                            &dirty_node_ids,
+                                        )
+                                    };
+                                    {
+                                        timescope::scope!("ssd window freeze shader buffers");
+                                        freeze_manual_shader_buffers(
+                                            &previous_shader_buffers,
+                                            &mut merged_shader_buffers,
+                                        );
+                                    }
+                                    cached.buffers = {
+                                        timescope::scope!("ssd window merge cached buffers");
+                                        merge_cached_buffers(
+                                            &previous_buffers,
+                                            rebuilt_buffers,
+                                            &dirty_node_ids,
+                                        )
+                                    };
+                                    cached.shader_buffers = merged_shader_buffers;
+                                    cached.text_buffers = {
+                                        timescope::scope!("ssd window partial text buffers");
+                                        merge_text_buffers(
+                                            &previous_text_buffers,
+                                            rebuild_partial_text_buffers_with_fallback(
+                                                &cached.layout,
+                                                &order_map,
+                                                &dirty_node_ids,
+                                                window_raster_scale,
+                                                &mut self.text_rasterizer,
+                                                &previous_text_buffers,
+                                            ),
+                                            &dirty_node_ids,
+                                        )
+                                    };
+                                    cached.icon_buffers = {
+                                        timescope::scope!("ssd window partial icon buffers");
+                                        merge_icon_buffers(
+                                            &previous_icon_buffers,
+                                            rebuild_partial_icon_buffers(
+                                                &cached.layout,
+                                                &order_map,
+                                                &dirty_node_ids,
+                                                window_raster_scale,
+                                                &cached.snapshot,
+                                                &mut self.icon_rasterizer,
+                                            ),
+                                            &dirty_node_ids,
+                                        )
+                                    };
+                                }
+                            } else {
+                                let layout_client_rect = {
+                                    timescope::scope!("ssd window effective client rect");
+                                    managed_client_rect_for_state(
+                                        &cached.tree,
+                                        &cached.managed_window,
+                                        client_rect,
+                                        layout_scale,
+                                    )?
+                                };
+                                cached.layout = {
+                                    timescope::scope!("ssd window layout");
+                                    cached
+                                        .tree
+                                        .layout_for_client_with_scale(
+                                            layout_client_rect,
+                                            layout_scale,
+                                        )
+                                        .map_err(super::DecorationEvaluationError::Layout)?
+                                };
+                                cached.layout_scale = layout_scale;
+                                cached.client_rect = layout_client_rect;
+                                {
+                                    timescope::scope!("ssd window clip");
+                                    let shared_edges =
+                                        build_shared_edge_geometry_map(&cached.layout);
+                                    cached.content_clip = content_clip_for_layout(
+                                        &cached.tree,
+                                        &cached.layout,
+                                        &shared_edges,
+                                    );
+                                }
+                                let order_map = {
+                                    timescope::scope!("ssd window render order");
+                                    build_render_order_map(&cached.layout)
+                                };
+                                cached.buffers = {
+                                    timescope::scope!("ssd window cached buffers");
+                                    build_cached_buffers(&cached.layout, &order_map)
+                                };
+                                cached.shader_buffers = {
+                                    timescope::scope!("ssd window shader buffers");
+                                    build_shader_buffers(&cached.layout, &order_map)
+                                };
+                                {
+                                    timescope::scope!("ssd window freeze shader buffers");
+                                    freeze_manual_shader_buffers(
+                                        &previous_shader_buffers,
+                                        &mut cached.shader_buffers,
+                                    );
+                                }
+                                cached.text_buffers = {
+                                    timescope::scope!("ssd window text buffers");
+                                    build_text_buffers_with_fallback(
                                         &cached.layout,
                                         &order_map,
-                                        &dirty_node_ids,
                                         window_raster_scale,
                                         &mut self.text_rasterizer,
                                         &previous_text_buffers,
-                                    ),
-                                    &dirty_node_ids,
-                                );
-                                cached.icon_buffers = merge_icon_buffers(
-                                    &previous_icon_buffers,
-                                    rebuild_partial_icon_buffers(
+                                    )
+                                };
+                                cached.icon_buffers = {
+                                    timescope::scope!("ssd window icon buffers");
+                                    build_icon_buffers(
                                         &cached.layout,
                                         &order_map,
-                                        &dirty_node_ids,
                                         window_raster_scale,
                                         &cached.snapshot,
                                         &mut self.icon_rasterizer,
-                                    ),
-                                    &dirty_node_ids,
-                                );
+                                    )
+                                };
+                                {
+                                    timescope::scope!("ssd window suggested offset");
+                                    self.suggested_window_offset =
+                                        suggested_window_offset(&cached.layout);
+                                }
                             }
-                        } else {
-                            let layout_client_rect = managed_client_rect_for_state(
-                                &cached.tree,
-                                &cached.managed_window,
-                                client_rect,
-                                layout_scale,
-                            )?;
-                            cached.layout = cached
-                                .tree
-                                .layout_for_client_with_scale(layout_client_rect, layout_scale)
-                                .map_err(super::DecorationEvaluationError::Layout)?;
-                            cached.layout_scale = layout_scale;
-                            cached.client_rect = layout_client_rect;
-                            let shared_edges = build_shared_edge_geometry_map(&cached.layout);
-                            cached.content_clip = content_clip_for_layout(
-                                &cached.tree,
-                                &cached.layout,
-                                &shared_edges,
+                            if !has_active_animation {
+                                cached.visual_transform = next_transform;
+                            }
+                            cached.static_visual_transform = next_transform;
+                        }
+                        let rebuild_ms = rebuild_started_at.elapsed().as_secs_f64() * 1000.0;
+                        let finalize_started_at = Instant::now();
+                        {
+                            timescope::scope!("ssd window runtime dirty damage");
+                            let next_root = transformed_root_rect(
+                                cached.layout.root.rect,
+                                cached.visual_transform,
                             );
+                            if previous_transform != cached.visual_transform
+                                || previous_root != next_root
+                            {
+                                push_damage_pair(
+                                    &mut self.pending_decoration_damage,
+                                    Some(previous_root),
+                                    next_root,
+                                );
+                            } else if !dirty_node_ids.is_empty() {
+                                self.pending_decoration_damage.extend(
+                                    runtime_dirty_node_damage_rects(
+                                        &previous_layout,
+                                        previous_transform,
+                                        &cached.layout,
+                                        cached.visual_transform,
+                                        &dirty_node_ids,
+                                    ),
+                                );
+                            } else {
+                                self.pending_decoration_damage
+                                    .extend(runtime_dirty_damage_rects(
+                                        &previous_buffers,
+                                        &cached.buffers,
+                                        &previous_shader_buffers,
+                                        &cached.shader_buffers,
+                                        &previous_text_buffers,
+                                        &cached.text_buffers,
+                                        &previous_icon_buffers,
+                                        &cached.icon_buffers,
+                                    ));
+                            }
+                        }
+                        let finalize_ms = finalize_started_at.elapsed().as_secs_f64() * 1000.0;
+                        let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+                        debug!(
+                            window_id = cached.snapshot.id,
+                            title = cached.snapshot.title,
+                            text_buffer_count = cached.text_buffers.len(),
+                            elapsed_ms,
+                            "recomputed window decoration tree from runtime dirty state"
+                        );
+                        record_managed_rect_path_event(ManagedRectPathEvent::RuntimeDirty);
+                        managed_rect_apply_window_ids.insert(snapshot_id.clone());
+                        log_animation_window_refresh_timing(
+                            "runtime-dirty",
+                            &cached.snapshot,
+                            elapsed_ms,
+                            evaluate_ms,
+                            rebuild_ms,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            finalize_ms,
+                            dirty_node_ids.len(),
+                            Some(tree_changed),
+                            layout_equivalent_state,
+                        );
+                        if force_async_asset_refresh {
                             let order_map = build_render_order_map(&cached.layout);
-                            cached.buffers = build_cached_buffers(&cached.layout, &order_map);
-                            cached.shader_buffers =
-                                build_shader_buffers(&cached.layout, &order_map);
-                            freeze_manual_shader_buffers(
-                                &previous_shader_buffers,
-                                &mut cached.shader_buffers,
-                            );
+                            let previous_text_buffers = cached.text_buffers.clone();
                             cached.text_buffers = build_text_buffers_with_fallback(
                                 &cached.layout,
                                 &order_map,
@@ -3197,74 +3509,33 @@ impl ShojiWM {
                                 &cached.snapshot,
                                 &mut self.icon_rasterizer,
                             );
-                            self.suggested_window_offset = suggested_window_offset(&cached.layout);
                         }
-                        if !has_active_animation {
-                            cached.visual_transform = next_transform;
+                        if label_debug_enabled() {
+                            info!(
+                                window_id = %cached.snapshot.id,
+                                title = %cached.snapshot.title,
+                                text_buffers = ?summarize_text_buffers(&cached.text_buffers),
+                                "label debug: runtime dirty final text buffers"
+                            );
                         }
-                        cached.static_visual_transform = next_transform;
-                    }
-                    let rebuild_ms = rebuild_started_at.elapsed().as_secs_f64() * 1000.0;
-                    let finalize_started_at = Instant::now();
-                    let next_root =
-                        transformed_root_rect(cached.layout.root.rect, cached.visual_transform);
-                    if previous_transform != cached.visual_transform || previous_root != next_root {
-                        push_damage_pair(
-                            &mut self.pending_decoration_damage,
-                            Some(previous_root),
-                            next_root,
+                        log_decoration_refresh(
+                            "runtime-dirty",
+                            &cached.snapshot,
+                            client_rect,
+                            &cached.layout,
+                            &cached.buffers,
                         );
-                    } else if !dirty_node_ids.is_empty() {
-                        self.pending_decoration_damage
-                            .extend(runtime_dirty_node_damage_rects(
-                                &previous_layout,
-                                previous_transform,
-                                &cached.layout,
-                                cached.visual_transform,
-                                &dirty_node_ids,
-                            ));
-                    } else {
-                        self.pending_decoration_damage
-                            .extend(runtime_dirty_damage_rects(
-                                &previous_buffers,
-                                &cached.buffers,
-                                &previous_shader_buffers,
-                                &cached.shader_buffers,
-                                &previous_text_buffers,
-                                &cached.text_buffers,
-                                &previous_icon_buffers,
-                                &cached.icon_buffers,
-                            ));
-                    }
-                    let finalize_ms = finalize_started_at.elapsed().as_secs_f64() * 1000.0;
-                    let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
-                    debug!(
-                        window_id = cached.snapshot.id,
-                        title = cached.snapshot.title,
-                        text_buffer_count = cached.text_buffers.len(),
-                        elapsed_ms,
-                        "recomputed window decoration tree from runtime dirty state"
-                    );
-                    record_managed_rect_path_event(ManagedRectPathEvent::RuntimeDirty);
-                    managed_rect_apply_window_ids.insert(snapshot_id.clone());
-                    log_animation_window_refresh_timing(
-                        "runtime-dirty",
-                        &cached.snapshot,
-                        elapsed_ms,
-                        evaluate_ms,
-                        rebuild_ms,
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                        finalize_ms,
-                        dirty_node_ids.len(),
-                        Some(tree_changed),
-                        layout_equivalent_state,
-                    );
-                    if force_async_asset_refresh {
+                        runtime_dirty_updates = runtime_dirty_updates.saturating_add(1);
+                        // The runtime-dirty branch swaps `tree` / `managed_window`
+                        // / `layout_scale` but leaves `client_rect` matching the
+                        // *previous* probe-loop result, so the diff check on the
+                        // next refresh has to recompute once to either confirm
+                        // or detect the divergence.
+                        cached.client_rect_potentially_stale = true;
+                        self.schedule_redraw();
+                        self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
+                        animation_active_for_target |= evaluation.next_poll_in_ms == Some(0);
+                    } else if force_async_asset_refresh {
                         let order_map = build_render_order_map(&cached.layout);
                         let previous_text_buffers = cached.text_buffers.clone();
                         cached.text_buffers = build_text_buffers_with_fallback(
@@ -3282,61 +3553,24 @@ impl ShojiWM {
                             &mut self.icon_rasterizer,
                         );
                     }
-                    if label_debug_enabled() {
-                        info!(
-                            window_id = %cached.snapshot.id,
-                            title = %cached.snapshot.title,
-                            text_buffers = ?summarize_text_buffers(&cached.text_buffers),
-                            "label debug: runtime dirty final text buffers"
-                        );
-                    }
-                    log_decoration_refresh(
-                        "runtime-dirty",
-                        &cached.snapshot,
-                        client_rect,
-                        &cached.layout,
-                        &cached.buffers,
-                    );
-                    runtime_dirty_updates = runtime_dirty_updates.saturating_add(1);
-                    // The runtime-dirty branch swaps `tree` / `managed_window`
-                    // / `layout_scale` but leaves `client_rect` matching the
-                    // *previous* probe-loop result, so the diff check on the
-                    // next refresh has to recompute once to either confirm
-                    // or detect the divergence.
-                    cached.client_rect_potentially_stale = true;
-                    self.schedule_redraw();
-                    self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
-                    animation_active_for_target |= evaluation.next_poll_in_ms == Some(0);
-                } else if force_async_asset_refresh {
-                    let order_map = build_render_order_map(&cached.layout);
-                    let previous_text_buffers = cached.text_buffers.clone();
-                    cached.text_buffers = build_text_buffers_with_fallback(
-                        &cached.layout,
-                        &order_map,
-                        window_raster_scale,
-                        &mut self.text_rasterizer,
-                        &previous_text_buffers,
-                    );
-                    cached.icon_buffers = build_icon_buffers(
-                        &cached.layout,
-                        &order_map,
-                        window_raster_scale,
-                        &cached.snapshot,
-                        &mut self.icon_rasterizer,
-                    );
                 }
-            }
-            if window_was_runtime_dirty {
-                processed_runtime_dirty_window_ids.insert(snapshot_id);
+                if window_was_runtime_dirty {
+                    processed_runtime_dirty_window_ids.insert(snapshot_id);
+                }
             }
         }
         let windows_pass_elapsed_ms = windows_pass_started_at.elapsed().as_secs_f64() * 1000.0;
         if !pre_advance_actions.is_empty() {
-            let deferred =
-                self.apply_pre_advance_animation_actions(std::mem::take(&mut pre_advance_actions));
+            let deferred = {
+                timescope::scope!("ssd apply pre-advance actions");
+                self.apply_pre_advance_animation_actions(std::mem::take(&mut pre_advance_actions))
+            };
             pending_window_actions.extend(deferred);
         }
-        managed_rect_apply_window_ids.extend(self.advance_managed_window_animations(now_ms));
+        managed_rect_apply_window_ids.extend({
+            timescope::scope!("ssd advance window animations");
+            self.advance_managed_window_animations(now_ms)
+        });
         if managed_rect_debug_enabled() {
             let mut apply_ids = managed_rect_apply_window_ids
                 .iter()
@@ -3353,56 +3587,344 @@ impl ShojiWM {
                 "managed rect debug: refresh apply batch"
             );
         }
-        self.apply_managed_window_rects(&managed_rect_apply_window_ids);
+        {
+            timescope::scope!("ssd apply managed window rects");
+            self.apply_managed_window_rects(&managed_rect_apply_window_ids);
+        }
 
         let closing_pass_started_at = Instant::now();
-        let closing_dirty_ids = self
-            .closing_window_snapshots
-            .keys()
-            .filter(|window_id| {
-                force_output_animation_reevaluate
-                    || self.runtime_dirty_window_ids.contains(*window_id)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for window_id in closing_dirty_ids {
-            let force_full_cached_reevaluation = self.runtime_dirty_window_ids.contains(&window_id);
-            let closing_raster_scale = self
-                .closing_window_snapshots
-                .get(&window_id)
-                .map(|closing| self.decoration_raster_scale_for_rect(closing.live.rect))
-                .unwrap_or(1);
-            if let Some(closing) = self.closing_window_snapshots.get_mut(&window_id) {
-                let previous_root =
-                    transformed_root_rect(closing.decoration.layout.root.rect, closing.transform);
-                let previous_layout = closing.decoration.layout.clone();
-                let previous_transform = closing.transform;
-                let previous_buffers = closing.decoration.buffers.clone();
-                let previous_shader_buffers = closing.decoration.shader_buffers.clone();
-                let previous_text_buffers = closing.decoration.text_buffers.clone();
-                let previous_icon_buffers = closing.decoration.icon_buffers.clone();
-                let mut evaluation = self.decoration_evaluator.evaluate_cached_window(
-                    &window_id,
-                    None,
-                    now_ms,
-                    force_full_cached_reevaluation,
-                )?;
-                pending_display_config_updates.push(evaluation.display_config.clone());
-                pending_process_config_updates.push(evaluation.process_config.clone());
-                pending_process_actions.extend(evaluation.process_actions.clone());
-                pre_advance_actions.extend(std::mem::take(&mut evaluation.actions));
-                if evaluation.managed_window_only {
+        let closing_dirty_ids = {
+            timescope::scope!("ssd collect closing dirty ids");
+            self.closing_window_snapshots
+                .keys()
+                .filter(|window_id| {
+                    force_output_animation_reevaluate
+                        || self.runtime_dirty_window_ids.contains(*window_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        {
+            timescope::scope!("ssd closing pass");
+            for window_id in closing_dirty_ids {
+                let force_full_cached_reevaluation =
+                    self.runtime_dirty_window_ids.contains(&window_id);
+                let closing_raster_scale = self
+                    .closing_window_snapshots
+                    .get(&window_id)
+                    .map(|closing| self.decoration_raster_scale_for_rect(closing.live.rect))
+                    .unwrap_or(1);
+                if let Some(closing) = self.closing_window_snapshots.get_mut(&window_id) {
+                    let previous_root = transformed_root_rect(
+                        closing.decoration.layout.root.rect,
+                        closing.transform,
+                    );
+                    let previous_layout = closing.decoration.layout.clone();
+                    let previous_transform = closing.transform;
+                    let previous_buffers = closing.decoration.buffers.clone();
+                    let previous_shader_buffers = closing.decoration.shader_buffers.clone();
+                    let previous_text_buffers = closing.decoration.text_buffers.clone();
+                    let previous_icon_buffers = closing.decoration.icon_buffers.clone();
+                    let mut evaluation = {
+                        timescope::scope!("ssd closing runtime evaluate");
+                        self.decoration_evaluator.evaluate_cached_window(
+                            &window_id,
+                            None,
+                            now_ms,
+                            force_full_cached_reevaluation,
+                        )?
+                    };
+                    pending_display_config_updates.push(evaluation.display_config.clone());
+                    pending_process_config_updates.push(evaluation.process_config.clone());
+                    pending_process_actions.extend(evaluation.process_actions.clone());
+                    pre_advance_actions.extend(std::mem::take(&mut evaluation.actions));
+                    if evaluation.managed_window_only {
+                        let has_active_animation =
+                            closing.decoration.managed_window_animation_active;
+                        let next_managed_window = evaluation.managed_window;
+                        let next_transform = evaluation.transform;
+
+                        closing.decoration.static_managed_window = next_managed_window.clone();
+                        closing.decoration.static_visual_transform = next_transform;
+                        closing.decoration.window_effects = evaluation.window_effects;
+                        if !has_active_animation {
+                            closing.decoration.managed_window = next_managed_window;
+                            closing.decoration.visual_transform = next_transform;
+                            closing.transform = next_transform;
+                        }
+                        if closing.decoration.managed_window.managed
+                            && let Some(desired_root) = closing.decoration.managed_window.rect
+                        {
+                            let desired_root = managed_rect_snapshot_to_logical_rect(desired_root);
+                            if desired_root.width > 0 && desired_root.height > 0 {
+                                let desired_client = managed_client_rect_for_root(
+                                    &closing.decoration.tree,
+                                    desired_root,
+                                    closing.decoration.layout_scale,
+                                )?;
+                                let position_changed = desired_client.x
+                                    != closing.decoration.client_rect.x
+                                    || desired_client.y != closing.decoration.client_rect.y;
+                                let size_changed = desired_client.width
+                                    != closing.decoration.client_rect.width
+                                    || desired_client.height
+                                        != closing.decoration.client_rect.height;
+                                if size_changed {
+                                    let layout = closing
+                                        .decoration
+                                        .tree
+                                        .layout_for_client_with_scale(
+                                            desired_client,
+                                            closing.decoration.layout_scale,
+                                        )
+                                        .map_err(super::DecorationEvaluationError::Layout)?;
+                                    let shared_edges = build_shared_edge_geometry_map(&layout);
+                                    let content_clip = content_clip_for_layout(
+                                        &closing.decoration.tree,
+                                        &layout,
+                                        &shared_edges,
+                                    );
+                                    let order_map = build_render_order_map(&layout);
+                                    closing.decoration.layout = layout;
+                                    closing.decoration.content_clip = content_clip;
+                                    closing.decoration.client_rect = desired_client;
+                                    closing.decoration.snapshot.position = WindowPositionSnapshot {
+                                        x: desired_client.x,
+                                        y: desired_client.y,
+                                        width: desired_client.width,
+                                        height: desired_client.height,
+                                    };
+                                    closing.decoration.buffers = build_cached_buffers(
+                                        &closing.decoration.layout,
+                                        &order_map,
+                                    );
+                                    closing.decoration.shader_buffers = build_shader_buffers(
+                                        &closing.decoration.layout,
+                                        &order_map,
+                                    );
+                                    freeze_manual_shader_buffers(
+                                        &previous_shader_buffers,
+                                        &mut closing.decoration.shader_buffers,
+                                    );
+                                    closing.decoration.text_buffers =
+                                        build_text_buffers_with_fallback(
+                                            &closing.decoration.layout,
+                                            &order_map,
+                                            closing_raster_scale,
+                                            &mut self.text_rasterizer,
+                                            &previous_text_buffers,
+                                        );
+                                    closing.decoration.icon_buffers = build_icon_buffers(
+                                        &closing.decoration.layout,
+                                        &order_map,
+                                        closing_raster_scale,
+                                        &closing.decoration.snapshot,
+                                        &mut self.icon_rasterizer,
+                                    );
+                                    closing.live.rect = desired_client;
+                                } else if position_changed {
+                                    let dx = desired_client.x - closing.decoration.client_rect.x;
+                                    let dy = desired_client.y - closing.decoration.client_rect.y;
+                                    translate_cached_decoration_position(
+                                        &mut closing.decoration,
+                                        dx,
+                                        dy,
+                                        desired_client,
+                                    );
+                                    closing.live.rect = desired_client;
+                                }
+                            }
+                        }
+                        if !has_active_animation {
+                            closing.transform = next_transform;
+                        }
+                        let next_root = transformed_root_rect(
+                            closing.decoration.layout.root.rect,
+                            closing.transform,
+                        );
+                        push_damage_pair(
+                            &mut self.pending_decoration_damage,
+                            Some(previous_root),
+                            next_root,
+                        );
+                        if evaluation.next_poll_in_ms.is_none()
+                            && closing.transform.opacity <= 0.001
+                        {
+                            pending_finalize_close_damage.push(next_root);
+                            pending_window_actions.push(crate::ssd::RuntimeWindowAction {
+                                window_id: window_id.clone(),
+                                action: crate::ssd::WaylandWindowAction::FinalizeClose,
+                                animation: None,
+                                channel: None,
+                            });
+                        }
+                        self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
+                        self.schedule_redraw();
+                        closing_runtime_updates = closing_runtime_updates.saturating_add(1);
+                        animation_active_for_target |= evaluation.next_poll_in_ms == Some(0);
+                        processed_runtime_dirty_window_ids.insert(window_id);
+                        continue;
+                    }
+                    let Some(evaluation_node) = evaluation.node else {
+                        return Err(DecorationEvaluationError::RuntimeProtocol(
+                            "cached closing evaluation returned no tree without managedWindowOnly"
+                                .into(),
+                        ));
+                    };
+                    let next_tree = DecorationTree::new(evaluation_node);
                     let has_active_animation = closing.decoration.managed_window_animation_active;
                     let next_managed_window = evaluation.managed_window;
                     let next_transform = evaluation.transform;
-
                     closing.decoration.static_managed_window = next_managed_window.clone();
-                    closing.decoration.static_visual_transform = next_transform;
                     closing.decoration.window_effects = evaluation.window_effects;
                     if !has_active_animation {
                         closing.decoration.managed_window = next_managed_window;
-                        closing.decoration.visual_transform = next_transform;
-                        closing.transform = next_transform;
+                    }
+                    let dirty_node_ids = evaluation.dirty_node_ids;
+                    let tree_changed = next_tree != closing.decoration.tree;
+                    if !tree_changed {
+                        if !has_active_animation {
+                            closing.decoration.visual_transform = next_transform;
+                        }
+                        closing.decoration.static_visual_transform = next_transform;
+                    } else {
+                        let layout_equivalent = closing
+                            .decoration
+                            .tree
+                            .root
+                            .layout_equivalent(&next_tree.root);
+                        closing.decoration.tree = next_tree;
+                        if layout_equivalent {
+                            reapply_tree_preserving_layout(
+                                &mut closing.decoration.layout.root,
+                                &closing.decoration.tree.root,
+                                None,
+                                closing.decoration.layout_scale,
+                            );
+                            closing
+                                .decoration
+                                .layout
+                                .root
+                                .sync_root_bounds(closing.decoration.layout_scale);
+                            let shared_edges =
+                                build_shared_edge_geometry_map(&closing.decoration.layout);
+                            closing.decoration.content_clip = content_clip_for_layout(
+                                &closing.decoration.tree,
+                                &closing.decoration.layout,
+                                &shared_edges,
+                            );
+                            let order_map = build_render_order_map(&closing.decoration.layout);
+                            if dirty_node_ids.is_empty() {
+                                closing.decoration.buffers =
+                                    build_cached_buffers(&closing.decoration.layout, &order_map);
+                                closing.decoration.shader_buffers =
+                                    build_shader_buffers(&closing.decoration.layout, &order_map);
+                                closing.decoration.text_buffers = build_text_buffers_with_fallback(
+                                    &closing.decoration.layout,
+                                    &order_map,
+                                    closing_raster_scale,
+                                    &mut self.text_rasterizer,
+                                    &previous_text_buffers,
+                                );
+                                closing.decoration.icon_buffers = build_icon_buffers(
+                                    &closing.decoration.layout,
+                                    &order_map,
+                                    closing_raster_scale,
+                                    &closing.decoration.snapshot,
+                                    &mut self.icon_rasterizer,
+                                );
+                            } else {
+                                let (rebuilt_buffers, rebuilt_shader_buffers) =
+                                    rebuild_partial_buffers(
+                                        &closing.decoration.layout,
+                                        &order_map,
+                                        &dirty_node_ids,
+                                    );
+                                let mut merged_shader_buffers = merge_shader_buffers(
+                                    &previous_shader_buffers,
+                                    rebuilt_shader_buffers,
+                                    &dirty_node_ids,
+                                );
+                                freeze_manual_shader_buffers(
+                                    &previous_shader_buffers,
+                                    &mut merged_shader_buffers,
+                                );
+                                closing.decoration.buffers = merge_cached_buffers(
+                                    &previous_buffers,
+                                    rebuilt_buffers,
+                                    &dirty_node_ids,
+                                );
+                                closing.decoration.shader_buffers = merged_shader_buffers;
+                                closing.decoration.text_buffers = merge_text_buffers(
+                                    &previous_text_buffers,
+                                    rebuild_partial_text_buffers_with_fallback(
+                                        &closing.decoration.layout,
+                                        &order_map,
+                                        &dirty_node_ids,
+                                        closing_raster_scale,
+                                        &mut self.text_rasterizer,
+                                        &previous_text_buffers,
+                                    ),
+                                    &dirty_node_ids,
+                                );
+                                closing.decoration.icon_buffers = merge_icon_buffers(
+                                    &previous_icon_buffers,
+                                    rebuild_partial_icon_buffers(
+                                        &closing.decoration.layout,
+                                        &order_map,
+                                        &dirty_node_ids,
+                                        closing_raster_scale,
+                                        &closing.decoration.snapshot,
+                                        &mut self.icon_rasterizer,
+                                    ),
+                                    &dirty_node_ids,
+                                );
+                            }
+                        } else {
+                            let layout = closing
+                                .decoration
+                                .tree
+                                .layout_for_client_with_scale(
+                                    closing.decoration.client_rect,
+                                    closing.decoration.layout_scale,
+                                )
+                                .map_err(super::DecorationEvaluationError::Layout)?;
+                            let shared_edges = build_shared_edge_geometry_map(&layout);
+                            let content_clip = content_clip_for_layout(
+                                &closing.decoration.tree,
+                                &layout,
+                                &shared_edges,
+                            );
+                            let order_map = build_render_order_map(&layout);
+                            let buffers = build_cached_buffers(&layout, &order_map);
+                            let shader_buffers = build_shader_buffers(&layout, &order_map);
+                            let text_buffers = build_text_buffers_with_fallback(
+                                &layout,
+                                &order_map,
+                                closing_raster_scale,
+                                &mut self.text_rasterizer,
+                                &previous_text_buffers,
+                            );
+                            let icon_buffers = build_icon_buffers(
+                                &layout,
+                                &order_map,
+                                closing_raster_scale,
+                                &closing.decoration.snapshot,
+                                &mut self.icon_rasterizer,
+                            );
+                            closing.decoration.layout = layout;
+                            closing.decoration.content_clip = content_clip;
+                            closing.decoration.buffers = buffers;
+                            closing.decoration.shader_buffers = shader_buffers;
+                            closing.decoration.text_buffers = text_buffers;
+                            closing.decoration.icon_buffers = icon_buffers;
+                            self.suggested_window_offset =
+                                suggested_window_offset(&closing.decoration.layout);
+                        }
+                        if !has_active_animation {
+                            closing.decoration.visual_transform = next_transform;
+                        }
+                        closing.decoration.static_visual_transform = next_transform;
                     }
                     if closing.decoration.managed_window.managed
                         && let Some(desired_root) = closing.decoration.managed_window.rect
@@ -3482,17 +4004,60 @@ impl ShojiWM {
                         }
                     }
                     if !has_active_animation {
+                        closing.decoration.visual_transform = next_transform;
                         closing.transform = next_transform;
                     }
+                    closing.decoration.static_visual_transform = next_transform;
                     let next_root = transformed_root_rect(
                         closing.decoration.layout.root.rect,
                         closing.transform,
                     );
-                    push_damage_pair(
-                        &mut self.pending_decoration_damage,
-                        Some(previous_root),
-                        next_root,
-                    );
+                    if previous_transform != closing.transform || previous_root != next_root {
+                        push_damage_pair(
+                            &mut self.pending_decoration_damage,
+                            Some(previous_root),
+                            next_root,
+                        );
+                    } else if !dirty_node_ids.is_empty() {
+                        self.pending_decoration_damage
+                            .extend(runtime_dirty_node_damage_rects(
+                                &previous_layout,
+                                previous_transform,
+                                &closing.decoration.layout,
+                                closing.transform,
+                                &dirty_node_ids,
+                            ));
+                    } else {
+                        self.pending_decoration_damage
+                            .extend(runtime_dirty_damage_rects(
+                                &previous_buffers,
+                                &closing.decoration.buffers,
+                                &previous_shader_buffers,
+                                &closing.decoration.shader_buffers,
+                                &previous_text_buffers,
+                                &closing.decoration.text_buffers,
+                                &previous_icon_buffers,
+                                &closing.decoration.icon_buffers,
+                            ));
+                    }
+                    if force_async_asset_refresh {
+                        let order_map = build_render_order_map(&closing.decoration.layout);
+                        let previous_text_buffers = closing.decoration.text_buffers.clone();
+                        closing.decoration.text_buffers = build_text_buffers_with_fallback(
+                            &closing.decoration.layout,
+                            &order_map,
+                            closing_raster_scale,
+                            &mut self.text_rasterizer,
+                            &previous_text_buffers,
+                        );
+                        closing.decoration.icon_buffers = build_icon_buffers(
+                            &closing.decoration.layout,
+                            &order_map,
+                            closing_raster_scale,
+                            &closing.decoration.snapshot,
+                            &mut self.icon_rasterizer,
+                        );
+                    }
                     if evaluation.next_poll_in_ms.is_none() && closing.transform.opacity <= 0.001 {
                         pending_finalize_close_damage.push(next_root);
                         pending_window_actions.push(crate::ssd::RuntimeWindowAction {
@@ -3507,311 +4072,7 @@ impl ShojiWM {
                     closing_runtime_updates = closing_runtime_updates.saturating_add(1);
                     animation_active_for_target |= evaluation.next_poll_in_ms == Some(0);
                     processed_runtime_dirty_window_ids.insert(window_id);
-                    continue;
                 }
-                let Some(evaluation_node) = evaluation.node else {
-                    return Err(DecorationEvaluationError::RuntimeProtocol(
-                        "cached closing evaluation returned no tree without managedWindowOnly"
-                            .into(),
-                    ));
-                };
-                let next_tree = DecorationTree::new(evaluation_node);
-                let has_active_animation = closing.decoration.managed_window_animation_active;
-                let next_managed_window = evaluation.managed_window;
-                let next_transform = evaluation.transform;
-                closing.decoration.static_managed_window = next_managed_window.clone();
-                closing.decoration.window_effects = evaluation.window_effects;
-                if !has_active_animation {
-                    closing.decoration.managed_window = next_managed_window;
-                }
-                let dirty_node_ids = evaluation.dirty_node_ids;
-                let tree_changed = next_tree != closing.decoration.tree;
-                if !tree_changed {
-                    if !has_active_animation {
-                        closing.decoration.visual_transform = next_transform;
-                    }
-                    closing.decoration.static_visual_transform = next_transform;
-                } else {
-                    let layout_equivalent = closing
-                        .decoration
-                        .tree
-                        .root
-                        .layout_equivalent(&next_tree.root);
-                    closing.decoration.tree = next_tree;
-                    if layout_equivalent {
-                        reapply_tree_preserving_layout(
-                            &mut closing.decoration.layout.root,
-                            &closing.decoration.tree.root,
-                            None,
-                            closing.decoration.layout_scale,
-                        );
-                        closing
-                            .decoration
-                            .layout
-                            .root
-                            .sync_root_bounds(closing.decoration.layout_scale);
-                        let shared_edges =
-                            build_shared_edge_geometry_map(&closing.decoration.layout);
-                        closing.decoration.content_clip = content_clip_for_layout(
-                            &closing.decoration.tree,
-                            &closing.decoration.layout,
-                            &shared_edges,
-                        );
-                        let order_map = build_render_order_map(&closing.decoration.layout);
-                        if dirty_node_ids.is_empty() {
-                            closing.decoration.buffers =
-                                build_cached_buffers(&closing.decoration.layout, &order_map);
-                            closing.decoration.shader_buffers =
-                                build_shader_buffers(&closing.decoration.layout, &order_map);
-                            closing.decoration.text_buffers = build_text_buffers_with_fallback(
-                                &closing.decoration.layout,
-                                &order_map,
-                                closing_raster_scale,
-                                &mut self.text_rasterizer,
-                                &previous_text_buffers,
-                            );
-                            closing.decoration.icon_buffers = build_icon_buffers(
-                                &closing.decoration.layout,
-                                &order_map,
-                                closing_raster_scale,
-                                &closing.decoration.snapshot,
-                                &mut self.icon_rasterizer,
-                            );
-                        } else {
-                            let (rebuilt_buffers, rebuilt_shader_buffers) = rebuild_partial_buffers(
-                                &closing.decoration.layout,
-                                &order_map,
-                                &dirty_node_ids,
-                            );
-                            let mut merged_shader_buffers = merge_shader_buffers(
-                                &previous_shader_buffers,
-                                rebuilt_shader_buffers,
-                                &dirty_node_ids,
-                            );
-                            freeze_manual_shader_buffers(
-                                &previous_shader_buffers,
-                                &mut merged_shader_buffers,
-                            );
-                            closing.decoration.buffers = merge_cached_buffers(
-                                &previous_buffers,
-                                rebuilt_buffers,
-                                &dirty_node_ids,
-                            );
-                            closing.decoration.shader_buffers = merged_shader_buffers;
-                            closing.decoration.text_buffers = merge_text_buffers(
-                                &previous_text_buffers,
-                                rebuild_partial_text_buffers_with_fallback(
-                                    &closing.decoration.layout,
-                                    &order_map,
-                                    &dirty_node_ids,
-                                    closing_raster_scale,
-                                    &mut self.text_rasterizer,
-                                    &previous_text_buffers,
-                                ),
-                                &dirty_node_ids,
-                            );
-                            closing.decoration.icon_buffers = merge_icon_buffers(
-                                &previous_icon_buffers,
-                                rebuild_partial_icon_buffers(
-                                    &closing.decoration.layout,
-                                    &order_map,
-                                    &dirty_node_ids,
-                                    closing_raster_scale,
-                                    &closing.decoration.snapshot,
-                                    &mut self.icon_rasterizer,
-                                ),
-                                &dirty_node_ids,
-                            );
-                        }
-                    } else {
-                        let layout = closing
-                            .decoration
-                            .tree
-                            .layout_for_client_with_scale(
-                                closing.decoration.client_rect,
-                                closing.decoration.layout_scale,
-                            )
-                            .map_err(super::DecorationEvaluationError::Layout)?;
-                        let shared_edges = build_shared_edge_geometry_map(&layout);
-                        let content_clip = content_clip_for_layout(
-                            &closing.decoration.tree,
-                            &layout,
-                            &shared_edges,
-                        );
-                        let order_map = build_render_order_map(&layout);
-                        let buffers = build_cached_buffers(&layout, &order_map);
-                        let shader_buffers = build_shader_buffers(&layout, &order_map);
-                        let text_buffers = build_text_buffers_with_fallback(
-                            &layout,
-                            &order_map,
-                            closing_raster_scale,
-                            &mut self.text_rasterizer,
-                            &previous_text_buffers,
-                        );
-                        let icon_buffers = build_icon_buffers(
-                            &layout,
-                            &order_map,
-                            closing_raster_scale,
-                            &closing.decoration.snapshot,
-                            &mut self.icon_rasterizer,
-                        );
-                        closing.decoration.layout = layout;
-                        closing.decoration.content_clip = content_clip;
-                        closing.decoration.buffers = buffers;
-                        closing.decoration.shader_buffers = shader_buffers;
-                        closing.decoration.text_buffers = text_buffers;
-                        closing.decoration.icon_buffers = icon_buffers;
-                        self.suggested_window_offset =
-                            suggested_window_offset(&closing.decoration.layout);
-                    }
-                    if !has_active_animation {
-                        closing.decoration.visual_transform = next_transform;
-                    }
-                    closing.decoration.static_visual_transform = next_transform;
-                }
-                if closing.decoration.managed_window.managed
-                    && let Some(desired_root) = closing.decoration.managed_window.rect
-                {
-                    let desired_root = managed_rect_snapshot_to_logical_rect(desired_root);
-                    if desired_root.width > 0 && desired_root.height > 0 {
-                        let desired_client = managed_client_rect_for_root(
-                            &closing.decoration.tree,
-                            desired_root,
-                            closing.decoration.layout_scale,
-                        )?;
-                        let position_changed = desired_client.x != closing.decoration.client_rect.x
-                            || desired_client.y != closing.decoration.client_rect.y;
-                        let size_changed = desired_client.width
-                            != closing.decoration.client_rect.width
-                            || desired_client.height != closing.decoration.client_rect.height;
-                        if size_changed {
-                            let layout = closing
-                                .decoration
-                                .tree
-                                .layout_for_client_with_scale(
-                                    desired_client,
-                                    closing.decoration.layout_scale,
-                                )
-                                .map_err(super::DecorationEvaluationError::Layout)?;
-                            let shared_edges = build_shared_edge_geometry_map(&layout);
-                            let content_clip = content_clip_for_layout(
-                                &closing.decoration.tree,
-                                &layout,
-                                &shared_edges,
-                            );
-                            let order_map = build_render_order_map(&layout);
-                            closing.decoration.layout = layout;
-                            closing.decoration.content_clip = content_clip;
-                            closing.decoration.client_rect = desired_client;
-                            closing.decoration.snapshot.position = WindowPositionSnapshot {
-                                x: desired_client.x,
-                                y: desired_client.y,
-                                width: desired_client.width,
-                                height: desired_client.height,
-                            };
-                            closing.decoration.buffers =
-                                build_cached_buffers(&closing.decoration.layout, &order_map);
-                            closing.decoration.shader_buffers =
-                                build_shader_buffers(&closing.decoration.layout, &order_map);
-                            freeze_manual_shader_buffers(
-                                &previous_shader_buffers,
-                                &mut closing.decoration.shader_buffers,
-                            );
-                            closing.decoration.text_buffers = build_text_buffers_with_fallback(
-                                &closing.decoration.layout,
-                                &order_map,
-                                closing_raster_scale,
-                                &mut self.text_rasterizer,
-                                &previous_text_buffers,
-                            );
-                            closing.decoration.icon_buffers = build_icon_buffers(
-                                &closing.decoration.layout,
-                                &order_map,
-                                closing_raster_scale,
-                                &closing.decoration.snapshot,
-                                &mut self.icon_rasterizer,
-                            );
-                            closing.live.rect = desired_client;
-                        } else if position_changed {
-                            let dx = desired_client.x - closing.decoration.client_rect.x;
-                            let dy = desired_client.y - closing.decoration.client_rect.y;
-                            translate_cached_decoration_position(
-                                &mut closing.decoration,
-                                dx,
-                                dy,
-                                desired_client,
-                            );
-                            closing.live.rect = desired_client;
-                        }
-                    }
-                }
-                if !has_active_animation {
-                    closing.decoration.visual_transform = next_transform;
-                    closing.transform = next_transform;
-                }
-                closing.decoration.static_visual_transform = next_transform;
-                let next_root =
-                    transformed_root_rect(closing.decoration.layout.root.rect, closing.transform);
-                if previous_transform != closing.transform || previous_root != next_root {
-                    push_damage_pair(
-                        &mut self.pending_decoration_damage,
-                        Some(previous_root),
-                        next_root,
-                    );
-                } else if !dirty_node_ids.is_empty() {
-                    self.pending_decoration_damage
-                        .extend(runtime_dirty_node_damage_rects(
-                            &previous_layout,
-                            previous_transform,
-                            &closing.decoration.layout,
-                            closing.transform,
-                            &dirty_node_ids,
-                        ));
-                } else {
-                    self.pending_decoration_damage
-                        .extend(runtime_dirty_damage_rects(
-                            &previous_buffers,
-                            &closing.decoration.buffers,
-                            &previous_shader_buffers,
-                            &closing.decoration.shader_buffers,
-                            &previous_text_buffers,
-                            &closing.decoration.text_buffers,
-                            &previous_icon_buffers,
-                            &closing.decoration.icon_buffers,
-                        ));
-                }
-                if force_async_asset_refresh {
-                    let order_map = build_render_order_map(&closing.decoration.layout);
-                    let previous_text_buffers = closing.decoration.text_buffers.clone();
-                    closing.decoration.text_buffers = build_text_buffers_with_fallback(
-                        &closing.decoration.layout,
-                        &order_map,
-                        closing_raster_scale,
-                        &mut self.text_rasterizer,
-                        &previous_text_buffers,
-                    );
-                    closing.decoration.icon_buffers = build_icon_buffers(
-                        &closing.decoration.layout,
-                        &order_map,
-                        closing_raster_scale,
-                        &closing.decoration.snapshot,
-                        &mut self.icon_rasterizer,
-                    );
-                }
-                if evaluation.next_poll_in_ms.is_none() && closing.transform.opacity <= 0.001 {
-                    pending_finalize_close_damage.push(next_root);
-                    pending_window_actions.push(crate::ssd::RuntimeWindowAction {
-                        window_id: window_id.clone(),
-                        action: crate::ssd::WaylandWindowAction::FinalizeClose,
-                        animation: None,
-                        channel: None,
-                    });
-                }
-                self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
-                self.schedule_redraw();
-                closing_runtime_updates = closing_runtime_updates.saturating_add(1);
-                animation_active_for_target |= evaluation.next_poll_in_ms == Some(0);
-                processed_runtime_dirty_window_ids.insert(window_id);
             }
         }
         let closing_pass_elapsed_ms = closing_pass_started_at.elapsed().as_secs_f64() * 1000.0;
@@ -4058,6 +4319,7 @@ impl ShojiWM {
     }
 
     fn apply_managed_window_rects(&mut self, dirty_window_ids: &std::collections::HashSet<String>) {
+        timescope::scope!("ssd apply managed window rects body");
         if managed_rect_debug_enabled() {
             let mut dirty_ids = dirty_window_ids.iter().cloned().collect::<Vec<_>>();
             dirty_ids.sort();
@@ -4080,24 +4342,26 @@ impl ShojiWM {
                 "managed rect debug: apply start"
             );
         }
-        let windows = self
-            .window_decorations
-            .iter()
-            .filter_map(|(window, decoration)| {
-                let managed = &decoration.managed_window;
-                if !managed.managed {
-                    return None;
-                }
-                if !dirty_window_ids.contains(&decoration.snapshot.id)
-                    && !self
-                        .pending_xdg_state_configure_window_ids
-                        .contains(&decoration.snapshot.id)
-                {
-                    return None;
-                }
-                Some(window.clone())
-            })
-            .collect::<Vec<_>>();
+        let windows = {
+            timescope::scope!("ssd apply managed collect candidates");
+            self.window_decorations
+                .iter()
+                .filter_map(|(window, decoration)| {
+                    let managed = &decoration.managed_window;
+                    if !managed.managed {
+                        return None;
+                    }
+                    if !dirty_window_ids.contains(&decoration.snapshot.id)
+                        && !self
+                            .pending_xdg_state_configure_window_ids
+                            .contains(&decoration.snapshot.id)
+                    {
+                        return None;
+                    }
+                    Some(window.clone())
+                })
+                .collect::<Vec<_>>()
+        };
 
         if managed_rect_debug_enabled() {
             let mut candidate_ids = windows
@@ -4117,6 +4381,7 @@ impl ShojiWM {
         }
 
         for window in windows {
+            timescope::scope!("ssd apply managed window");
             let Some((
                 force_rect_size,
                 tiled,
@@ -4129,6 +4394,7 @@ impl ShojiWM {
                 static_root,
                 last_configured_client_size,
             )) = ({
+                timescope::scope!("ssd apply managed window state");
                 let Some(decoration) = self.window_decorations.get(&window) else {
                     continue;
                 };
@@ -4178,7 +4444,8 @@ impl ShojiWM {
             // SSD layout instead of by stretching a lagging buffer. The
             // visual rect (relocate, SSD layout) still uses the animated
             // `desired_client`; only the size we hand the client deviates.
-            let active_rect_override =
+            let active_rect_override = {
+                timescope::scope!("ssd apply managed active override");
                 self.managed_window_animations
                     .get(&window_id)
                     .is_some_and(|channels| {
@@ -4187,29 +4454,33 @@ impl ShojiWM {
                                 matches!(rect_anim.mode, ManagedWindowAnimationMode::Override)
                             })
                         })
-                    });
+                    })
+            };
 
-            let tiled_state_changed = window.toplevel().is_some_and(|toplevel| {
-                toplevel.with_pending_state(|state| {
-                    let tiled_states = [
-                        xdg_toplevel::State::TiledLeft,
-                        xdg_toplevel::State::TiledRight,
-                        xdg_toplevel::State::TiledTop,
-                        xdg_toplevel::State::TiledBottom,
-                    ];
-                    let was_tiled = tiled_states
-                        .iter()
-                        .all(|state_name| state.states.contains(*state_name));
-                    for state_name in tiled_states {
-                        if tiled {
-                            state.states.set(state_name);
-                        } else {
-                            state.states.unset(state_name);
+            let tiled_state_changed = {
+                timescope::scope!("ssd apply managed tiled state");
+                window.toplevel().is_some_and(|toplevel| {
+                    toplevel.with_pending_state(|state| {
+                        let tiled_states = [
+                            xdg_toplevel::State::TiledLeft,
+                            xdg_toplevel::State::TiledRight,
+                            xdg_toplevel::State::TiledTop,
+                            xdg_toplevel::State::TiledBottom,
+                        ];
+                        let was_tiled = tiled_states
+                            .iter()
+                            .all(|state_name| state.states.contains(*state_name));
+                        for state_name in tiled_states {
+                            if tiled {
+                                state.states.set(state_name);
+                            } else {
+                                state.states.unset(state_name);
+                            }
                         }
-                    }
-                    was_tiled != tiled
+                        was_tiled != tiled
+                    })
                 })
-            });
+            };
 
             if desired_root == current_root && !needs_xdg_state_configure && !tiled_state_changed {
                 record_managed_rect_path_event(ManagedRectPathEvent::ApplyNoop);
@@ -4225,23 +4496,30 @@ impl ShojiWM {
                 continue;
             }
 
-            let root_size_changed = desired_root.width != current_root.width
-                || desired_root.height != current_root.height;
-            let desired_client = if root_size_changed {
-                record_managed_rect_path_event(ManagedRectPathEvent::ApplySizeFast);
-                managed_client_rect_from_current_insets(current_root, current_client, desired_root)
-            } else {
-                let dx = desired_root.x - current_root.x;
-                let dy = desired_root.y - current_root.y;
-                if dx != 0 || dy != 0 {
-                    record_managed_rect_path_event(ManagedRectPathEvent::ApplyPositionFast);
+            let desired_client = {
+                timescope::scope!("ssd apply managed desired client");
+                let root_size_changed = desired_root.width != current_root.width
+                    || desired_root.height != current_root.height;
+                if root_size_changed {
+                    record_managed_rect_path_event(ManagedRectPathEvent::ApplySizeFast);
+                    managed_client_rect_from_current_insets(
+                        current_root,
+                        current_client,
+                        desired_root,
+                    )
+                } else {
+                    let dx = desired_root.x - current_root.x;
+                    let dy = desired_root.y - current_root.y;
+                    if dx != 0 || dy != 0 {
+                        record_managed_rect_path_event(ManagedRectPathEvent::ApplyPositionFast);
+                    }
+                    LogicalRect::new(
+                        current_client.x + dx,
+                        current_client.y + dy,
+                        current_client.width,
+                        current_client.height,
+                    )
                 }
-                LogicalRect::new(
-                    current_client.x + dx,
-                    current_client.y + dy,
-                    current_client.width,
-                    current_client.height,
-                )
             };
 
             if desired_client == current_client
@@ -4307,13 +4585,16 @@ impl ShojiWM {
                 );
             }
 
-            let geometry = window.geometry();
-            let next_location = Point::from((
-                desired_client.x - geometry.loc.x,
-                desired_client.y - geometry.loc.y,
-            ));
-            if self.space.element_location(&window) != Some(next_location) {
-                self.space.relocate_element(&window, next_location);
+            {
+                timescope::scope!("ssd apply managed relocate");
+                let geometry = window.geometry();
+                let next_location = Point::from((
+                    desired_client.x - geometry.loc.x,
+                    desired_client.y - geometry.loc.y,
+                ));
+                if self.space.element_location(&window) != Some(next_location) {
+                    self.space.relocate_element(&window, next_location);
+                }
             }
 
             // Pick the size we'll send to the client. During an active rect
@@ -4321,7 +4602,8 @@ impl ShojiWM {
             // size (computed via the same inset logic as the animated
             // desired_client) so we issue exactly one resize-configure and
             // the buffer doesn't have to chase intermediate sizes.
-            let configure_client_size =
+            let configure_client_size = {
+                timescope::scope!("ssd apply managed configure size");
                 if active_rect_override && let Some(static_root) = static_root {
                     let static_client = managed_client_rect_from_current_insets(
                         current_root,
@@ -4331,7 +4613,8 @@ impl ShojiWM {
                     (static_client.width, static_client.height)
                 } else {
                     (desired_client.width, desired_client.height)
-                };
+                }
+            };
             // Only push a configure when the size actually changes from what
             // the client was last told. `needs_xdg_state_configure` still
             // forces one through for non-size state updates (maximize, etc.).
@@ -4340,6 +4623,7 @@ impl ShojiWM {
                 configure_size_changed || needs_xdg_state_configure || tiled_state_changed;
 
             if should_configure {
+                timescope::scope!("ssd apply managed configure client");
                 if let Some(toplevel) = window.toplevel() {
                     toplevel.with_pending_state(|state| {
                         state.size = Some(Size::from(configure_client_size));
@@ -4371,19 +4655,24 @@ impl ShojiWM {
                 }
             }
             if size_changed {
+                timescope::scope!("ssd apply managed size rebuild");
                 let window_raster_scale = self.decoration_raster_scale_for_window(&window);
                 if force_rect_size
                     && let Some(decoration) = self.window_decorations.get_mut(&window)
                 {
                     let previous_shader_buffers = decoration.shader_buffers.clone();
                     let previous_text_buffers = decoration.text_buffers.clone();
-                    let layout = decoration
-                        .tree
-                        .layout_for_client_with_scale(desired_client, decoration.layout_scale)
-                        .map_err(super::DecorationEvaluationError::Layout)
-                        .ok();
+                    let layout = {
+                        timescope::scope!("ssd apply managed size layout");
+                        decoration
+                            .tree
+                            .layout_for_client_with_scale(desired_client, decoration.layout_scale)
+                            .map_err(super::DecorationEvaluationError::Layout)
+                            .ok()
+                    };
                     if let Some(layout) = layout {
                         let (content_clip, buffers, shader_buffers, text_buffers, icon_buffers) = {
+                            timescope::scope!("ssd apply managed size buffers");
                             let arena = Bump::new();
                             let shared_edges = build_shared_edge_geometry_map_in(&layout, &arena);
                             let content_clip =
@@ -4399,35 +4688,41 @@ impl ShojiWM {
                                 &previous_shader_buffers,
                                 &mut shader_buffers,
                             );
-                            let text_buffers = if text_buffers_need_raster_for_layout(
-                                &layout,
-                                &shared_edges,
-                                &previous_text_buffers,
-                                window_raster_scale,
-                            ) {
-                                build_text_buffers_with_shared_edges(
+                            let text_buffers = {
+                                timescope::scope!("ssd apply managed size text buffers");
+                                if text_buffers_need_raster_for_layout(
                                     &layout,
-                                    &order_map,
                                     &shared_edges,
+                                    &previous_text_buffers,
                                     window_raster_scale,
-                                    &mut self.text_rasterizer,
-                                    &previous_text_buffers,
-                                )
-                            } else {
-                                retarget_text_buffers_with_shared_edges(
+                                ) {
+                                    build_text_buffers_with_shared_edges(
+                                        &layout,
+                                        &order_map,
+                                        &shared_edges,
+                                        window_raster_scale,
+                                        &mut self.text_rasterizer,
+                                        &previous_text_buffers,
+                                    )
+                                } else {
+                                    retarget_text_buffers_with_shared_edges(
+                                        &layout,
+                                        &order_map,
+                                        &shared_edges,
+                                        &previous_text_buffers,
+                                    )
+                                }
+                            };
+                            let icon_buffers = {
+                                timescope::scope!("ssd apply managed size icon buffers");
+                                retarget_icon_buffers_with_shared_edges(
                                     &layout,
                                     &order_map,
                                     &shared_edges,
-                                    &previous_text_buffers,
+                                    &decoration.snapshot,
+                                    &decoration.icon_buffers,
                                 )
                             };
-                            let icon_buffers = retarget_icon_buffers_with_shared_edges(
-                                &layout,
-                                &order_map,
-                                &shared_edges,
-                                &decoration.snapshot,
-                                &decoration.icon_buffers,
-                            );
                             (
                                 content_clip,
                                 buffers,
@@ -4452,6 +4747,7 @@ impl ShojiWM {
                     }
                 }
             } else if position_changed {
+                timescope::scope!("ssd apply managed position update");
                 if let Some(decoration) = self.window_decorations.get_mut(&window) {
                     translate_cached_decoration_position(decoration, dx, dy, desired_client);
                 }
@@ -4957,6 +5253,7 @@ fn managed_client_rect_for_state(
     fallback_client_rect: LogicalRect,
     scale: f64,
 ) -> Result<LogicalRect, DecorationEvaluationError> {
+    timescope::scope!("ssd managed client rect for state");
     if !(managed.managed && managed.force_rect_size) {
         return Ok(fallback_client_rect);
     }
@@ -4996,29 +5293,45 @@ fn managed_client_rect_for_root(
     desired_root: LogicalRect,
     scale: f64,
 ) -> Result<LogicalRect, DecorationEvaluationError> {
+    timescope::scope!("ssd managed client rect for root");
     let mut client_width = desired_root.width.max(1);
     let mut client_height = desired_root.height.max(1);
 
     for _ in 0..4 {
-        let probe_layout = tree
-            .layout_for_client_with_scale(
+        timescope::scope!("ssd managed client rect probe iteration");
+        let probe_layout = {
+            timescope::scope!("ssd managed client rect probe layout");
+            tree.layout_for_client_with_scale(
                 LogicalRect::new(0, 0, client_width, client_height),
                 scale,
             )
-            .map_err(super::DecorationEvaluationError::Layout)?;
-        let shared_edges = build_shared_edge_geometry_map(&probe_layout);
-        let Some(content_clip) = content_clip_for_layout(tree, &probe_layout, &shared_edges) else {
-            return Ok(desired_root);
+            .map_err(super::DecorationEvaluationError::Layout)?
+        };
+        let shared_edges = {
+            timescope::scope!("ssd managed client rect probe shared edges");
+            build_shared_edge_geometry_map(&probe_layout)
+        };
+        let content_clip = {
+            timescope::scope!("ssd managed client rect probe content clip");
+            let Some(content_clip) = content_clip_for_layout(tree, &probe_layout, &shared_edges)
+            else {
+                return Ok(desired_root);
+            };
+            content_clip
         };
 
-        let left = content_clip.rect.loc.x - probe_layout.root.rect.x;
-        let top = content_clip.rect.loc.y - probe_layout.root.rect.y;
-        let right = (probe_layout.root.rect.x + probe_layout.root.rect.width)
-            - (content_clip.rect.loc.x + content_clip.rect.size.w);
-        let bottom = (probe_layout.root.rect.y + probe_layout.root.rect.height)
-            - (content_clip.rect.loc.y + content_clip.rect.size.h);
-        let next_width = (desired_root.width - left - right).max(1);
-        let next_height = (desired_root.height - top - bottom).max(1);
+        let (left, top, next_width, next_height) = {
+            timescope::scope!("ssd managed client rect probe insets");
+            let left = content_clip.rect.loc.x - probe_layout.root.rect.x;
+            let top = content_clip.rect.loc.y - probe_layout.root.rect.y;
+            let right = (probe_layout.root.rect.x + probe_layout.root.rect.width)
+                - (content_clip.rect.loc.x + content_clip.rect.size.w);
+            let bottom = (probe_layout.root.rect.y + probe_layout.root.rect.height)
+                - (content_clip.rect.loc.y + content_clip.rect.size.h);
+            let next_width = (desired_root.width - left - right).max(1);
+            let next_height = (desired_root.height - top - bottom).max(1);
+            (left, top, next_width, next_height)
+        };
 
         if next_width == client_width && next_height == client_height {
             return Ok(LogicalRect::new(
@@ -5033,15 +5346,32 @@ fn managed_client_rect_for_root(
         client_height = next_height;
     }
 
-    let final_layout = tree
-        .layout_for_client_with_scale(LogicalRect::new(0, 0, client_width, client_height), scale)
-        .map_err(super::DecorationEvaluationError::Layout)?;
-    let shared_edges = build_shared_edge_geometry_map(&final_layout);
-    let Some(content_clip) = content_clip_for_layout(tree, &final_layout, &shared_edges) else {
-        return Ok(desired_root);
+    let final_layout = {
+        timescope::scope!("ssd managed client rect final layout");
+        tree.layout_for_client_with_scale(
+            LogicalRect::new(0, 0, client_width, client_height),
+            scale,
+        )
+        .map_err(super::DecorationEvaluationError::Layout)?
     };
-    let left = content_clip.rect.loc.x - final_layout.root.rect.x;
-    let top = content_clip.rect.loc.y - final_layout.root.rect.y;
+    let shared_edges = {
+        timescope::scope!("ssd managed client rect final shared edges");
+        build_shared_edge_geometry_map(&final_layout)
+    };
+    let content_clip = {
+        timescope::scope!("ssd managed client rect final content clip");
+        let Some(content_clip) = content_clip_for_layout(tree, &final_layout, &shared_edges) else {
+            return Ok(desired_root);
+        };
+        content_clip
+    };
+    let (left, top) = {
+        timescope::scope!("ssd managed client rect final insets");
+        (
+            content_clip.rect.loc.x - final_layout.root.rect.x,
+            content_clip.rect.loc.y - final_layout.root.rect.y,
+        )
+    };
 
     Ok(LogicalRect::new(
         desired_root.x + left,

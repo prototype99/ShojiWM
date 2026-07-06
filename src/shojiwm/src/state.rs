@@ -2489,6 +2489,7 @@ impl ShojiWM {
     ) {
         if let Some(update) = update {
             self.fps_counter.set_enabled(update.fps_counter);
+            crate::profiler::set_enabled(update.profile);
         }
     }
 

@@ -8,4 +8,6 @@ use serde::Deserialize;
 pub struct RuntimeDebugConfigUpdate {
     #[serde(default)]
     pub fps_counter: bool,
+    #[serde(default)]
+    pub profile: bool,
 }

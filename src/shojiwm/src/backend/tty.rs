@@ -1715,6 +1715,7 @@ fn render_surface(
     crtc: crtc::Handle,
 ) -> Result<RenderSurfaceOutcome, Box<dyn std::error::Error>> {
     let frame_started_at = Instant::now();
+    timescope::scope!("tty render_surface");
     let spike_threshold_ms = animation_spike_threshold_ms();
     let output = state
         .tty_backends
@@ -1725,68 +1726,78 @@ fn render_surface(
     if !state.runtime_output_render_enabled(&output.name()) {
         return Ok(RenderSurfaceOutcome::Skipped);
     }
-    if std::env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some() {
-        let frame_pending = state
-            .tty_backends
-            .get(&node)
-            .and_then(|backend| backend.surfaces.get(&crtc))
-            .map(|surface| surface.frame_pending)
-            .unwrap_or(false);
-        let redraw_state = state
-            .tty_backends
-            .get(&node)
-            .and_then(|backend| backend.surfaces.get(&crtc))
-            .map(|surface| surface.redraw_state)
-            .unwrap_or(TtyRedrawState::Idle);
-        tracing::info!(
-            output = %output.name(),
-            frame_pending,
-            redraw_state = ?redraw_state,
-            "screencopy: render_surface called"
-        );
-    }
-    let gap_threshold_ms = animation_gap_threshold_ms();
-    if animation_gap_debug_enabled()
-        && let Some(gap_ms) =
-            record_animation_gap("tty-render-surface", output.name().as_str(), Instant::now())
-        && gap_ms >= gap_threshold_ms
     {
-        let redraw_state = state
-            .tty_backends
-            .get(&node)
-            .and_then(|backend| backend.surfaces.get(&crtc))
-            .map(|surface| surface.redraw_state)
-            .unwrap_or(TtyRedrawState::Idle);
-        let frame_pending = state
-            .tty_backends
-            .get(&node)
-            .and_then(|backend| backend.surfaces.get(&crtc))
-            .map(|surface| surface.frame_pending)
-            .unwrap_or(false);
-        warn!(
-            output = %output.name(),
-            gap_ms,
-            redraw_state = ?redraw_state,
-            frame_pending,
-            queued_wait_ms = state
+        timescope::scope!("tty render_surface debug gates");
+        if std::env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some() {
+            let frame_pending = state
                 .tty_backends
                 .get(&node)
                 .and_then(|backend| backend.surfaces.get(&crtc))
-                .and_then(|surface| surface.queued_at)
-                .map(|queued_at| queued_at.elapsed().as_secs_f64() * 1000.0),
-            closing_snapshot_count = state.closing_window_snapshots.len(),
-            gap_threshold_ms,
-            "animation gap: tty render_surface cadence gap"
-        );
+                .map(|surface| surface.frame_pending)
+                .unwrap_or(false);
+            let redraw_state = state
+                .tty_backends
+                .get(&node)
+                .and_then(|backend| backend.surfaces.get(&crtc))
+                .map(|surface| surface.redraw_state)
+                .unwrap_or(TtyRedrawState::Idle);
+            tracing::info!(
+                output = %output.name(),
+                frame_pending,
+                redraw_state = ?redraw_state,
+                "screencopy: render_surface called"
+            );
+        }
+        let gap_threshold_ms = animation_gap_threshold_ms();
+        if animation_gap_debug_enabled()
+            && let Some(gap_ms) =
+                record_animation_gap("tty-render-surface", output.name().as_str(), Instant::now())
+            && gap_ms >= gap_threshold_ms
+        {
+            let redraw_state = state
+                .tty_backends
+                .get(&node)
+                .and_then(|backend| backend.surfaces.get(&crtc))
+                .map(|surface| surface.redraw_state)
+                .unwrap_or(TtyRedrawState::Idle);
+            let frame_pending = state
+                .tty_backends
+                .get(&node)
+                .and_then(|backend| backend.surfaces.get(&crtc))
+                .map(|surface| surface.frame_pending)
+                .unwrap_or(false);
+            warn!(
+                output = %output.name(),
+                gap_ms,
+                redraw_state = ?redraw_state,
+                frame_pending,
+                queued_wait_ms = state
+                    .tty_backends
+                    .get(&node)
+                    .and_then(|backend| backend.surfaces.get(&crtc))
+                    .and_then(|surface| surface.queued_at)
+                    .map(|queued_at| queued_at.elapsed().as_secs_f64() * 1000.0),
+                closing_snapshot_count = state.closing_window_snapshots.len(),
+                gap_threshold_ms,
+                "animation gap: tty render_surface cadence gap"
+            );
+        }
     }
+    let gap_threshold_ms = animation_gap_threshold_ms();
 
     let decoration_refresh_started_at = Instant::now();
-    state.refresh_window_decorations_for_output(Some(output.name().as_str()))?;
+    {
+        timescope::scope!("tty refresh_window_decorations");
+        state.refresh_window_decorations_for_output(Some(output.name().as_str()))?;
+    }
     let decoration_refresh_elapsed_ms =
         decoration_refresh_started_at.elapsed().as_secs_f64() * 1000.0;
     let layer_effects_started_at = Instant::now();
-    state.refresh_layer_effects_for_output(output.name().as_str())?;
-    state.refresh_popup_effects_for_output(output.name().as_str())?;
+    {
+        timescope::scope!("tty refresh_layer_and_popup_effects");
+        state.refresh_layer_effects_for_output(output.name().as_str())?;
+        state.refresh_popup_effects_for_output(output.name().as_str())?;
+    }
     let layer_effects_elapsed_ms = layer_effects_started_at.elapsed().as_secs_f64() * 1000.0;
 
     let redraw_state = state
@@ -1839,21 +1850,34 @@ fn render_surface(
         return Ok(RenderSurfaceOutcome::Skipped);
     }
 
-    let has_visible_mpv = mpv_frame_debug_enabled() && output_has_visible_mpv(state, &output);
-    let frame_duration = state
-        .tty_backends
-        .get(&node)
-        .and_then(|backend| backend.surfaces.get(&crtc))
-        .map(|surface| surface.frame_duration)
-        .unwrap_or(Duration::ZERO);
-    let fallback_frame_time = Duration::from(state.clock.now()) + frame_duration;
-    let raw_frame_target = state
-        .tty_backends
-        .get(&node)
-        .and_then(|backend| backend.surfaces.get(&crtc))
-        .and_then(|surface| surface.next_frame_target);
-    let (frame_target, stale_frame_target) =
-        sanitize_next_frame_target(raw_frame_target, fallback_frame_time, frame_duration);
+    let has_visible_mpv = {
+        timescope::scope!("tty visible mpv check");
+        mpv_frame_debug_enabled() && output_has_visible_mpv(state, &output)
+    };
+    let (frame_duration, fallback_frame_time, raw_frame_target, frame_target, stale_frame_target) = {
+        timescope::scope!("tty frame timing setup");
+        let frame_duration = state
+            .tty_backends
+            .get(&node)
+            .and_then(|backend| backend.surfaces.get(&crtc))
+            .map(|surface| surface.frame_duration)
+            .unwrap_or(Duration::ZERO);
+        let fallback_frame_time = Duration::from(state.clock.now()) + frame_duration;
+        let raw_frame_target = state
+            .tty_backends
+            .get(&node)
+            .and_then(|backend| backend.surfaces.get(&crtc))
+            .and_then(|surface| surface.next_frame_target);
+        let (frame_target, stale_frame_target) =
+            sanitize_next_frame_target(raw_frame_target, fallback_frame_time, frame_duration);
+        (
+            frame_duration,
+            fallback_frame_time,
+            raw_frame_target,
+            frame_target,
+            stale_frame_target,
+        )
+    };
     if stale_frame_target && mpv_frame_debug_enabled() && output_has_visible_mpv(state, &output) {
         info!(
             output = %output.name(),
@@ -1863,46 +1887,69 @@ fn render_surface(
             "mpv frame debug: stale next_frame_target ignored before pre_repaint"
         );
     }
-    state.pre_repaint(&output, frame_target.into());
+    {
+        timescope::scope!("tty pre_repaint");
+        state.pre_repaint(&output, frame_target.into());
+    }
 
     let mut timing = TtyAnimationTimingMetrics::default();
 
-    let should_capture_blink = state.damage_blink_enabled;
-    let blink_visible = state.damage_blink_rects_for_output(&output).to_vec();
-    let output_geo = state.space.output_geometry(&output).unwrap();
-    let has_visible_x11_chrome = output_has_visible_x11_chrome(state, &output);
-    let mut extra_damage = state.pending_decoration_damage.clone();
-    if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() && !extra_damage.is_empty() {
-        tracing::info!(
-            output = %output.name(),
-            pending_decoration_damage_count = extra_damage.len(),
-            "transform snapshot tty pending decoration damage at render start"
-        );
-    }
-    if state.force_full_damage {
-        extra_damage.push(crate::ssd::LogicalRect::new(
-            output_geo.loc.x,
-            output_geo.loc.y,
-            output_geo.size.w,
-            output_geo.size.h,
-        ));
-    }
-    if should_capture_blink && !blink_visible.is_empty() {
-        extra_damage.push(crate::ssd::LogicalRect::new(
-            output_geo.loc.x,
-            output_geo.loc.y,
-            output_geo.size.w,
-            output_geo.size.h,
-        ));
-    }
-    let windows_top_to_bottom_for_output: Vec<_> = state
-        .windows_for_output_top_to_bottom(&output)
-        .into_iter()
-        .cloned()
-        .collect();
-    let session_lock_surface_for_output = state.session_lock_surface_for_output(&output);
+    let (
+        should_capture_blink,
+        blink_visible,
+        has_visible_x11_chrome,
+        mut extra_damage,
+        windows_top_to_bottom_for_output,
+        session_lock_surface_for_output,
+    ) = {
+        timescope::scope!("tty render prep");
+        let should_capture_blink = state.damage_blink_enabled;
+        let blink_visible = state.damage_blink_rects_for_output(&output).to_vec();
+        let output_geo = state.space.output_geometry(&output).unwrap();
+        let has_visible_x11_chrome = output_has_visible_x11_chrome(state, &output);
+        let mut extra_damage = state.pending_decoration_damage.clone();
+        if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() && !extra_damage.is_empty()
+        {
+            tracing::info!(
+                output = %output.name(),
+                pending_decoration_damage_count = extra_damage.len(),
+                "transform snapshot tty pending decoration damage at render start"
+            );
+        }
+        if state.force_full_damage {
+            extra_damage.push(crate::ssd::LogicalRect::new(
+                output_geo.loc.x,
+                output_geo.loc.y,
+                output_geo.size.w,
+                output_geo.size.h,
+            ));
+        }
+        if should_capture_blink && !blink_visible.is_empty() {
+            extra_damage.push(crate::ssd::LogicalRect::new(
+                output_geo.loc.x,
+                output_geo.loc.y,
+                output_geo.size.w,
+                output_geo.size.h,
+            ));
+        }
+        let windows_top_to_bottom_for_output: Vec<_> = state
+            .windows_for_output_top_to_bottom(&output)
+            .into_iter()
+            .cloned()
+            .collect();
+        let session_lock_surface_for_output = state.session_lock_surface_for_output(&output);
+        (
+            should_capture_blink,
+            blink_visible,
+            has_visible_x11_chrome,
+            extra_damage,
+            windows_top_to_bottom_for_output,
+            session_lock_surface_for_output,
+        )
+    };
     let mut newly_ready_initial_focus_window_ids = Vec::new();
     let captured_blink_damage = {
+        timescope::scope!("tty render mutable section");
         let window_source_damage_snapshot = state.window_source_damage.clone();
         let ShojiWM {
             space,
@@ -1981,75 +2028,79 @@ fn render_surface(
         let (_, _lower_layer_elements) =
             window_render::layer_elements_for_output(&mut backend.renderer, &output, scale, 1.0);
 
-        if output_geo.to_f64().contains(pointer_pos) {
-            let reset =
-                matches!(cursor_status, CursorImageStatus::Surface(surface) if !surface.alive());
-            if reset {
-                *cursor_status = CursorImageStatus::default_named();
-            }
-
-            let effective_cursor_status = cursor_override
-                .map(CursorImageStatus::Named)
-                .unwrap_or_else(|| cursor_status.clone());
-
-            let hotspot = if let CursorImageStatus::Surface(surface) = &effective_cursor_status {
-                *current_pointer_image = None;
-                compositor::with_states(surface, |states| {
-                    states
-                        .data_map
-                        .get::<std::sync::Mutex<CursorImageAttributes>>()
-                        .unwrap()
-                        .lock()
-                        .unwrap()
-                        .hotspot
-                })
-            } else {
-                let icon = match &effective_cursor_status {
-                    CursorImageStatus::Named(icon) => *icon,
-                    _ => smithay::input::pointer::CursorIcon::Default,
-                };
-                let cursor_scale = output.current_scale().fractional_scale().ceil().max(1.0) as u32;
-                let frame = cursor_theme.get_image(icon, cursor_scale, start_time.elapsed());
-                let buffer = pointer_images
-                    .iter()
-                    .find_map(|(image, buffer)| (image == &frame).then_some(buffer.clone()))
-                    .unwrap_or_else(|| {
-                        let buffer = MemoryRenderBuffer::from_slice(
-                            &frame.pixels_rgba,
-                            Fourcc::Argb8888,
-                            (frame.width as i32, frame.height as i32),
-                            cursor_scale as i32,
-                            Transform::Normal,
-                            None,
-                        );
-                        pointer_images.push((frame.clone(), buffer.clone()));
-                        buffer
-                    });
-                if current_pointer_image.as_ref() != Some(&frame) {
-                    pointer_element.set_buffer(buffer);
-                    *current_pointer_image = Some(frame.clone());
+        {
+            timescope::scope!("tty cursor elements");
+            if output_geo.to_f64().contains(pointer_pos) {
+                let reset = matches!(cursor_status, CursorImageStatus::Surface(surface) if !surface.alive());
+                if reset {
+                    *cursor_status = CursorImageStatus::default_named();
                 }
-                (
-                    (frame.xhot / cursor_scale) as i32,
-                    (frame.yhot / cursor_scale) as i32,
-                )
-                    .into()
-            };
 
-            pointer_element.set_status(effective_cursor_status);
+                let effective_cursor_status = cursor_override
+                    .map(CursorImageStatus::Named)
+                    .unwrap_or_else(|| cursor_status.clone());
 
-            let cursor_location = (pointer_pos - output_geo.loc.to_f64() - hotspot.to_f64())
-                .to_physical(scale)
-                .to_i32_round();
+                let hotspot = if let CursorImageStatus::Surface(surface) = &effective_cursor_status
+                {
+                    *current_pointer_image = None;
+                    compositor::with_states(surface, |states| {
+                        states
+                            .data_map
+                            .get::<std::sync::Mutex<CursorImageAttributes>>()
+                            .unwrap()
+                            .lock()
+                            .unwrap()
+                            .hotspot
+                    })
+                } else {
+                    let icon = match &effective_cursor_status {
+                        CursorImageStatus::Named(icon) => *icon,
+                        _ => smithay::input::pointer::CursorIcon::Default,
+                    };
+                    let cursor_scale =
+                        output.current_scale().fractional_scale().ceil().max(1.0) as u32;
+                    let frame = cursor_theme.get_image(icon, cursor_scale, start_time.elapsed());
+                    let buffer = pointer_images
+                        .iter()
+                        .find_map(|(image, buffer)| (image == &frame).then_some(buffer.clone()))
+                        .unwrap_or_else(|| {
+                            let buffer = MemoryRenderBuffer::from_slice(
+                                &frame.pixels_rgba,
+                                Fourcc::Argb8888,
+                                (frame.width as i32, frame.height as i32),
+                                cursor_scale as i32,
+                                Transform::Normal,
+                                None,
+                            );
+                            pointer_images.push((frame.clone(), buffer.clone()));
+                            buffer
+                        });
+                    if current_pointer_image.as_ref() != Some(&frame) {
+                        pointer_element.set_buffer(buffer);
+                        *current_pointer_image = Some(frame.clone());
+                    }
+                    (
+                        (frame.xhot / cursor_scale) as i32,
+                        (frame.yhot / cursor_scale) as i32,
+                    )
+                        .into()
+                };
 
-            cursor_pointer_elements.extend(
-                pointer_element.render_elements::<PointerRenderElement<GlesRenderer>>(
-                    &mut backend.renderer,
-                    cursor_location,
-                    scale,
-                    1.0,
-                ),
-            );
+                pointer_element.set_status(effective_cursor_status);
+
+                let cursor_location = (pointer_pos - output_geo.loc.to_f64() - hotspot.to_f64())
+                    .to_physical(scale)
+                    .to_i32_round();
+
+                cursor_pointer_elements.extend(
+                    pointer_element.render_elements::<PointerRenderElement<GlesRenderer>>(
+                        &mut backend.renderer,
+                        cursor_location,
+                        scale,
+                        1.0,
+                    ),
+                );
+            }
         }
         let cursor_elapsed_ms = cursor_started_at.elapsed().as_secs_f64() * 1000.0;
         timing.cursor_elapsed_ms = cursor_elapsed_ms;
@@ -2084,44 +2135,50 @@ fn render_surface(
 
         let mut scene_elements: Vec<TtyRenderElements> = Vec::new();
         let upper_layers_started_at = Instant::now();
-        let upper_layer_elements = upper_layer_scene_elements(
-            &mut backend.renderer,
-            space,
-            window_decorations,
-            &state.window_source_damage,
-            &state.lower_layer_source_damage,
-            &state.upper_layer_source_damage,
-            state.lower_layer_scene_generation,
-            &state.configured_layer_effects,
-            &state.configured_popup_effects,
-            state.configured_background_effect.as_ref(),
-            &output,
-            output_geo,
-            scale,
-            upper_layer_backdrop_windows,
-            fullscreen_window.is_some(),
-            &mut state.layer_backdrop_cache,
-            &mut state.layer_framebuffer_effect_states,
-            &mut state.layer_effect_cache,
-            &mut state.popup_effect_cache,
-            &mut state.popup_framebuffer_effect_states,
-        )?;
+        let upper_layer_elements = {
+            timescope::scope!("tty upper layer scene");
+            upper_layer_scene_elements(
+                &mut backend.renderer,
+                space,
+                window_decorations,
+                &state.window_source_damage,
+                &state.lower_layer_source_damage,
+                &state.upper_layer_source_damage,
+                state.lower_layer_scene_generation,
+                &state.configured_layer_effects,
+                &state.configured_popup_effects,
+                state.configured_background_effect.as_ref(),
+                &output,
+                output_geo,
+                scale,
+                upper_layer_backdrop_windows,
+                fullscreen_window.is_some(),
+                &mut state.layer_backdrop_cache,
+                &mut state.layer_framebuffer_effect_states,
+                &mut state.layer_effect_cache,
+                &mut state.popup_effect_cache,
+                &mut state.popup_framebuffer_effect_states,
+            )?
+        };
         let fullscreen_overlay_visible =
             fullscreen_window.is_some() && !upper_layer_elements.is_empty();
         scene_elements.extend(upper_layer_elements);
         let upper_layers_elapsed_ms = upper_layers_started_at.elapsed().as_secs_f64() * 1000.0;
         timing.upper_layers_elapsed_ms = upper_layers_elapsed_ms;
         let closing_snapshots_started_at = Instant::now();
-        scene_elements.extend(
-            closing_snapshot_elements(
-                &mut backend.renderer,
-                &output,
-                &closing_snapshots,
-                output_geo,
-                scale,
-            )
-            .into_iter(),
-        );
+        {
+            timescope::scope!("tty closing snapshots");
+            scene_elements.extend(
+                closing_snapshot_elements(
+                    &mut backend.renderer,
+                    &output,
+                    &closing_snapshots,
+                    output_geo,
+                    scale,
+                )
+                .into_iter(),
+            );
+        }
         let closing_snapshots_elapsed_ms =
             closing_snapshots_started_at.elapsed().as_secs_f64() * 1000.0;
         timing.closing_snapshots_elapsed_ms = closing_snapshots_elapsed_ms;
@@ -2146,55 +2203,71 @@ fn render_surface(
                 "close debug: closing snapshots active"
             );
         }
-        for (_window_index, window) in windows_top_to_bottom.iter().enumerate() {
-            // Fullscreen fast path: every other window is fully occluded;
-            // the fullscreen window itself renders as a bare surface tree +
-            // popups (no decorations, no effects) so the frame can collapse
-            // to a single scanout-capable element.
-            if let Some(fullscreen_fast_path_window) = fullscreen_window.as_ref() {
-                if window != fullscreen_fast_path_window {
+        {
+            timescope::scope!("tty window loop");
+            for (_window_index, window) in windows_top_to_bottom.iter().enumerate() {
+                timescope::scope!("tty window");
+                // Fullscreen fast path: every other window is fully occluded;
+                // the fullscreen window itself renders as a bare surface tree +
+                // popups (no decorations, no effects) so the frame can collapse
+                // to a single scanout-capable element.
+                if let Some(fullscreen_fast_path_window) = fullscreen_window.as_ref() {
+                    if window != fullscreen_fast_path_window {
+                        continue;
+                    }
+                    let Some(window_location) = space.element_location(window) else {
+                        continue;
+                    };
+                    let physical_location =
+                        (window_location - output_geo.loc).to_physical_precise_round(scale);
+                    let popup_elements = window_render::popup_elements(
+                        window,
+                        &mut backend.renderer,
+                        physical_location,
+                        scale,
+                        1.0,
+                    );
+                    let surface_elements = window_render::surface_elements(
+                        window,
+                        &mut backend.renderer,
+                        physical_location,
+                        scale,
+                        1.0,
+                    );
+                    scene_elements
+                        .extend(popup_elements.into_iter().map(TtyRenderElements::Window));
+                    scene_elements
+                        .extend(surface_elements.into_iter().map(TtyRenderElements::Window));
                     continue;
                 }
+                let window_started_at = Instant::now();
+                let mut window_timing = TtyWindowTimingMetrics::default();
                 let Some(window_location) = space.element_location(window) else {
                     continue;
                 };
-                let physical_location =
-                    (window_location - output_geo.loc).to_physical_precise_round(scale);
-                let popup_elements = window_render::popup_elements(
-                    window,
-                    &mut backend.renderer,
-                    physical_location,
-                    scale,
-                    1.0,
-                );
-                let surface_elements = window_render::surface_elements(
-                    window,
-                    &mut backend.renderer,
-                    physical_location,
-                    scale,
-                    1.0,
-                );
-                scene_elements.extend(popup_elements.into_iter().map(TtyRenderElements::Window));
-                scene_elements.extend(surface_elements.into_iter().map(TtyRenderElements::Window));
-                continue;
-            }
-            let window_started_at = Instant::now();
-            let mut window_timing = TtyWindowTimingMetrics::default();
-            let Some(window_location) = space.element_location(window) else {
-                continue;
-            };
-            let Some(window_id) = window_decorations
-                .get(window)
-                .map(|decoration| decoration.snapshot.id.clone())
-            else {
-                continue;
-            };
-            if let Some(decoration) = window_decorations.get(window) {
-                let render_allowed =
-                    decoration.managed_window_allows_render_on_output(output.name().as_str());
-                if !render_allowed {
+                let Some(window_id) = window_decorations
+                    .get(window)
+                    .map(|decoration| decoration.snapshot.id.clone())
+                else {
+                    continue;
+                };
+                if let Some(decoration) = window_decorations.get(window) {
+                    let render_allowed =
+                        decoration.managed_window_allows_render_on_output(output.name().as_str());
+                    if !render_allowed {
+                        log_kinetic_window_render_state_debug(
+                            "live-skip-render",
+                            &output.name(),
+                            decoration,
+                            output_geo,
+                            scale,
+                            None,
+                            render_allowed,
+                        );
+                        continue;
+                    }
                     log_kinetic_window_render_state_debug(
-                        "live-skip-render",
+                        "live-before-visual",
                         &output.name(),
                         decoration,
                         output_geo,
@@ -2202,403 +2275,401 @@ fn render_surface(
                         None,
                         render_allowed,
                     );
+                } else {
                     continue;
                 }
-                log_kinetic_window_render_state_debug(
-                    "live-before-visual",
-                    &output.name(),
-                    decoration,
-                    output_geo,
-                    scale,
-                    None,
-                    render_allowed,
-                );
-            } else {
-                continue;
-            }
-            if closing_window_snapshots.contains_key(&window_id) {
-                if close_debug {
-                    tracing::info!(
-                        output = %output.name(),
-                        window_id = %window_id,
-                        "close debug: live loop skipping window (in closing_window_snapshots)"
-                    );
+                if closing_window_snapshots.contains_key(&window_id) {
+                    if close_debug {
+                        tracing::info!(
+                            output = %output.name(),
+                            window_id = %window_id,
+                            "close debug: live loop skipping window (in closing_window_snapshots)"
+                        );
+                    }
+                    continue;
                 }
-                continue;
-            }
-            let preliminary_physical_location =
-                (window_location - output_geo.loc).to_physical_precise_round(scale);
-            let visual_state = window_decorations
-                .get(window)
-                .map(|decoration| {
-                    window_visual_state(
-                        decoration.layout.root.rect,
-                        decoration.visual_transform,
+                let preliminary_physical_location =
+                    (window_location - output_geo.loc).to_physical_precise_round(scale);
+                let visual_state = window_decorations
+                    .get(window)
+                    .map(|decoration| {
+                        window_visual_state(
+                            decoration.layout.root.rect,
+                            decoration.visual_transform,
+                            output_geo,
+                            scale,
+                        )
+                    })
+                    .unwrap_or(WindowVisualState {
+                        origin: preliminary_physical_location,
+                        scale: smithay::utils::Scale::from((1.0, 1.0)),
+                        translation: (0, 0).into(),
+                        opacity: 1.0,
+                    });
+                if let Some(decoration) = window_decorations.get(window) {
+                    log_kinetic_window_render_state_debug(
+                        "live-after-visual",
+                        &output.name(),
+                        decoration,
                         output_geo,
                         scale,
-                    )
-                })
-                .unwrap_or(WindowVisualState {
-                    origin: preliminary_physical_location,
-                    scale: smithay::utils::Scale::from((1.0, 1.0)),
-                    translation: (0, 0).into(),
-                    opacity: 1.0,
-                });
-            if let Some(decoration) = window_decorations.get(window) {
-                log_kinetic_window_render_state_debug(
-                    "live-after-visual",
-                    &output.name(),
-                    decoration,
-                    output_geo,
+                        Some(visual_state),
+                        true,
+                    );
+                }
+                let snap_scale = Scale::from((
+                    scale.x * visual_state.scale.x.max(0.0),
+                    scale.y * visual_state.scale.y.max(0.0),
+                ));
+                let client_physical_geometry =
+                    window_decorations.get(window).and_then(|decoration| {
+                        decoration.content_clip.map(|clip| {
+                            let root_origin = root_physical_origin(
+                                decoration.layout.root.rect,
+                                output_geo,
+                                scale,
+                            );
+                            let local_geometry =
+                                crate::backend::visual::relative_physical_rect_from_root_precise(
+                                    clip.rect_precise,
+                                    decoration.layout.root.rect,
+                                    output_geo,
+                                    scale,
+                                );
+                            smithay::utils::Rectangle::new(
+                                smithay::utils::Point::from((
+                                    root_origin.x + local_geometry.loc.x,
+                                    root_origin.y + local_geometry.loc.y,
+                                )),
+                                local_geometry.size,
+                            )
+                        })
+                    });
+                let physical_location = client_physical_geometry
+                    .map(|geometry| geometry.loc)
+                    .unwrap_or(preliminary_physical_location);
+                let direct_surface_lookup_started_at = Instant::now();
+                let direct_surface_count = window_render::surface_elements(
+                    window,
+                    &mut backend.renderer,
+                    physical_location,
                     scale,
-                    Some(visual_state),
-                    true,
-                );
-            }
-            let snap_scale = Scale::from((
-                scale.x * visual_state.scale.x.max(0.0),
-                scale.y * visual_state.scale.y.max(0.0),
-            ));
-            let client_physical_geometry = window_decorations.get(window).and_then(|decoration| {
-                decoration.content_clip.map(|clip| {
-                    let root_origin =
-                        root_physical_origin(decoration.layout.root.rect, output_geo, scale);
-                    let local_geometry =
-                        crate::backend::visual::relative_physical_rect_from_root_precise(
-                            clip.rect_precise,
-                            decoration.layout.root.rect,
-                            output_geo,
-                            scale,
+                    1.0,
+                )
+                .len();
+                window_timing.direct_surface_lookup_ms =
+                    direct_surface_lookup_started_at.elapsed().as_secs_f64() * 1000.0;
+                if std::env::var_os("SHOJI_SOURCE_DAMAGE_DEBUG").is_some() {
+                    let title = window_decorations
+                        .get(window)
+                        .map(|d| d.snapshot.title.clone())
+                        .unwrap_or_default();
+                    let has_backdrop_source_probe = direct_surface_count > 0
+                        || live_window_snapshots.contains_key(&window_id)
+                        || complete_window_snapshots.contains_key(&window_id);
+                    let decoration_ready_probe = windows_ready_for_decoration.contains(&window_id);
+                    tracing::info!(
+                        output = %output.name(),
+                        window_id = %window_id,
+                        title = %title,
+                        direct_surface_count,
+                        skipping = direct_surface_count == 0,
+                        has_backdrop_source = has_backdrop_source_probe,
+                        decoration_ready = decoration_ready_probe,
+                        "per-window loop direct_surface_count probe"
+                    );
+                }
+                if direct_surface_count == 0 {
+                    if close_debug {
+                        tracing::info!(
+                            output = %output.name(),
+                            window_id = %window_id,
+                            "close debug: live loop skipping window (direct_surface_count==0)"
                         );
-                    smithay::utils::Rectangle::new(
-                        smithay::utils::Point::from((
-                            root_origin.x + local_geometry.loc.x,
-                            root_origin.y + local_geometry.loc.y,
-                        )),
-                        local_geometry.size,
-                    )
-                })
-            });
-            let physical_location = client_physical_geometry
-                .map(|geometry| geometry.loc)
-                .unwrap_or(preliminary_physical_location);
-            let direct_surface_lookup_started_at = Instant::now();
-            let direct_surface_count = window_render::surface_elements(
-                window,
-                &mut backend.renderer,
-                physical_location,
-                scale,
-                1.0,
-            )
-            .len();
-            window_timing.direct_surface_lookup_ms =
-                direct_surface_lookup_started_at.elapsed().as_secs_f64() * 1000.0;
-            if std::env::var_os("SHOJI_SOURCE_DAMAGE_DEBUG").is_some() {
-                let title = window_decorations
-                    .get(window)
-                    .map(|d| d.snapshot.title.clone())
-                    .unwrap_or_default();
-                let has_backdrop_source_probe = direct_surface_count > 0
-                    || live_window_snapshots.contains_key(&window_id)
-                    || complete_window_snapshots.contains_key(&window_id);
-                let decoration_ready_probe = windows_ready_for_decoration.contains(&window_id);
-                tracing::info!(
-                    output = %output.name(),
-                    window_id = %window_id,
-                    title = %title,
-                    direct_surface_count,
-                    skipping = direct_surface_count == 0,
-                    has_backdrop_source = has_backdrop_source_probe,
-                    decoration_ready = decoration_ready_probe,
-                    "per-window loop direct_surface_count probe"
-                );
-            }
-            if direct_surface_count == 0 {
+                    }
+                    if output_render_debug_enabled() {
+                        let title = window_decorations
+                            .get(window)
+                            .map(|d| d.snapshot.title.as_str());
+                        tracing::info!(
+                            output = %output.name(),
+                            window_id = %window_id,
+                            title = ?title,
+                            physical_location = ?physical_location,
+                            "output_render_debug: SKIPPED (direct_surface_count==0)"
+                        );
+                    }
+                    continue;
+                }
                 if close_debug {
                     tracing::info!(
                         output = %output.name(),
                         window_id = %window_id,
-                        "close debug: live loop skipping window (direct_surface_count==0)"
+                        direct_surface_count,
+                        "close debug: live loop rendering window"
                     );
                 }
-                if output_render_debug_enabled() {
-                    let title = window_decorations
+                let has_backdrop_source = direct_surface_count > 0
+                    || live_window_snapshots.contains_key(&window_id)
+                    || complete_window_snapshots.contains_key(&window_id);
+                let decoration_ready = windows_ready_for_decoration.contains(&window_id);
+                if !has_backdrop_source {
+                    continue;
+                }
+                let use_full_window_snapshot = requires_full_window_snapshot(visual_state);
+                let used_transform_snapshot_last_frame =
+                    transform_snapshot_window_ids.contains(&window_id);
+                if use_full_window_snapshot {
+                    frame_transform_snapshot_window_count =
+                        frame_transform_snapshot_window_count.saturating_add(1);
+                }
+                let snapshot_id = window_decorations
+                    .get(window)
+                    .map(|decoration| decoration.snapshot.id.clone());
+                let window_has_snapshot_damage = snapshot_id
+                    .as_ref()
+                    .is_some_and(|snapshot_id| snapshot_dirty_window_ids.contains(snapshot_id));
+                if frame_liveness_debug_enabled() {
+                    let snapshot = window_decorations
                         .get(window)
-                        .map(|d| d.snapshot.title.as_str());
+                        .map(|decoration| &decoration.snapshot);
                     tracing::info!(
                         output = %output.name(),
                         window_id = %window_id,
-                        title = ?title,
-                        physical_location = ?physical_location,
-                        "output_render_debug: SKIPPED (direct_surface_count==0)"
+                        title = ?snapshot.map(|snapshot| snapshot.title.as_str()),
+                        app_id = ?snapshot.and_then(|snapshot| snapshot.app_id.as_deref()),
+                        direct_surface_count,
+                        use_full_window_snapshot,
+                        used_transform_snapshot_last_frame,
+                        window_has_snapshot_damage,
+                        translation_x = visual_state.translation.x,
+                        translation_y = visual_state.translation.y,
+                        scale_x = visual_state.scale.x,
+                        scale_y = visual_state.scale.y,
+                        opacity = visual_state.opacity,
+                        "tty frame liveness: window snapshot decision",
                     );
                 }
-                continue;
-            }
-            if close_debug {
-                tracing::info!(
-                    output = %output.name(),
-                    window_id = %window_id,
-                    direct_surface_count,
-                    "close debug: live loop rendering window"
-                );
-            }
-            let has_backdrop_source = direct_surface_count > 0
-                || live_window_snapshots.contains_key(&window_id)
-                || complete_window_snapshots.contains_key(&window_id);
-            let decoration_ready = windows_ready_for_decoration.contains(&window_id);
-            if !has_backdrop_source {
-                continue;
-            }
-            let use_full_window_snapshot = requires_full_window_snapshot(visual_state);
-            let used_transform_snapshot_last_frame =
-                transform_snapshot_window_ids.contains(&window_id);
-            if use_full_window_snapshot {
-                frame_transform_snapshot_window_count =
-                    frame_transform_snapshot_window_count.saturating_add(1);
-            }
-            let snapshot_id = window_decorations
-                .get(window)
-                .map(|decoration| decoration.snapshot.id.clone());
-            let window_has_snapshot_damage = snapshot_id
-                .as_ref()
-                .is_some_and(|snapshot_id| snapshot_dirty_window_ids.contains(snapshot_id));
-            if frame_liveness_debug_enabled() {
-                let snapshot = window_decorations
-                    .get(window)
-                    .map(|decoration| &decoration.snapshot);
-                tracing::info!(
-                    output = %output.name(),
-                    window_id = %window_id,
-                    title = ?snapshot.map(|snapshot| snapshot.title.as_str()),
-                    app_id = ?snapshot.and_then(|snapshot| snapshot.app_id.as_deref()),
-                    direct_surface_count,
-                    use_full_window_snapshot,
-                    used_transform_snapshot_last_frame,
-                    window_has_snapshot_damage,
-                    translation_x = visual_state.translation.x,
-                    translation_y = visual_state.translation.y,
-                    scale_x = visual_state.scale.x,
-                    scale_y = visual_state.scale.y,
-                    opacity = visual_state.opacity,
-                    "tty frame liveness: window snapshot decision",
-                );
-            }
-            if use_full_window_snapshot && window_has_snapshot_damage {
-                frame_snapshot_damage_window_count =
-                    frame_snapshot_damage_window_count.saturating_add(1);
-            }
-            if ((use_full_window_snapshot != used_transform_snapshot_last_frame)
-                || (use_full_window_snapshot && window_has_snapshot_damage))
-                && let Some(decoration) = window_decorations.get(window)
-            {
                 if use_full_window_snapshot && window_has_snapshot_damage {
-                    frame_had_transform_snapshot_damage = true;
+                    frame_snapshot_damage_window_count =
+                        frame_snapshot_damage_window_count.saturating_add(1);
                 }
-                extra_damage.push(transformed_root_rect(
-                    decoration.layout.root.rect,
-                    decoration.visual_transform,
-                ));
-            }
-            // Track whether this window's visual_transform changed since the previous frame.
-            // If it changed the window is actively animating; if not, it is stationary in
-            // snapshot mode.  The snapshot fix below only restores primary_scanout_output for
-            // animating windows so that stationary snapshot windows remain throttled.
-            if use_full_window_snapshot {
-                if let Some(sid) = snapshot_id.as_deref() {
-                    if let Some(decoration) = window_decorations.get(window) {
-                        let prev = previous_snapshot_visual_transform(
-                            sid,
-                            output.name().as_str(),
-                            decoration.visual_transform,
-                        );
-                        let changed = prev
-                            .map(|p| p != decoration.visual_transform)
-                            .unwrap_or(true); // first frame → assume changed
-                        if changed {
-                            snapshot_transform_changed_ids.insert(sid.to_string());
+                if ((use_full_window_snapshot != used_transform_snapshot_last_frame)
+                    || (use_full_window_snapshot && window_has_snapshot_damage))
+                    && let Some(decoration) = window_decorations.get(window)
+                {
+                    if use_full_window_snapshot && window_has_snapshot_damage {
+                        frame_had_transform_snapshot_damage = true;
+                    }
+                    extra_damage.push(transformed_root_rect(
+                        decoration.layout.root.rect,
+                        decoration.visual_transform,
+                    ));
+                }
+                // Track whether this window's visual_transform changed since the previous frame.
+                // If it changed the window is actively animating; if not, it is stationary in
+                // snapshot mode.  The snapshot fix below only restores primary_scanout_output for
+                // animating windows so that stationary snapshot windows remain throttled.
+                if use_full_window_snapshot {
+                    if let Some(sid) = snapshot_id.as_deref() {
+                        if let Some(decoration) = window_decorations.get(window) {
+                            let prev = previous_snapshot_visual_transform(
+                                sid,
+                                output.name().as_str(),
+                                decoration.visual_transform,
+                            );
+                            let changed = prev
+                                .map(|p| p != decoration.visual_transform)
+                                .unwrap_or(true); // first frame → assume changed
+                            if changed {
+                                snapshot_transform_changed_ids.insert(sid.to_string());
+                            }
                         }
                     }
                 }
-            }
-            if use_full_window_snapshot {
-                transform_snapshot_window_ids.insert(window_id.clone());
-            } else {
-                transform_snapshot_window_ids.remove(&window_id);
-                complete_window_snapshot_trackers.remove(&window_id);
-            }
-            let mut ordered_ui_elements: Vec<(usize, TtyRenderElements)> = Vec::new();
-            let mut ordered_backdrop_elements: Vec<(usize, TtyRenderElements)> = Vec::new();
-            let mut snapshot_ui_items: Vec<(usize, TtyRenderElements)> = Vec::new();
-            let mut snapshot_backdrop_items: Vec<(usize, TtyRenderElements)> = Vec::new();
-            let mut debug_background_geometries: Vec<(
-                usize,
-                String,
-                &'static str,
-                smithay::utils::Rectangle<i32, smithay::utils::Physical>,
-            )> = Vec::new();
-            let mut debug_background_pre_geometries: Vec<(
-                usize,
-                String,
-                &'static str,
-                smithay::utils::Rectangle<i32, smithay::utils::Physical>,
-            )> = Vec::new();
-            let mut debug_ui_geometries: Vec<(
-                usize,
-                String,
-                &'static str,
-                smithay::utils::Rectangle<i32, smithay::utils::Physical>,
-            )> = Vec::new();
-            let mut debug_ui_pre_geometries: Vec<(
-                usize,
-                String,
-                &'static str,
-                smithay::utils::Rectangle<i32, smithay::utils::Physical>,
-            )> = Vec::new();
-            let root_origin = window_decorations.get(window).map(|decoration| {
-                root_physical_origin(decoration.layout.root.rect, output_geo, scale)
-            });
-            let composition_visual = if use_full_window_snapshot {
-                WindowVisualState {
-                    origin: Point::from((0, 0)),
-                    scale: Scale::from((1.0, 1.0)),
-                    translation: Point::from((0, 0)),
-                    opacity: 1.0,
+                if use_full_window_snapshot {
+                    transform_snapshot_window_ids.insert(window_id.clone());
+                } else {
+                    transform_snapshot_window_ids.remove(&window_id);
+                    complete_window_snapshot_trackers.remove(&window_id);
                 }
-            } else {
-                visual_state
-            };
-            let decoration_phase_started_at = Instant::now();
-            if decoration_ready {
-                let backdrop_started_at = Instant::now();
-                let mut backdrop_items = backdrop_shader_elements_for_window(
-                    &mut backend.renderer,
-                    space,
-                    window_decorations,
-                    &state.window_commit_times,
-                    &state.window_source_damage,
-                    &state.lower_layer_source_damage,
-                    state.lower_layer_scene_generation,
-                    &output,
-                    output_geo,
-                    scale,
-                    &windows_top_to_bottom,
-                    _window_index,
-                    window,
-                    if use_full_window_snapshot {
-                        1.0
-                    } else {
-                        visual_state.opacity
-                    },
-                    decoration_ready,
-                    false,
-                    !use_full_window_snapshot,
-                );
-                if let Some(effect_config) = state.configured_background_effect.as_ref() {
-                    if use_full_window_snapshot
-                        || !effect_config.effect.supports_framebuffer_backdrop()
+                let mut ordered_ui_elements: Vec<(usize, TtyRenderElements)> = Vec::new();
+                let mut ordered_backdrop_elements: Vec<(usize, TtyRenderElements)> = Vec::new();
+                let mut snapshot_ui_items: Vec<(usize, TtyRenderElements)> = Vec::new();
+                let mut snapshot_backdrop_items: Vec<(usize, TtyRenderElements)> = Vec::new();
+                let mut debug_background_geometries: Vec<(
+                    usize,
+                    String,
+                    &'static str,
+                    smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+                )> = Vec::new();
+                let mut debug_background_pre_geometries: Vec<(
+                    usize,
+                    String,
+                    &'static str,
+                    smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+                )> = Vec::new();
+                let mut debug_ui_geometries: Vec<(
+                    usize,
+                    String,
+                    &'static str,
+                    smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+                )> = Vec::new();
+                let mut debug_ui_pre_geometries: Vec<(
+                    usize,
+                    String,
+                    &'static str,
+                    smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+                )> = Vec::new();
+                let root_origin = window_decorations.get(window).map(|decoration| {
+                    root_physical_origin(decoration.layout.root.rect, output_geo, scale)
+                });
+                let composition_visual = if use_full_window_snapshot {
+                    WindowVisualState {
+                        origin: Point::from((0, 0)),
+                        scale: Scale::from((1.0, 1.0)),
+                        translation: Point::from((0, 0)),
+                        opacity: 1.0,
+                    }
+                } else {
+                    visual_state
+                };
+                let decoration_phase_started_at = Instant::now();
+                if decoration_ready {
+                    let backdrop_started_at = Instant::now();
+                    let mut backdrop_items = backdrop_shader_elements_for_window(
+                        &mut backend.renderer,
+                        space,
+                        window_decorations,
+                        &state.window_commit_times,
+                        &state.window_source_damage,
+                        &state.lower_layer_source_damage,
+                        state.lower_layer_scene_generation,
+                        &output,
+                        output_geo,
+                        scale,
+                        &windows_top_to_bottom,
+                        _window_index,
+                        window,
+                        if use_full_window_snapshot {
+                            1.0
+                        } else {
+                            visual_state.opacity
+                        },
+                        decoration_ready,
+                        false,
+                        !use_full_window_snapshot,
+                    );
+                    if let Some(effect_config) = state.configured_background_effect.as_ref() {
+                        if use_full_window_snapshot
+                            || !effect_config.effect.supports_framebuffer_backdrop()
+                        {
+                            backdrop_items.extend(
+                                configured_background_effect_elements_for_window(
+                                    &mut backend.renderer,
+                                    space,
+                                    window_decorations,
+                                    &state.window_commit_times,
+                                    &state.window_source_damage,
+                                    &state.lower_layer_source_damage,
+                                    state.lower_layer_scene_generation,
+                                    &output,
+                                    output_geo,
+                                    scale,
+                                    &windows_top_to_bottom,
+                                    _window_index,
+                                    window,
+                                    if use_full_window_snapshot {
+                                        1.0
+                                    } else {
+                                        visual_state.opacity
+                                    },
+                                    effect_config,
+                                    false,
+                                )
+                                .into_iter()
+                                .map(|(order, element)| (order, element, true)),
+                            );
+                        }
+                    }
+                    window_timing.backdrop_ms =
+                        backdrop_started_at.elapsed().as_secs_f64() * 1000.0;
+                    let background_started_at = Instant::now();
+                    for (order, element, render_as_backdrop) in backdrop_items.drain(..) {
+                        if let Some(root_origin) = root_origin {
+                            let items = transform_backdrop_elements(
+                                vec![element],
+                                root_origin,
+                                composition_visual,
+                            )?;
+                            if std::env::var_os("SHOJI_GAP_READBACK_DEBUG").is_some()
+                                && !use_full_window_snapshot
+                                && let Some(first_geometry) = items.first().map(|item| {
+                                    smithay::backend::renderer::element::Element::geometry(
+                                        item, scale,
+                                    )
+                                })
+                            {
+                                log_gap_readback_edge_probes(
+                                    &mut backend.renderer,
+                                    scale,
+                                    &items,
+                                    first_geometry,
+                                    "decoration-backdrop",
+                                    &output.name(),
+                                    &window_id,
+                                );
+                            }
+                            if use_full_window_snapshot {
+                                if render_as_backdrop {
+                                    snapshot_backdrop_items
+                                        .extend(items.into_iter().map(|item| (order, item)));
+                                } else {
+                                    snapshot_ui_items
+                                        .extend(items.into_iter().map(|item| (order, item)));
+                                }
+                            } else {
+                                let transformed = items.into_iter().map(|item| (order, item));
+                                if render_as_backdrop {
+                                    ordered_backdrop_elements.extend(transformed);
+                                } else {
+                                    ordered_ui_elements.extend(transformed);
+                                }
+                            }
+                        }
+                    }
+                    if !use_full_window_snapshot
+                        && let Some(effect_config) = state.configured_background_effect.as_ref()
+                        && effect_config.effect.supports_framebuffer_backdrop()
                     {
-                        backdrop_items.extend(
-                            configured_background_effect_elements_for_window(
+                        for (order, element) in
+                            configured_background_framebuffer_effect_elements_for_window(
                                 &mut backend.renderer,
-                                space,
                                 window_decorations,
-                                &state.window_commit_times,
-                                &state.window_source_damage,
-                                &state.lower_layer_source_damage,
-                                state.lower_layer_scene_generation,
-                                &output,
+                                window,
                                 output_geo,
                                 scale,
-                                &windows_top_to_bottom,
-                                _window_index,
-                                window,
-                                if use_full_window_snapshot {
-                                    1.0
-                                } else {
-                                    visual_state.opacity
-                                },
+                                visual_state.opacity,
                                 effect_config,
-                                false,
                             )
-                            .into_iter()
-                            .map(|(order, element)| (order, element, true)),
-                        );
-                    }
-                }
-                window_timing.backdrop_ms = backdrop_started_at.elapsed().as_secs_f64() * 1000.0;
-                let background_started_at = Instant::now();
-                for (order, element, render_as_backdrop) in backdrop_items.drain(..) {
-                    if let Some(root_origin) = root_origin {
-                        let items = transform_backdrop_elements(
-                            vec![element],
-                            root_origin,
-                            composition_visual,
-                        )?;
-                        if std::env::var_os("SHOJI_GAP_READBACK_DEBUG").is_some()
-                            && !use_full_window_snapshot
-                            && let Some(first_geometry) = items.first().map(|item| {
-                                smithay::backend::renderer::element::Element::geometry(item, scale)
-                            })
                         {
-                            log_gap_readback_edge_probes(
-                                &mut backend.renderer,
-                                scale,
-                                &items,
-                                first_geometry,
-                                "decoration-backdrop",
-                                &output.name(),
-                                &window_id,
-                            );
-                        }
-                        if use_full_window_snapshot {
-                            if render_as_backdrop {
-                                snapshot_backdrop_items
-                                    .extend(items.into_iter().map(|item| (order, item)));
-                            } else {
-                                snapshot_ui_items
-                                    .extend(items.into_iter().map(|item| (order, item)));
-                            }
-                        } else {
-                            let transformed = items.into_iter().map(|item| (order, item));
-                            if render_as_backdrop {
-                                ordered_backdrop_elements.extend(transformed);
-                            } else {
-                                ordered_ui_elements.extend(transformed);
+                            if let Some(root_origin) = root_origin {
+                                ordered_backdrop_elements.extend(
+                                    transform_decoration_elements(
+                                        vec![decoration::DecorationSceneElements::Backdrop(
+                                            element,
+                                        )],
+                                        root_origin,
+                                        composition_visual,
+                                    )?
+                                    .into_iter()
+                                    .map(|item| (order, item)),
+                                );
                             }
                         }
                     }
-                }
-                if !use_full_window_snapshot
-                    && let Some(effect_config) = state.configured_background_effect.as_ref()
-                    && effect_config.effect.supports_framebuffer_backdrop()
-                {
-                    for (order, element) in
-                        configured_background_framebuffer_effect_elements_for_window(
-                            &mut backend.renderer,
-                            window_decorations,
-                            window,
-                            output_geo,
-                            scale,
-                            visual_state.opacity,
-                            effect_config,
-                        )
-                    {
-                        if let Some(root_origin) = root_origin {
-                            ordered_backdrop_elements.extend(
-                                transform_decoration_elements(
-                                    vec![decoration::DecorationSceneElements::Backdrop(element)],
-                                    root_origin,
-                                    composition_visual,
-                                )?
-                                .into_iter()
-                                .map(|item| (order, item)),
-                            );
-                        }
-                    }
-                }
-                if let Some(decoration_state) = window_decorations.get_mut(window) {
-                    let mut ordered_background_items =
+                    if let Some(decoration_state) = window_decorations.get_mut(window) {
+                        let mut ordered_background_items =
                         decoration::ordered_background_elements_for_window_with_framebuffer_backdrops(
                             &mut backend.renderer,
                             decoration_state,
@@ -2619,17 +2690,144 @@ fn render_surface(
                             warn!(?error, "failed to build decoration background elements");
                         })
                         .unwrap_or_default();
-                    ordered_background_items.sort_by_key(|(order, _)| *order);
-                    for (order, element) in ordered_background_items {
+                        ordered_background_items.sort_by_key(|(order, _)| *order);
+                        for (order, element) in ordered_background_items {
+                            if let Some(root_origin) = root_origin {
+                                let render_as_backdrop = matches!(
+                                    element,
+                                    decoration::DecorationSceneElements::Backdrop(_)
+                                );
+                                let debug_stable = if std::env::var_os("SHOJI_GAP_DEBUG").is_some()
+                                {
+                                    decoration_state
+                                        .buffers
+                                        .iter()
+                                        .find(|buffer| buffer.order == order)
+                                        .map(|buffer| {
+                                            (buffer.stable_key.clone(), buffer.source_kind)
+                                        })
+                                } else {
+                                    None
+                                };
+                                let pre_transform_geometry = if std::env::var_os("SHOJI_GAP_DEBUG")
+                                    .is_some()
+                                {
+                                    Some(smithay::backend::renderer::element::Element::geometry(
+                                        &element, scale,
+                                    ))
+                                } else {
+                                    None
+                                };
+                                let items = transform_decoration_elements(
+                                    vec![element],
+                                    root_origin,
+                                    composition_visual,
+                                )?;
+                                if let (
+                                    Some((stable_key, source_kind)),
+                                    Some(pre_transform_geometry),
+                                ) = (debug_stable, pre_transform_geometry)
+                                {
+                                    let post_transform_geometry = items.first().map(|item| {
+                                        smithay::backend::renderer::element::Element::geometry(
+                                            item, scale,
+                                        )
+                                    });
+                                    debug_background_pre_geometries.push((
+                                        order,
+                                        stable_key.clone(),
+                                        source_kind,
+                                        pre_transform_geometry,
+                                    ));
+                                    if let Some(post_transform_geometry) = post_transform_geometry {
+                                        debug_background_geometries.push((
+                                            order,
+                                            stable_key.clone(),
+                                            source_kind,
+                                            post_transform_geometry,
+                                        ));
+                                    }
+                                    tracing::info!(
+                                        output = %output.name(),
+                                        window_id = %window_id,
+                                        stable_key = %stable_key,
+                                        source_kind = %source_kind,
+                                        order,
+                                        root_origin = ?root_origin,
+                                        visual_origin = ?composition_visual.origin,
+                                        visual_scale = ?composition_visual.scale,
+                                        visual_translation = ?composition_visual.translation,
+                                        pre_transform_geometry = ?pre_transform_geometry,
+                                        post_transform_geometry = ?post_transform_geometry,
+                                        "gap debug tty transformed decoration geometry"
+                                    );
+                                }
+                                if std::env::var_os("SHOJI_GAP_READBACK_DEBUG").is_some()
+                                    && !use_full_window_snapshot
+                                    && let Some(first_geometry) = items.first().map(|item| {
+                                        smithay::backend::renderer::element::Element::geometry(
+                                            item, scale,
+                                        )
+                                    })
+                                {
+                                    log_gap_readback_edge_probes(
+                                        &mut backend.renderer,
+                                        scale,
+                                        &items,
+                                        first_geometry,
+                                        "decoration-background",
+                                        &output.name(),
+                                        &window_id,
+                                    );
+                                }
+                                if use_full_window_snapshot {
+                                    if render_as_backdrop {
+                                        snapshot_backdrop_items
+                                            .extend(items.into_iter().map(|item| (order, item)));
+                                    } else {
+                                        snapshot_ui_items
+                                            .extend(items.into_iter().map(|item| (order, item)));
+                                    }
+                                } else if render_as_backdrop {
+                                    ordered_backdrop_elements
+                                        .extend(items.into_iter().map(|item| (order, item)));
+                                } else {
+                                    ordered_ui_elements
+                                        .extend(items.into_iter().map(|item| (order, item)));
+                                }
+                            }
+                        }
+                    }
+                    window_timing.background_ms =
+                        background_started_at.elapsed().as_secs_f64() * 1000.0;
+
+                    let icon_started_at = Instant::now();
+                    for (order, element) in decoration::ordered_icon_elements_for_window(
+                        &mut backend.renderer,
+                        space,
+                        window_decorations,
+                        &output,
+                        window,
+                        if use_full_window_snapshot {
+                            1.0
+                        } else {
+                            visual_state.opacity
+                        },
+                    )? {
                         if let Some(root_origin) = root_origin {
-                            let render_as_backdrop =
-                                matches!(element, decoration::DecorationSceneElements::Backdrop(_));
                             let debug_stable = if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
-                                decoration_state
-                                    .buffers
-                                    .iter()
-                                    .find(|buffer| buffer.order == order)
-                                    .map(|buffer| (buffer.stable_key.clone(), buffer.source_kind))
+                                Some(
+                                    window_decorations
+                                        .get(window)
+                                        .and_then(|decoration| {
+                                            decoration
+                                                .icon_buffers
+                                                .iter()
+                                                .find(|buffer| buffer.order == order)
+                                                .map(|buffer| buffer.stable_key.clone())
+                                        })
+                                        .unwrap_or_else(|| format!("icon-order-{order}")),
+                                )
                             } else {
                                 None
                             };
@@ -2641,12 +2839,12 @@ fn render_surface(
                                 } else {
                                     None
                                 };
-                            let items = transform_decoration_elements(
+                            let items = transform_text_elements(
                                 vec![element],
                                 root_origin,
                                 composition_visual,
                             )?;
-                            if let (Some((stable_key, source_kind)), Some(pre_transform_geometry)) =
+                            if let (Some(stable_key), Some(pre_transform_geometry)) =
                                 (debug_stable, pre_transform_geometry)
                             {
                                 let post_transform_geometry = items.first().map(|item| {
@@ -2654,17 +2852,17 @@ fn render_surface(
                                         item, scale,
                                     )
                                 });
-                                debug_background_pre_geometries.push((
+                                debug_ui_pre_geometries.push((
                                     order,
                                     stable_key.clone(),
-                                    source_kind,
+                                    "app-icon",
                                     pre_transform_geometry,
                                 ));
                                 if let Some(post_transform_geometry) = post_transform_geometry {
-                                    debug_background_geometries.push((
+                                    debug_ui_geometries.push((
                                         order,
                                         stable_key.clone(),
-                                        source_kind,
+                                        "app-icon",
                                         post_transform_geometry,
                                     ));
                                 }
@@ -2672,7 +2870,7 @@ fn render_surface(
                                     output = %output.name(),
                                     window_id = %window_id,
                                     stable_key = %stable_key,
-                                    source_kind = %source_kind,
+                                    source_kind = %"app-icon",
                                     order,
                                     root_origin = ?root_origin,
                                     visual_origin = ?composition_visual.origin,
@@ -2683,34 +2881,8 @@ fn render_surface(
                                     "gap debug tty transformed decoration geometry"
                                 );
                             }
-                            if std::env::var_os("SHOJI_GAP_READBACK_DEBUG").is_some()
-                                && !use_full_window_snapshot
-                                && let Some(first_geometry) = items.first().map(|item| {
-                                    smithay::backend::renderer::element::Element::geometry(
-                                        item, scale,
-                                    )
-                                })
-                            {
-                                log_gap_readback_edge_probes(
-                                    &mut backend.renderer,
-                                    scale,
-                                    &items,
-                                    first_geometry,
-                                    "decoration-background",
-                                    &output.name(),
-                                    &window_id,
-                                );
-                            }
                             if use_full_window_snapshot {
-                                if render_as_backdrop {
-                                    snapshot_backdrop_items
-                                        .extend(items.into_iter().map(|item| (order, item)));
-                                } else {
-                                    snapshot_ui_items
-                                        .extend(items.into_iter().map(|item| (order, item)));
-                                }
-                            } else if render_as_backdrop {
-                                ordered_backdrop_elements
+                                snapshot_ui_items
                                     .extend(items.into_iter().map(|item| (order, item)));
                             } else {
                                 ordered_ui_elements
@@ -2718,338 +2890,262 @@ fn render_surface(
                             }
                         }
                     }
-                }
-                window_timing.background_ms =
-                    background_started_at.elapsed().as_secs_f64() * 1000.0;
+                    window_timing.icon_ms = icon_started_at.elapsed().as_secs_f64() * 1000.0;
 
-                let icon_started_at = Instant::now();
-                for (order, element) in decoration::ordered_icon_elements_for_window(
-                    &mut backend.renderer,
-                    space,
-                    window_decorations,
-                    &output,
-                    window,
-                    if use_full_window_snapshot {
-                        1.0
-                    } else {
-                        visual_state.opacity
-                    },
-                )? {
-                    if let Some(root_origin) = root_origin {
-                        let debug_stable = if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
-                            Some(
-                                window_decorations
-                                    .get(window)
-                                    .and_then(|decoration| {
-                                        decoration
-                                            .icon_buffers
-                                            .iter()
-                                            .find(|buffer| buffer.order == order)
-                                            .map(|buffer| buffer.stable_key.clone())
-                                    })
-                                    .unwrap_or_else(|| format!("icon-order-{order}")),
-                            )
-                        } else {
-                            None
-                        };
-                        let pre_transform_geometry =
-                            if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
-                                Some(smithay::backend::renderer::element::Element::geometry(
-                                    &element, scale,
-                                ))
-                            } else {
-                                None
-                            };
-                        let items = transform_text_elements(
-                            vec![element],
-                            root_origin,
-                            composition_visual,
-                        )?;
-                        if let (Some(stable_key), Some(pre_transform_geometry)) =
-                            (debug_stable, pre_transform_geometry)
-                        {
-                            let post_transform_geometry = items.first().map(|item| {
-                                smithay::backend::renderer::element::Element::geometry(item, scale)
-                            });
-                            debug_ui_pre_geometries.push((
-                                order,
-                                stable_key.clone(),
-                                "app-icon",
-                                pre_transform_geometry,
-                            ));
-                            if let Some(post_transform_geometry) = post_transform_geometry {
-                                debug_ui_geometries.push((
-                                    order,
-                                    stable_key.clone(),
-                                    "app-icon",
-                                    post_transform_geometry,
-                                ));
-                            }
-                            tracing::info!(
-                                output = %output.name(),
-                                window_id = %window_id,
-                                stable_key = %stable_key,
-                                source_kind = %"app-icon",
-                                order,
-                                root_origin = ?root_origin,
-                                visual_origin = ?composition_visual.origin,
-                                visual_scale = ?composition_visual.scale,
-                                visual_translation = ?composition_visual.translation,
-                                pre_transform_geometry = ?pre_transform_geometry,
-                                post_transform_geometry = ?post_transform_geometry,
-                                "gap debug tty transformed decoration geometry"
-                            );
-                        }
+                    let text_started_at = Instant::now();
+                    for (order, element) in decoration::ordered_text_elements_for_window(
+                        &mut backend.renderer,
+                        space,
+                        window_decorations,
+                        &output,
+                        window,
                         if use_full_window_snapshot {
-                            snapshot_ui_items.extend(items.into_iter().map(|item| (order, item)));
+                            1.0
                         } else {
-                            ordered_ui_elements.extend(items.into_iter().map(|item| (order, item)));
-                        }
-                    }
-                }
-                window_timing.icon_ms = icon_started_at.elapsed().as_secs_f64() * 1000.0;
-
-                let text_started_at = Instant::now();
-                for (order, element) in decoration::ordered_text_elements_for_window(
-                    &mut backend.renderer,
-                    space,
-                    window_decorations,
-                    &output,
-                    window,
-                    if use_full_window_snapshot {
-                        1.0
-                    } else {
-                        visual_state.opacity
-                    },
-                )? {
-                    if let Some(root_origin) = root_origin {
-                        let debug_stable = if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
-                            Some(
-                                window_decorations
-                                    .get(window)
-                                    .and_then(|decoration| {
-                                        decoration
-                                            .text_buffers
-                                            .iter()
-                                            .find(|buffer| buffer.order == order)
-                                            .map(|buffer| buffer.stable_key.clone())
-                                    })
-                                    .unwrap_or_else(|| format!("label-order-{order}")),
-                            )
-                        } else {
-                            None
-                        };
-                        let pre_transform_geometry =
-                            if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
-                                Some(smithay::backend::renderer::element::Element::geometry(
-                                    &element, scale,
-                                ))
+                            visual_state.opacity
+                        },
+                    )? {
+                        if let Some(root_origin) = root_origin {
+                            let debug_stable = if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                                Some(
+                                    window_decorations
+                                        .get(window)
+                                        .and_then(|decoration| {
+                                            decoration
+                                                .text_buffers
+                                                .iter()
+                                                .find(|buffer| buffer.order == order)
+                                                .map(|buffer| buffer.stable_key.clone())
+                                        })
+                                        .unwrap_or_else(|| format!("label-order-{order}")),
+                                )
                             } else {
                                 None
                             };
-                        let items = transform_text_elements(
-                            vec![element],
-                            root_origin,
-                            composition_visual,
-                        )?;
-                        if let (Some(stable_key), Some(pre_transform_geometry)) =
-                            (debug_stable, pre_transform_geometry)
-                        {
-                            let post_transform_geometry = items.first().map(|item| {
-                                smithay::backend::renderer::element::Element::geometry(item, scale)
-                            });
-                            debug_ui_pre_geometries.push((
-                                order,
-                                stable_key.clone(),
-                                "label",
-                                pre_transform_geometry,
-                            ));
-                            if let Some(post_transform_geometry) = post_transform_geometry {
-                                debug_ui_geometries.push((
+                            let pre_transform_geometry =
+                                if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                                    Some(smithay::backend::renderer::element::Element::geometry(
+                                        &element, scale,
+                                    ))
+                                } else {
+                                    None
+                                };
+                            let items = transform_text_elements(
+                                vec![element],
+                                root_origin,
+                                composition_visual,
+                            )?;
+                            if let (Some(stable_key), Some(pre_transform_geometry)) =
+                                (debug_stable, pre_transform_geometry)
+                            {
+                                let post_transform_geometry = items.first().map(|item| {
+                                    smithay::backend::renderer::element::Element::geometry(
+                                        item, scale,
+                                    )
+                                });
+                                debug_ui_pre_geometries.push((
                                     order,
                                     stable_key.clone(),
                                     "label",
-                                    post_transform_geometry,
+                                    pre_transform_geometry,
                                 ));
+                                if let Some(post_transform_geometry) = post_transform_geometry {
+                                    debug_ui_geometries.push((
+                                        order,
+                                        stable_key.clone(),
+                                        "label",
+                                        post_transform_geometry,
+                                    ));
+                                }
+                                tracing::info!(
+                                    output = %output.name(),
+                                    window_id = %window_id,
+                                    stable_key = %stable_key,
+                                    source_kind = %"label",
+                                    order,
+                                    root_origin = ?root_origin,
+                                    visual_origin = ?composition_visual.origin,
+                                    visual_scale = ?composition_visual.scale,
+                                    visual_translation = ?composition_visual.translation,
+                                    pre_transform_geometry = ?pre_transform_geometry,
+                                    post_transform_geometry = ?post_transform_geometry,
+                                    "gap debug tty transformed decoration geometry"
+                                );
                             }
-                            tracing::info!(
-                                output = %output.name(),
-                                window_id = %window_id,
-                                stable_key = %stable_key,
-                                source_kind = %"label",
-                                order,
-                                root_origin = ?root_origin,
-                                visual_origin = ?composition_visual.origin,
-                                visual_scale = ?composition_visual.scale,
-                                visual_translation = ?composition_visual.translation,
-                                pre_transform_geometry = ?pre_transform_geometry,
-                                post_transform_geometry = ?post_transform_geometry,
-                                "gap debug tty transformed decoration geometry"
-                            );
-                        }
-                        if use_full_window_snapshot {
-                            snapshot_ui_items.extend(items.into_iter().map(|item| (order, item)));
-                        } else {
-                            ordered_ui_elements.extend(items.into_iter().map(|item| (order, item)));
+                            if use_full_window_snapshot {
+                                snapshot_ui_items
+                                    .extend(items.into_iter().map(|item| (order, item)));
+                            } else {
+                                ordered_ui_elements
+                                    .extend(items.into_iter().map(|item| (order, item)));
+                            }
                         }
                     }
-                }
-                window_timing.text_ms = text_started_at.elapsed().as_secs_f64() * 1000.0;
+                    window_timing.text_ms = text_started_at.elapsed().as_secs_f64() * 1000.0;
 
-                ordered_ui_elements.sort_by_key(|(order, _)| *order);
-                ordered_backdrop_elements.sort_by_key(|(order, _)| *order);
-                snapshot_ui_items.sort_by_key(|(order, _)| *order);
-                snapshot_backdrop_items.sort_by_key(|(order, _)| *order);
-                if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
-                    let first_backdrop = ordered_backdrop_elements.first().map(|(_, element)| {
-                        smithay::backend::renderer::element::Element::geometry(element, scale)
-                    });
-                    let first_snapshot_backdrop =
-                        snapshot_backdrop_items.first().map(|(_, element)| {
+                    ordered_ui_elements.sort_by_key(|(order, _)| *order);
+                    ordered_backdrop_elements.sort_by_key(|(order, _)| *order);
+                    snapshot_ui_items.sort_by_key(|(order, _)| *order);
+                    snapshot_backdrop_items.sort_by_key(|(order, _)| *order);
+                    if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
+                        let first_backdrop =
+                            ordered_backdrop_elements.first().map(|(_, element)| {
+                                smithay::backend::renderer::element::Element::geometry(
+                                    element, scale,
+                                )
+                            });
+                        let first_snapshot_backdrop =
+                            snapshot_backdrop_items.first().map(|(_, element)| {
+                                smithay::backend::renderer::element::Element::geometry(
+                                    element, scale,
+                                )
+                            });
+                        let first_ui = ordered_ui_elements.first().map(|(_, element)| {
                             smithay::backend::renderer::element::Element::geometry(element, scale)
                         });
-                    let first_ui = ordered_ui_elements.first().map(|(_, element)| {
-                        smithay::backend::renderer::element::Element::geometry(element, scale)
-                    });
-                    let first_snapshot_item = snapshot_ui_items.first().map(|(_, element)| {
-                        smithay::backend::renderer::element::Element::geometry(element, scale)
-                    });
-                    tracing::info!(
-                        window_id = %window_id,
-                        use_full_window_snapshot,
-                        visual_state = ?visual_state,
-                        backdrop_count = ordered_backdrop_elements.len(),
-                        ui_count = ordered_ui_elements.len(),
-                        snapshot_scene_count = snapshot_ui_items.len() + snapshot_backdrop_items.len(),
-                        first_backdrop = ?first_backdrop,
-                        first_snapshot_backdrop = ?first_snapshot_backdrop,
-                        first_ui = ?first_ui,
-                        first_snapshot_item = ?first_snapshot_item,
-                        "transform snapshot tty branch composition"
-                    );
-                }
-                if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
-                    let first_backdrop = ordered_backdrop_elements.first().map(|(_, element)| {
-                        smithay::backend::renderer::element::Element::geometry(element, scale)
-                    });
-                    let first_fill = debug_background_geometries
-                        .iter()
-                        .filter(|(_, stable_key, source_kind, geometry)| {
-                            *source_kind == "fill"
-                                && stable_key.ends_with(":fill")
-                                && geometry.size.w > 200
-                        })
-                        .min_by_key(|(order, _, _, _)| *order)
-                        .map(|(_, _, _, geometry)| *geometry);
-                    let backdrop_fill_delta =
-                        first_backdrop.zip(first_fill).map(|(backdrop, fill)| {
-                            (
-                                backdrop.loc.x - fill.loc.x,
-                                backdrop.loc.y - fill.loc.y,
-                                backdrop.size.w - fill.size.w,
-                                backdrop.size.h - fill.size.h,
-                            )
+                        let first_snapshot_item = snapshot_ui_items.first().map(|(_, element)| {
+                            smithay::backend::renderer::element::Element::geometry(element, scale)
                         });
-                    tracing::info!(
-                        window_id = %window_id,
-                        first_backdrop = ?first_backdrop,
-                        first_fill = ?first_fill,
-                        backdrop_fill_delta = ?backdrop_fill_delta,
-                        "gap debug tty backdrop/fill compare"
+                        tracing::info!(
+                            window_id = %window_id,
+                            use_full_window_snapshot,
+                            visual_state = ?visual_state,
+                            backdrop_count = ordered_backdrop_elements.len(),
+                            ui_count = ordered_ui_elements.len(),
+                            snapshot_scene_count = snapshot_ui_items.len() + snapshot_backdrop_items.len(),
+                            first_backdrop = ?first_backdrop,
+                            first_snapshot_backdrop = ?first_snapshot_backdrop,
+                            first_ui = ?first_ui,
+                            first_snapshot_item = ?first_snapshot_item,
+                            "transform snapshot tty branch composition"
+                        );
+                    }
+                    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                        let first_backdrop =
+                            ordered_backdrop_elements.first().map(|(_, element)| {
+                                smithay::backend::renderer::element::Element::geometry(
+                                    element, scale,
+                                )
+                            });
+                        let first_fill = debug_background_geometries
+                            .iter()
+                            .filter(|(_, stable_key, source_kind, geometry)| {
+                                *source_kind == "fill"
+                                    && stable_key.ends_with(":fill")
+                                    && geometry.size.w > 200
+                            })
+                            .min_by_key(|(order, _, _, _)| *order)
+                            .map(|(_, _, _, geometry)| *geometry);
+                        let backdrop_fill_delta =
+                            first_backdrop.zip(first_fill).map(|(backdrop, fill)| {
+                                (
+                                    backdrop.loc.x - fill.loc.x,
+                                    backdrop.loc.y - fill.loc.y,
+                                    backdrop.size.w - fill.size.w,
+                                    backdrop.size.h - fill.size.h,
+                                )
+                            });
+                        tracing::info!(
+                            window_id = %window_id,
+                            first_backdrop = ?first_backdrop,
+                            first_fill = ?first_fill,
+                            backdrop_fill_delta = ?backdrop_fill_delta,
+                            "gap debug tty backdrop/fill compare"
+                        );
+                    }
+                }
+                window_timing.decoration_phase_ms =
+                    decoration_phase_started_at.elapsed().as_secs_f64() * 1000.0;
+
+                let content_clip = window_decorations
+                    .get(window)
+                    .and_then(|decoration| decoration.content_clip);
+                let clip_all_client_surfaces = window_decorations
+                    .get(window)
+                    .is_some_and(|decoration| decoration.managed_window.force_rect_size);
+                if let Some(decoration) = window_decorations.get(window) {
+                    log_managed_rect_physical_debug(
+                        &window_id,
+                        &output.name(),
+                        decoration.layout.root.rect,
+                        content_clip,
+                        output_geo,
+                        scale,
                     );
                 }
-            }
-            window_timing.decoration_phase_ms =
-                decoration_phase_started_at.elapsed().as_secs_f64() * 1000.0;
 
-            let content_clip = window_decorations
-                .get(window)
-                .and_then(|decoration| decoration.content_clip);
-            let clip_all_client_surfaces = window_decorations
-                .get(window)
-                .is_some_and(|decoration| decoration.managed_window.force_rect_size);
-            if let Some(decoration) = window_decorations.get(window) {
-                log_managed_rect_physical_debug(
-                    &window_id,
-                    &output.name(),
-                    decoration.layout.root.rect,
-                    content_clip,
-                    output_geo,
-                    scale,
-                );
-            }
-
-            let client_phase_started_at = Instant::now();
-            let client_elements = if use_full_window_snapshot {
-                let full_snapshot_scene_started_at = Instant::now();
-                let mut snapshot_scene = Vec::new();
-                if let Some(content_clip) = content_clip {
-                    let clipped = window_render::clipped_surface_elements(
-                        window,
-                        &mut backend.renderer,
-                        physical_location,
-                        client_physical_geometry,
-                        output_geo.loc,
-                        scale,
-                        scale,
-                        1.0,
-                        Some(content_clip),
-                        clip_all_client_surfaces,
-                    )
-                    .unwrap_or_default();
-                    let mut root_raw_element = None;
-                    for element in clipped {
-                        match element {
-                            window_render::WindowClipElement::Clipped(element) => {
-                                snapshot_scene.push(TtyRenderElements::Clipped(element));
-                                if !clip_all_client_surfaces {
-                                    break;
-                                }
-                            }
-                            window_render::WindowClipElement::Raw(element)
-                                if root_raw_element.is_none() =>
-                            {
-                                root_raw_element = Some(element);
-                            }
-                            window_render::WindowClipElement::Raw(_) => {}
-                        }
-                    }
-                    if snapshot_scene.is_empty()
-                        && let Some(element) = root_raw_element
-                    {
-                        snapshot_scene.push(TtyRenderElements::Window(element));
-                    }
-                } else {
-                    snapshot_scene.extend(
-                        window_render::root_surface_elements(
+                let client_phase_started_at = Instant::now();
+                let client_elements = if use_full_window_snapshot {
+                    let full_snapshot_scene_started_at = Instant::now();
+                    let mut snapshot_scene = Vec::new();
+                    if let Some(content_clip) = content_clip {
+                        let clipped = window_render::clipped_surface_elements(
                             window,
                             &mut backend.renderer,
                             physical_location,
+                            client_physical_geometry,
+                            output_geo.loc,
+                            scale,
                             scale,
                             1.0,
+                            Some(content_clip),
+                            clip_all_client_surfaces,
                         )
-                        .into_iter()
-                        .map(TtyRenderElements::Window),
+                        .unwrap_or_default();
+                        let mut root_raw_element = None;
+                        for element in clipped {
+                            match element {
+                                window_render::WindowClipElement::Clipped(element) => {
+                                    snapshot_scene.push(TtyRenderElements::Clipped(element));
+                                    if !clip_all_client_surfaces {
+                                        break;
+                                    }
+                                }
+                                window_render::WindowClipElement::Raw(element)
+                                    if root_raw_element.is_none() =>
+                                {
+                                    root_raw_element = Some(element);
+                                }
+                                window_render::WindowClipElement::Raw(_) => {}
+                            }
+                        }
+                        if snapshot_scene.is_empty()
+                            && let Some(element) = root_raw_element
+                        {
+                            snapshot_scene.push(TtyRenderElements::Window(element));
+                        }
+                    } else {
+                        snapshot_scene.extend(
+                            window_render::root_surface_elements(
+                                window,
+                                &mut backend.renderer,
+                                physical_location,
+                                scale,
+                                1.0,
+                            )
+                            .into_iter()
+                            .map(TtyRenderElements::Window),
+                        );
+                    }
+                    let _client_end_len = snapshot_scene.len();
+                    snapshot_scene
+                        .extend(snapshot_ui_items.into_iter().map(|(_, element)| element));
+                    snapshot_scene.extend(
+                        snapshot_backdrop_items
+                            .into_iter()
+                            .map(|(_, element)| element),
                     );
-                }
-                let _client_end_len = snapshot_scene.len();
-                snapshot_scene.extend(snapshot_ui_items.into_iter().map(|(_, element)| element));
-                snapshot_scene.extend(
-                    snapshot_backdrop_items
-                        .into_iter()
-                        .map(|(_, element)| element),
-                );
-                let full_rect = window_decorations
-                    .get(window)
-                    .map(|decoration| decoration.layout.root.rect);
-                let snapshot_scene_signature =
-                    crate::backend::snapshot::render_element_scene_signature(
-                        &snapshot_scene,
-                        scale,
-                    );
-                window_timing.full_snapshot_scene_ms =
-                    full_snapshot_scene_started_at.elapsed().as_secs_f64() * 1000.0;
-                full_rect
+                    let full_rect = window_decorations
+                        .get(window)
+                        .map(|decoration| decoration.layout.root.rect);
+                    let snapshot_scene_signature =
+                        crate::backend::snapshot::render_element_scene_signature(
+                            &snapshot_scene,
+                            scale,
+                        );
+                    window_timing.full_snapshot_scene_ms =
+                        full_snapshot_scene_started_at.elapsed().as_secs_f64() * 1000.0;
+                    full_rect
                     .and_then(|full_rect| {
                         if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
                             let existing_signature = complete_window_snapshots
@@ -3169,94 +3265,95 @@ fn render_surface(
                         transform_snapshot_elements(vec![element], visual_state).ok()
                     })
                     .unwrap_or_default()
-            } else if let Some(content_clip) = content_clip {
-                if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
-                    if let Some(decoration) = window_decorations.get(window) {
-                        let border_buffer = decoration.buffers.iter().find(|buffer| {
-                            buffer.source_kind == "window-border" && buffer.border_width > 0.0
-                        });
-                        let border_fill = decoration.buffers.iter().find(|buffer| {
-                            buffer.source_kind == "fill" && buffer.hole_rect.is_some()
-                        });
-                        let snap_scale = Scale::from((
-                            scale.x * visual_state.scale.x.max(0.0),
-                            scale.y * visual_state.scale.y.max(0.0),
-                        ));
-                        let border_width = (decoration.layout.root.rect.x
-                            + decoration.layout.root.rect.width)
-                            - (content_clip.rect.loc.x + content_clip.rect.size.w);
-                        let border_rect = Some(crate::ssd::LogicalRect::new(
-                            content_clip.rect.loc.x - border_width,
-                            content_clip.rect.loc.y - border_width,
-                            content_clip.rect.size.w + border_width * 2,
-                            content_clip.rect.size.h + border_width * 2,
-                        ));
-                        let snapped_inner = Some(
-                            crate::backend::visual::snapped_logical_rect_relative_with_mode(
-                                crate::ssd::LogicalRect::new(
-                                    content_clip.rect.loc.x,
-                                    content_clip.rect.loc.y,
-                                    content_clip.rect.size.w,
-                                    content_clip.rect.size.h,
-                                ),
-                                output_geo.loc,
-                                snap_scale,
-                                content_clip.snap_mode,
-                            ),
-                        );
-                        let snapped_clip =
-                            crate::backend::visual::snapped_logical_rect_relative_with_mode(
-                                crate::ssd::LogicalRect::new(
-                                    content_clip.rect.loc.x,
-                                    content_clip.rect.loc.y,
-                                    content_clip.rect.size.w,
-                                    content_clip.rect.size.h,
-                                ),
-                                output_geo.loc,
-                                snap_scale,
-                                content_clip.snap_mode,
-                            );
-                        let expected_left = (snapped_clip.x as f64 * scale.x).round() as i32;
-                        let expected_top = (snapped_clip.y as f64 * scale.y).round() as i32;
-                        let expected_right =
-                            ((snapped_clip.x + snapped_clip.width) as f64 * scale.x).round() as i32;
-                        let expected_bottom = ((snapped_clip.y + snapped_clip.height) as f64
-                            * scale.y)
-                            .round() as i32;
-                        tracing::info!(
-                            output = %output.name(),
-                            window_id = %window_id,
-                            window_location = ?window_location,
-                            output_scale = scale.x,
-                            window_scale_x = visual_state.scale.x,
-                            window_scale_y = visual_state.scale.y,
-                            physical_location = ?physical_location,
-                            border_rect = ?border_rect,
-                            snapped_inner = ?snapped_inner,
-                            content_clip = ?content_clip,
-                            snapped_clip = ?snapped_clip,
-                            expected_left,
-                            expected_top,
-                            expected_right,
-                            expected_bottom,
-                            "gap debug tty border/client geometry"
-                        );
-                        tracing::info!(
-                            output = %output.name(),
-                            window_id = %window_id,
-                            border_buffer_rect = ?border_buffer.map(|buffer| buffer.rect),
-                            border_buffer_width = ?border_buffer.map(|buffer| buffer.border_width),
-                            border_buffer_hole = ?border_buffer.and_then(|buffer| buffer.hole_rect),
-                            border_buffer_hole_precise = ?border_buffer.and_then(|buffer| buffer.hole_rect_precise),
-                            border_buffer_hole_radius_precise = ?border_buffer.and_then(|buffer| buffer.hole_radius_precise),
-                            border_fill_rect = ?border_fill.map(|buffer| buffer.rect),
-                            border_fill_hole = ?border_fill.and_then(|buffer| buffer.hole_rect),
-                            decoration_root_rect = ?decoration.layout.root.rect,
-                            decoration_slot_rect = ?decoration.layout.window_slot_rect(),
-                            "gap debug tty border buffers"
-                        );
+                } else if let Some(content_clip) = content_clip {
+                    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
                         if let Some(decoration) = window_decorations.get(window) {
-                            let border_outer_physical = border_buffer.and_then(|buffer| {
+                            let border_buffer = decoration.buffers.iter().find(|buffer| {
+                                buffer.source_kind == "window-border" && buffer.border_width > 0.0
+                            });
+                            let border_fill = decoration.buffers.iter().find(|buffer| {
+                                buffer.source_kind == "fill" && buffer.hole_rect.is_some()
+                            });
+                            let snap_scale = Scale::from((
+                                scale.x * visual_state.scale.x.max(0.0),
+                                scale.y * visual_state.scale.y.max(0.0),
+                            ));
+                            let border_width = (decoration.layout.root.rect.x
+                                + decoration.layout.root.rect.width)
+                                - (content_clip.rect.loc.x + content_clip.rect.size.w);
+                            let border_rect = Some(crate::ssd::LogicalRect::new(
+                                content_clip.rect.loc.x - border_width,
+                                content_clip.rect.loc.y - border_width,
+                                content_clip.rect.size.w + border_width * 2,
+                                content_clip.rect.size.h + border_width * 2,
+                            ));
+                            let snapped_inner = Some(
+                                crate::backend::visual::snapped_logical_rect_relative_with_mode(
+                                    crate::ssd::LogicalRect::new(
+                                        content_clip.rect.loc.x,
+                                        content_clip.rect.loc.y,
+                                        content_clip.rect.size.w,
+                                        content_clip.rect.size.h,
+                                    ),
+                                    output_geo.loc,
+                                    snap_scale,
+                                    content_clip.snap_mode,
+                                ),
+                            );
+                            let snapped_clip =
+                                crate::backend::visual::snapped_logical_rect_relative_with_mode(
+                                    crate::ssd::LogicalRect::new(
+                                        content_clip.rect.loc.x,
+                                        content_clip.rect.loc.y,
+                                        content_clip.rect.size.w,
+                                        content_clip.rect.size.h,
+                                    ),
+                                    output_geo.loc,
+                                    snap_scale,
+                                    content_clip.snap_mode,
+                                );
+                            let expected_left = (snapped_clip.x as f64 * scale.x).round() as i32;
+                            let expected_top = (snapped_clip.y as f64 * scale.y).round() as i32;
+                            let expected_right = ((snapped_clip.x + snapped_clip.width) as f64
+                                * scale.x)
+                                .round() as i32;
+                            let expected_bottom = ((snapped_clip.y + snapped_clip.height) as f64
+                                * scale.y)
+                                .round() as i32;
+                            tracing::info!(
+                                output = %output.name(),
+                                window_id = %window_id,
+                                window_location = ?window_location,
+                                output_scale = scale.x,
+                                window_scale_x = visual_state.scale.x,
+                                window_scale_y = visual_state.scale.y,
+                                physical_location = ?physical_location,
+                                border_rect = ?border_rect,
+                                snapped_inner = ?snapped_inner,
+                                content_clip = ?content_clip,
+                                snapped_clip = ?snapped_clip,
+                                expected_left,
+                                expected_top,
+                                expected_right,
+                                expected_bottom,
+                                "gap debug tty border/client geometry"
+                            );
+                            tracing::info!(
+                                output = %output.name(),
+                                window_id = %window_id,
+                                border_buffer_rect = ?border_buffer.map(|buffer| buffer.rect),
+                                border_buffer_width = ?border_buffer.map(|buffer| buffer.border_width),
+                                border_buffer_hole = ?border_buffer.and_then(|buffer| buffer.hole_rect),
+                                border_buffer_hole_precise = ?border_buffer.and_then(|buffer| buffer.hole_rect_precise),
+                                border_buffer_hole_radius_precise = ?border_buffer.and_then(|buffer| buffer.hole_radius_precise),
+                                border_fill_rect = ?border_fill.map(|buffer| buffer.rect),
+                                border_fill_hole = ?border_fill.and_then(|buffer| buffer.hole_rect),
+                                decoration_root_rect = ?decoration.layout.root.rect,
+                                decoration_slot_rect = ?decoration.layout.window_slot_rect(),
+                                "gap debug tty border buffers"
+                            );
+                            if let Some(decoration) = window_decorations.get(window) {
+                                let border_outer_physical = border_buffer.and_then(|buffer| {
                                 buffer
                                     .rect_precise
                                     .map(|rect| crate::backend::visual::relative_physical_rect_from_root_precise(
@@ -3273,7 +3370,7 @@ fn render_surface(
                                         buffer.clip_rect,
                                     )))
                             });
-                            let border_inner_physical = border_buffer.and_then(|buffer| {
+                                let border_inner_physical = border_buffer.and_then(|buffer| {
                                 buffer
                                     .hole_rect_precise
                                     .map(|rect| crate::backend::visual::relative_physical_rect_from_root_precise(
@@ -3292,10 +3389,10 @@ fn render_surface(
                                         )
                                     }))
                             });
-                            let titlebar_fill = decoration.buffers.iter().find(|buffer| {
-                                buffer.source_kind == "fill" && buffer.rect.height == 30
-                            });
-                            let titlebar_fill_physical = titlebar_fill.map(|buffer| {
+                                let titlebar_fill = decoration.buffers.iter().find(|buffer| {
+                                    buffer.source_kind == "fill" && buffer.rect.height == 30
+                                });
+                                let titlebar_fill_physical = titlebar_fill.map(|buffer| {
                                 buffer
                                     .rect_precise
                                     .map(|rect| crate::backend::visual::relative_physical_rect_from_root_precise(
@@ -3314,31 +3411,32 @@ fn render_surface(
                                         )
                                     })
                             });
-                            let titlebar_shader = decoration
-                                .shader_buffers
-                                .iter()
-                                .find(|buffer| buffer.rect.height == 30);
-                            let titlebar_shader_precise = titlebar_shader.and_then(|buffer| {
-                                buffer.rect_precise.map(|rect| {
-                                    crate::backend::visual::PreciseLogicalRect {
-                                        x: rect.x - decoration.layout.root.rect.x as f32,
-                                        y: rect.y - decoration.layout.root.rect.y as f32,
-                                        width: rect.width,
-                                        height: rect.height,
-                                    }
-                                })
-                            });
-                            let titlebar_shader_clip_precise = titlebar_shader.and_then(|buffer| {
-                                buffer.clip_rect_precise.map(|rect| {
-                                    crate::backend::visual::PreciseLogicalRect {
-                                        x: rect.x - decoration.layout.root.rect.x as f32,
-                                        y: rect.y - decoration.layout.root.rect.y as f32,
-                                        width: rect.width,
-                                        height: rect.height,
-                                    }
-                                })
-                            });
-                            let titlebar_shader_physical = titlebar_shader.map(|buffer| {
+                                let titlebar_shader = decoration
+                                    .shader_buffers
+                                    .iter()
+                                    .find(|buffer| buffer.rect.height == 30);
+                                let titlebar_shader_precise = titlebar_shader.and_then(|buffer| {
+                                    buffer.rect_precise.map(|rect| {
+                                        crate::backend::visual::PreciseLogicalRect {
+                                            x: rect.x - decoration.layout.root.rect.x as f32,
+                                            y: rect.y - decoration.layout.root.rect.y as f32,
+                                            width: rect.width,
+                                            height: rect.height,
+                                        }
+                                    })
+                                });
+                                let titlebar_shader_clip_precise =
+                                    titlebar_shader.and_then(|buffer| {
+                                        buffer.clip_rect_precise.map(|rect| {
+                                            crate::backend::visual::PreciseLogicalRect {
+                                                x: rect.x - decoration.layout.root.rect.x as f32,
+                                                y: rect.y - decoration.layout.root.rect.y as f32,
+                                                width: rect.width,
+                                                height: rect.height,
+                                            }
+                                        })
+                                    });
+                                let titlebar_shader_physical = titlebar_shader.map(|buffer| {
                                 buffer
                                     .rect_precise
                                     .map(|rect| crate::backend::visual::relative_physical_rect_from_root_precise(
@@ -3357,51 +3455,53 @@ fn render_surface(
                                         )
                                     })
                             });
-                            let titlebar_shader_clip_physical_precise =
-                                titlebar_shader_clip_precise.map(|clip| {
-                                    let scale_x = scale.x.abs().max(0.0001) as f32;
-                                    let scale_y = scale.y.abs().max(0.0001) as f32;
-                                    (
-                                        clip.x * scale_x,
-                                        clip.y * scale_y,
-                                        clip.width * scale_x,
-                                        clip.height * scale_y,
-                                    )
-                                });
-                            let titlebar_shader_clip_physical_global_precise =
-                                titlebar_shader_clip_physical_precise;
-                            let border_expected_inner_precise = border_buffer
-                                .and_then(|buffer| buffer.hole_rect_precise)
-                                .map(|rect| crate::backend::visual::PreciseLogicalRect {
-                                    x: rect.x - decoration.layout.root.rect.x as f32,
-                                    y: rect.y - decoration.layout.root.rect.y as f32,
-                                    width: rect.width,
-                                    height: rect.height,
-                                });
-                            let border_expected_inner_physical_precise =
-                                border_expected_inner_precise.map(|rect| {
-                                    let scale_x = scale.x.abs().max(0.0001) as f32;
-                                    let scale_y = scale.y.abs().max(0.0001) as f32;
-                                    (
-                                        rect.x * scale_x,
-                                        rect.y * scale_y,
-                                        rect.width * scale_x,
-                                        rect.height * scale_y,
-                                    )
-                                });
-                            let shader_clip_vs_border_inner_precise =
-                                titlebar_shader_clip_physical_global_precise
-                                    .zip(border_expected_inner_physical_precise)
-                                    .map(|(shader, border)| {
+                                let titlebar_shader_clip_physical_precise =
+                                    titlebar_shader_clip_precise.map(|clip| {
+                                        let scale_x = scale.x.abs().max(0.0001) as f32;
+                                        let scale_y = scale.y.abs().max(0.0001) as f32;
                                         (
-                                            shader.0 - border.0,
-                                            shader.1 - border.1,
-                                            (shader.0 + shader.2) - (border.0 + border.2),
-                                            (shader.1 + shader.3) - (border.1 + border.3),
+                                            clip.x * scale_x,
+                                            clip.y * scale_y,
+                                            clip.width * scale_x,
+                                            clip.height * scale_y,
                                         )
                                     });
-                            let content_clip_physical =
-                                smithay::utils::Rectangle::<i32, smithay::utils::Physical>::new(
+                                let titlebar_shader_clip_physical_global_precise =
+                                    titlebar_shader_clip_physical_precise;
+                                let border_expected_inner_precise = border_buffer
+                                    .and_then(|buffer| buffer.hole_rect_precise)
+                                    .map(|rect| crate::backend::visual::PreciseLogicalRect {
+                                        x: rect.x - decoration.layout.root.rect.x as f32,
+                                        y: rect.y - decoration.layout.root.rect.y as f32,
+                                        width: rect.width,
+                                        height: rect.height,
+                                    });
+                                let border_expected_inner_physical_precise =
+                                    border_expected_inner_precise.map(|rect| {
+                                        let scale_x = scale.x.abs().max(0.0001) as f32;
+                                        let scale_y = scale.y.abs().max(0.0001) as f32;
+                                        (
+                                            rect.x * scale_x,
+                                            rect.y * scale_y,
+                                            rect.width * scale_x,
+                                            rect.height * scale_y,
+                                        )
+                                    });
+                                let shader_clip_vs_border_inner_precise =
+                                    titlebar_shader_clip_physical_global_precise
+                                        .zip(border_expected_inner_physical_precise)
+                                        .map(|(shader, border)| {
+                                            (
+                                                shader.0 - border.0,
+                                                shader.1 - border.1,
+                                                (shader.0 + shader.2) - (border.0 + border.2),
+                                                (shader.1 + shader.3) - (border.1 + border.3),
+                                            )
+                                        });
+                                let content_clip_physical = smithay::utils::Rectangle::<
+                                    i32,
+                                    smithay::utils::Physical,
+                                >::new(
                                     smithay::utils::Point::from((expected_left, expected_top)),
                                     (
                                         (expected_right - expected_left).max(0),
@@ -3409,224 +3509,232 @@ fn render_surface(
                                     )
                                         .into(),
                                 );
-                            let first_button = decoration.buffers.iter().find(|buffer| {
-                                buffer.source_kind == "button" && buffer.border_width > 0.0
-                            });
-                            let first_button_physical = first_button.map(|buffer| {
-                                crate::backend::visual::relative_physical_rect_from_root(
-                                    buffer.rect,
-                                    decoration.layout.root.rect,
-                                    output_geo,
-                                    scale,
-                                    buffer.clip_rect,
-                                )
-                            });
-                            let button_delta = match (border_inner_physical, first_button_physical)
-                            {
-                                (Some(inner), Some(button)) => Some((
-                                    button.loc.x - inner.loc.x,
-                                    button.loc.y - inner.loc.y,
-                                    (inner.loc.x + inner.size.w) - (button.loc.x + button.size.w),
-                                    (inner.loc.y + inner.size.h) - (button.loc.y + button.size.h),
-                                )),
-                                _ => None,
-                            };
-                            tracing::info!(
-                                output = %output.name(),
-                                window_id = %window_id,
-                                border_outer_physical = ?border_outer_physical,
-                                border_inner_physical = ?border_inner_physical,
-                                titlebar_shader_physical = ?titlebar_shader_physical,
-                                titlebar_fill_physical = ?titlebar_fill_physical,
-                                content_clip_physical = ?content_clip_physical,
-                                border_expected_inner_precise = ?border_expected_inner_precise,
-                                border_expected_inner_physical_precise = ?border_expected_inner_physical_precise,
-                                titlebar_shader_precise = ?titlebar_shader_precise,
-                                titlebar_shader_clip_precise = ?titlebar_shader_clip_precise,
-                                titlebar_shader_clip_physical_precise = ?titlebar_shader_clip_physical_precise,
-                                titlebar_shader_clip_physical_global_precise = ?titlebar_shader_clip_physical_global_precise,
-                                shader_clip_vs_border_inner_precise = ?shader_clip_vs_border_inner_precise,
-                                first_button_physical = ?first_button_physical,
-                                button_delta = ?button_delta,
-                                "gap debug tty border physical compare"
-                            );
+                                let first_button = decoration.buffers.iter().find(|buffer| {
+                                    buffer.source_kind == "button" && buffer.border_width > 0.0
+                                });
+                                let first_button_physical = first_button.map(|buffer| {
+                                    crate::backend::visual::relative_physical_rect_from_root(
+                                        buffer.rect,
+                                        decoration.layout.root.rect,
+                                        output_geo,
+                                        scale,
+                                        buffer.clip_rect,
+                                    )
+                                });
+                                let button_delta =
+                                    match (border_inner_physical, first_button_physical) {
+                                        (Some(inner), Some(button)) => Some((
+                                            button.loc.x - inner.loc.x,
+                                            button.loc.y - inner.loc.y,
+                                            (inner.loc.x + inner.size.w)
+                                                - (button.loc.x + button.size.w),
+                                            (inner.loc.y + inner.size.h)
+                                                - (button.loc.y + button.size.h),
+                                        )),
+                                        _ => None,
+                                    };
+                                tracing::info!(
+                                    output = %output.name(),
+                                    window_id = %window_id,
+                                    border_outer_physical = ?border_outer_physical,
+                                    border_inner_physical = ?border_inner_physical,
+                                    titlebar_shader_physical = ?titlebar_shader_physical,
+                                    titlebar_fill_physical = ?titlebar_fill_physical,
+                                    content_clip_physical = ?content_clip_physical,
+                                    border_expected_inner_precise = ?border_expected_inner_precise,
+                                    border_expected_inner_physical_precise = ?border_expected_inner_physical_precise,
+                                    titlebar_shader_precise = ?titlebar_shader_precise,
+                                    titlebar_shader_clip_precise = ?titlebar_shader_clip_precise,
+                                    titlebar_shader_clip_physical_precise = ?titlebar_shader_clip_physical_precise,
+                                    titlebar_shader_clip_physical_global_precise = ?titlebar_shader_clip_physical_global_precise,
+                                    shader_clip_vs_border_inner_precise = ?shader_clip_vs_border_inner_precise,
+                                    first_button_physical = ?first_button_physical,
+                                    button_delta = ?button_delta,
+                                    "gap debug tty border physical compare"
+                                );
+                            }
                         }
                     }
-                }
-                let clipped = window_render::clipped_surface_elements(
-                    window,
-                    &mut backend.renderer,
-                    physical_location,
-                    client_physical_geometry,
-                    output_geo.loc,
-                    scale,
-                    snap_scale,
-                    visual_state.opacity,
-                    Some(content_clip),
-                    clip_all_client_surfaces,
-                )
-                .inspect_err(|error| {
-                    warn!(?error, "failed to build clipped surface elements");
-                })
-                .unwrap_or_default();
-                let bypass_clip = std::env::var_os("SHOJI_GAP_BYPASS_CLIP").is_some();
-                if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
-                    let first_geometry = clipped.first().map(|element| match element {
-                        window_render::WindowClipElement::Clipped(element) => {
-                            smithay::backend::renderer::element::Element::geometry(element, scale)
-                        }
-                        window_render::WindowClipElement::Raw(element) => {
-                            smithay::backend::renderer::element::Element::geometry(element, scale)
-                        }
-                    });
-                    let window_geometry = window.geometry();
-                    let decoration_client_rect = window_decorations
-                        .get(window)
-                        .map(|decoration| decoration.client_rect);
-                    let edge_delta = if let (Some(decoration), Some(first_geometry)) =
-                        (window_decorations.get(window), first_geometry)
-                    {
-                        let snap_scale = Scale::from((
-                            scale.x * visual_state.scale.x.max(0.0),
-                            scale.y * visual_state.scale.y.max(0.0),
-                        ));
-                        let snapped_clip =
-                            crate::backend::visual::snapped_logical_rect_relative_with_mode(
-                                crate::ssd::LogicalRect::new(
-                                    decoration.content_clip.unwrap().rect.loc.x,
-                                    decoration.content_clip.unwrap().rect.loc.y,
-                                    decoration.content_clip.unwrap().rect.size.w,
-                                    decoration.content_clip.unwrap().rect.size.h,
-                                ),
-                                output_geo.loc,
-                                snap_scale,
-                                decoration.content_clip.unwrap().snap_mode,
-                            );
-                        let expected_left = (snapped_clip.x as f64 * scale.x).round() as i32;
-                        let expected_top = (snapped_clip.y as f64 * scale.y).round() as i32;
-                        let expected_right =
-                            ((snapped_clip.x + snapped_clip.width) as f64 * scale.x).round() as i32;
-                        let expected_bottom = ((snapped_clip.y + snapped_clip.height) as f64
-                            * scale.y)
-                            .round() as i32;
-                        Some((
-                            first_geometry.loc.x - expected_left,
-                            first_geometry.loc.y - expected_top,
-                            (first_geometry.loc.x + first_geometry.size.w) - expected_right,
-                            (first_geometry.loc.y + first_geometry.size.h) - expected_bottom,
-                        ))
-                    } else {
-                        None
-                    };
-                    tracing::info!(
-                        output = %output.name(),
-                        window_id = %window_id,
-                        window_geometry = ?window_geometry,
-                        decoration_client_rect = ?decoration_client_rect,
-                        window_bbox = ?window.bbox(),
-                        physical_location = ?physical_location,
-                        clipped_count = clipped.len(),
-                        first_geometry = ?first_geometry,
-                        edge_delta = ?edge_delta,
-                        "gap debug tty clipped surface elements"
-                    );
-                    if !debug_background_geometries.is_empty() {
-                        let mut titlebar_fills = debug_background_geometries
-                            .iter()
-                            .filter(|(_, stable_key, source_kind, geometry)| {
-                                *source_kind == "fill"
-                                    && stable_key.ends_with(":fill")
-                                    && geometry.size.w > 200
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        titlebar_fills.sort_by_key(|(order, _, _, _)| *order);
-                        let mut titlebar_pre_fills = debug_background_pre_geometries
-                            .iter()
-                            .filter(|(_, stable_key, source_kind, geometry)| {
-                                *source_kind == "fill"
-                                    && stable_key.ends_with(":fill")
-                                    && geometry.size.w > 200
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        titlebar_pre_fills.sort_by_key(|(order, _, _, _)| *order);
-                        let first_fill = titlebar_fills.first().cloned();
-                        let second_fill = titlebar_fills.get(1).cloned();
-                        let first_pre_fill = titlebar_pre_fills.first().cloned();
-                        let second_pre_fill = titlebar_pre_fills.get(1).cloned();
-                        let first_pre_fill_geometry =
-                            first_pre_fill.as_ref().map(|(_, _, _, geometry)| *geometry);
-                        let second_pre_fill_geometry = second_pre_fill
-                            .as_ref()
-                            .map(|(_, _, _, geometry)| *geometry);
-                        let fill_frame_key = format!("{}:{}", output.name(), window_id);
-                        let previous_fill_state = previous_titlebar_fill_state(
-                            &fill_frame_key,
-                            TitlebarFillFrameState {
-                                first_pre_fill: first_pre_fill_geometry,
-                                second_pre_fill: second_pre_fill_geometry,
-                            },
-                        );
-                        let fill_delta = |current: Option<
-                            Rectangle<i32, smithay::utils::Physical>,
-                        >,
-                                          previous: Option<
-                            Rectangle<i32, smithay::utils::Physical>,
-                        >| {
-                            current.zip(previous).map(|(current, previous)| {
-                                (
-                                    current.loc.x - previous.loc.x,
-                                    current.loc.y - previous.loc.y,
-                                    current.size.w - previous.size.w,
-                                    current.size.h - previous.size.h,
+                    let clipped = window_render::clipped_surface_elements(
+                        window,
+                        &mut backend.renderer,
+                        physical_location,
+                        client_physical_geometry,
+                        output_geo.loc,
+                        scale,
+                        snap_scale,
+                        visual_state.opacity,
+                        Some(content_clip),
+                        clip_all_client_surfaces,
+                    )
+                    .inspect_err(|error| {
+                        warn!(?error, "failed to build clipped surface elements");
+                    })
+                    .unwrap_or_default();
+                    let bypass_clip = std::env::var_os("SHOJI_GAP_BYPASS_CLIP").is_some();
+                    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                        let first_geometry = clipped.first().map(|element| match element {
+                            window_render::WindowClipElement::Clipped(element) => {
+                                smithay::backend::renderer::element::Element::geometry(
+                                    element, scale,
                                 )
-                            })
+                            }
+                            window_render::WindowClipElement::Raw(element) => {
+                                smithay::backend::renderer::element::Element::geometry(
+                                    element, scale,
+                                )
+                            }
+                        });
+                        let window_geometry = window.geometry();
+                        let decoration_client_rect = window_decorations
+                            .get(window)
+                            .map(|decoration| decoration.client_rect);
+                        let edge_delta = if let (Some(decoration), Some(first_geometry)) =
+                            (window_decorations.get(window), first_geometry)
+                        {
+                            let snap_scale = Scale::from((
+                                scale.x * visual_state.scale.x.max(0.0),
+                                scale.y * visual_state.scale.y.max(0.0),
+                            ));
+                            let snapped_clip =
+                                crate::backend::visual::snapped_logical_rect_relative_with_mode(
+                                    crate::ssd::LogicalRect::new(
+                                        decoration.content_clip.unwrap().rect.loc.x,
+                                        decoration.content_clip.unwrap().rect.loc.y,
+                                        decoration.content_clip.unwrap().rect.size.w,
+                                        decoration.content_clip.unwrap().rect.size.h,
+                                    ),
+                                    output_geo.loc,
+                                    snap_scale,
+                                    decoration.content_clip.unwrap().snap_mode,
+                                );
+                            let expected_left = (snapped_clip.x as f64 * scale.x).round() as i32;
+                            let expected_top = (snapped_clip.y as f64 * scale.y).round() as i32;
+                            let expected_right = ((snapped_clip.x + snapped_clip.width) as f64
+                                * scale.x)
+                                .round() as i32;
+                            let expected_bottom = ((snapped_clip.y + snapped_clip.height) as f64
+                                * scale.y)
+                                .round() as i32;
+                            Some((
+                                first_geometry.loc.x - expected_left,
+                                first_geometry.loc.y - expected_top,
+                                (first_geometry.loc.x + first_geometry.size.w) - expected_right,
+                                (first_geometry.loc.y + first_geometry.size.h) - expected_bottom,
+                            ))
+                        } else {
+                            None
                         };
-                        let first_pre_fill_delta = fill_delta(
-                            first_pre_fill_geometry,
-                            previous_fill_state.and_then(|state| state.first_pre_fill),
+                        tracing::info!(
+                            output = %output.name(),
+                            window_id = %window_id,
+                            window_geometry = ?window_geometry,
+                            decoration_client_rect = ?decoration_client_rect,
+                            window_bbox = ?window.bbox(),
+                            physical_location = ?physical_location,
+                            clipped_count = clipped.len(),
+                            first_geometry = ?first_geometry,
+                            edge_delta = ?edge_delta,
+                            "gap debug tty clipped surface elements"
                         );
-                        let second_pre_fill_delta = fill_delta(
-                            second_pre_fill_geometry,
-                            previous_fill_state.and_then(|state| state.second_pre_fill),
-                        );
-                        let sibling_gap = |upper: smithay::utils::Rectangle<
-                            i32,
-                            smithay::utils::Physical,
-                        >,
-                                           lower: smithay::utils::Rectangle<
-                            i32,
-                            smithay::utils::Physical,
-                        >| {
-                            (
-                                lower.loc.x - upper.loc.x,
-                                lower.loc.y - (upper.loc.y + upper.size.h),
-                                (lower.loc.x + lower.size.w) - (upper.loc.x + upper.size.w),
-                            )
-                        };
-                        let shader_to_shader_gap = first_fill
-                            .as_ref()
-                            .zip(second_fill.as_ref())
-                            .map(|((_, _, _, first), (_, _, _, second))| {
-                                sibling_gap(*first, *second)
-                            });
-                        let shader_to_client_gap =
-                            second_fill.as_ref().and_then(|(_, _, _, second)| {
-                                first_geometry.map(|client| sibling_gap(*second, client))
-                            });
-                        let fill_client_edge_delta =
-                            second_fill.as_ref().and_then(|(_, _, _, fill)| {
-                                first_geometry.map(|client| {
+                        if !debug_background_geometries.is_empty() {
+                            let mut titlebar_fills = debug_background_geometries
+                                .iter()
+                                .filter(|(_, stable_key, source_kind, geometry)| {
+                                    *source_kind == "fill"
+                                        && stable_key.ends_with(":fill")
+                                        && geometry.size.w > 200
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            titlebar_fills.sort_by_key(|(order, _, _, _)| *order);
+                            let mut titlebar_pre_fills = debug_background_pre_geometries
+                                .iter()
+                                .filter(|(_, stable_key, source_kind, geometry)| {
+                                    *source_kind == "fill"
+                                        && stable_key.ends_with(":fill")
+                                        && geometry.size.w > 200
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            titlebar_pre_fills.sort_by_key(|(order, _, _, _)| *order);
+                            let first_fill = titlebar_fills.first().cloned();
+                            let second_fill = titlebar_fills.get(1).cloned();
+                            let first_pre_fill = titlebar_pre_fills.first().cloned();
+                            let second_pre_fill = titlebar_pre_fills.get(1).cloned();
+                            let first_pre_fill_geometry =
+                                first_pre_fill.as_ref().map(|(_, _, _, geometry)| *geometry);
+                            let second_pre_fill_geometry = second_pre_fill
+                                .as_ref()
+                                .map(|(_, _, _, geometry)| *geometry);
+                            let fill_frame_key = format!("{}:{}", output.name(), window_id);
+                            let previous_fill_state = previous_titlebar_fill_state(
+                                &fill_frame_key,
+                                TitlebarFillFrameState {
+                                    first_pre_fill: first_pre_fill_geometry,
+                                    second_pre_fill: second_pre_fill_geometry,
+                                },
+                            );
+                            let fill_delta = |current: Option<
+                                Rectangle<i32, smithay::utils::Physical>,
+                            >,
+                                              previous: Option<
+                                Rectangle<i32, smithay::utils::Physical>,
+                            >| {
+                                current.zip(previous).map(|(current, previous)| {
                                     (
-                                        client.loc.x - fill.loc.x,
-                                        client.loc.y - (fill.loc.y + fill.size.h),
-                                        (client.loc.x + client.size.w) - (fill.loc.x + fill.size.w),
-                                        client.size.w - fill.size.w,
+                                        current.loc.x - previous.loc.x,
+                                        current.loc.y - previous.loc.y,
+                                        current.size.w - previous.size.w,
+                                        current.size.h - previous.size.h,
                                     )
                                 })
-                            });
-                        let content_clip_physical =
+                            };
+                            let first_pre_fill_delta = fill_delta(
+                                first_pre_fill_geometry,
+                                previous_fill_state.and_then(|state| state.first_pre_fill),
+                            );
+                            let second_pre_fill_delta = fill_delta(
+                                second_pre_fill_geometry,
+                                previous_fill_state.and_then(|state| state.second_pre_fill),
+                            );
+                            let sibling_gap = |upper: smithay::utils::Rectangle<
+                                i32,
+                                smithay::utils::Physical,
+                            >,
+                                               lower: smithay::utils::Rectangle<
+                                i32,
+                                smithay::utils::Physical,
+                            >| {
+                                (
+                                    lower.loc.x - upper.loc.x,
+                                    lower.loc.y - (upper.loc.y + upper.size.h),
+                                    (lower.loc.x + lower.size.w) - (upper.loc.x + upper.size.w),
+                                )
+                            };
+                            let shader_to_shader_gap = first_fill
+                                .as_ref()
+                                .zip(second_fill.as_ref())
+                                .map(|((_, _, _, first), (_, _, _, second))| {
+                                    sibling_gap(*first, *second)
+                                });
+                            let shader_to_client_gap =
+                                second_fill.as_ref().and_then(|(_, _, _, second)| {
+                                    first_geometry.map(|client| sibling_gap(*second, client))
+                                });
+                            let fill_client_edge_delta =
+                                second_fill.as_ref().and_then(|(_, _, _, fill)| {
+                                    first_geometry.map(|client| {
+                                        (
+                                            client.loc.x - fill.loc.x,
+                                            client.loc.y - (fill.loc.y + fill.size.h),
+                                            (client.loc.x + client.size.w)
+                                                - (fill.loc.x + fill.size.w),
+                                            client.size.w - fill.size.w,
+                                        )
+                                    })
+                                });
+                            let content_clip_physical =
                             window_decorations.get(window).and_then(|decoration| {
                                 let content_clip = decoration.content_clip?;
                                 let root_origin = root_physical_origin(
@@ -3649,162 +3757,272 @@ fn render_surface(
                                     local_geometry.size,
                                 ))
                             });
-                        let frame_key = format!("{}:{}", output.name(), window_id);
-                        let previous_client_state = previous_client_frame_state(
-                            &frame_key,
-                            ClientFrameState {
-                                client_geometry: first_geometry,
+                            let frame_key = format!("{}:{}", output.name(), window_id);
+                            let previous_client_state = previous_client_frame_state(
+                                &frame_key,
+                                ClientFrameState {
+                                    client_geometry: first_geometry,
+                                    content_clip_physical,
+                                    fill_client_edge_delta,
+                                },
+                            );
+                            let rect_delta = |current: Option<
+                                Rectangle<i32, smithay::utils::Physical>,
+                            >,
+                                              previous: Option<
+                                Rectangle<i32, smithay::utils::Physical>,
+                            >| {
+                                current.zip(previous).map(|(current, previous)| {
+                                    (
+                                        current.loc.x - previous.loc.x,
+                                        current.loc.y - previous.loc.y,
+                                        current.size.w - previous.size.w,
+                                        current.size.h - previous.size.h,
+                                    )
+                                })
+                            };
+                            let client_geometry_delta = rect_delta(
+                                first_geometry,
+                                previous_client_state.and_then(|state| state.client_geometry),
+                            );
+                            let content_clip_physical_delta = rect_delta(
                                 content_clip_physical,
-                                fill_client_edge_delta,
-                            },
-                        );
-                        let rect_delta = |current: Option<
-                            Rectangle<i32, smithay::utils::Physical>,
-                        >,
-                                          previous: Option<
-                            Rectangle<i32, smithay::utils::Physical>,
-                        >| {
-                            current.zip(previous).map(|(current, previous)| {
-                                (
-                                    current.loc.x - previous.loc.x,
-                                    current.loc.y - previous.loc.y,
-                                    current.size.w - previous.size.w,
-                                    current.size.h - previous.size.h,
+                                previous_client_state.and_then(|state| state.content_clip_physical),
+                            );
+                            let fill_client_edge_delta_delta = fill_client_edge_delta
+                                .zip(
+                                    previous_client_state
+                                        .and_then(|state| state.fill_client_edge_delta),
                                 )
-                            })
-                        };
-                        let client_geometry_delta = rect_delta(
-                            first_geometry,
-                            previous_client_state.and_then(|state| state.client_geometry),
+                                .map(|(current, previous)| {
+                                    (
+                                        current.0 - previous.0,
+                                        current.1 - previous.1,
+                                        current.2 - previous.2,
+                                        current.3 - previous.3,
+                                    )
+                                });
+                            let matching_fill = |ui_key: &str,
+                                                 fills: &Vec<(
+                                usize,
+                                String,
+                                &'static str,
+                                smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+                            )>| {
+                                fills
+                                    .iter()
+                                    .filter_map(|(order, fill_key, source_kind, geometry)| {
+                                        let fill_base = fill_key.strip_suffix(":fill")?;
+                                        (ui_key.starts_with(fill_base)
+                                            && ui_key.as_bytes().get(fill_base.len())
+                                                == Some(&b'/'))
+                                        .then_some((
+                                            *order,
+                                            fill_key.clone(),
+                                            *source_kind,
+                                            *geometry,
+                                        ))
+                                    })
+                                    .max_by_key(|(_, fill_key, _, _)| fill_key.len())
+                            };
+                            let titlebar_ui_pre_transform_relative = Some(
+                                debug_ui_pre_geometries
+                                    .iter()
+                                    .filter_map(|(order, key, source_kind, geometry)| {
+                                        let (_, fill_key, _, fill) =
+                                            matching_fill(key, &titlebar_pre_fills)?;
+                                        Some((
+                                            *order,
+                                            key.clone(),
+                                            *source_kind,
+                                            fill_key,
+                                            (
+                                                geometry.loc.x - fill.loc.x,
+                                                geometry.loc.y - fill.loc.y,
+                                                geometry.size.w - fill.size.w,
+                                                geometry.size.h - fill.size.h,
+                                            ),
+                                        ))
+                                    })
+                                    .collect::<Vec<_>>(),
+                            );
+                            let titlebar_ui_relative = Some(
+                                debug_ui_geometries
+                                    .iter()
+                                    .filter_map(|(order, key, source_kind, geometry)| {
+                                        let (_, fill_key, _, fill) =
+                                            matching_fill(key, &titlebar_fills)?;
+                                        Some((
+                                            *order,
+                                            key.clone(),
+                                            *source_kind,
+                                            fill_key,
+                                            (
+                                                geometry.loc.x - fill.loc.x,
+                                                geometry.loc.y - fill.loc.y,
+                                                geometry.size.w - fill.size.w,
+                                                geometry.size.h - fill.size.h,
+                                            ),
+                                        ))
+                                    })
+                                    .collect::<Vec<_>>(),
+                            );
+                            tracing::info!(
+                                output = %output.name(),
+                                window_id = %window_id,
+                                background_pre_geometries = ?debug_background_pre_geometries,
+                                background_geometries = ?debug_background_geometries,
+                                ui_pre_geometries = ?debug_ui_pre_geometries,
+                                ui_geometries = ?debug_ui_geometries,
+                                titlebar_pre_fills = ?titlebar_pre_fills,
+                                titlebar_fills = ?titlebar_fills,
+                                first_pre_fill = ?first_pre_fill,
+                                first_pre_fill_delta = ?first_pre_fill_delta,
+                                first_fill = ?first_fill,
+                                second_pre_fill = ?second_pre_fill,
+                                second_pre_fill_delta = ?second_pre_fill_delta,
+                                second_fill = ?second_fill,
+                                client_geometry = ?first_geometry,
+                                client_geometry_delta = ?client_geometry_delta,
+                                content_clip_physical = ?content_clip_physical,
+                                content_clip_physical_delta = ?content_clip_physical_delta,
+                                shader_to_shader_gap = ?shader_to_shader_gap,
+                                shader_to_client_gap = ?shader_to_client_gap,
+                                fill_client_edge_delta = ?fill_client_edge_delta,
+                                fill_client_edge_delta_delta = ?fill_client_edge_delta_delta,
+                                titlebar_ui_pre_transform_relative = ?titlebar_ui_pre_transform_relative,
+                                titlebar_ui_relative = ?titlebar_ui_relative,
+                                "gap debug tty sibling geometry summary"
+                            );
+                            tracing::info!(
+                                output = %output.name(),
+                                window_id = %window_id,
+                                first_fill = ?first_fill.as_ref().map(|(_, stable_key, _, geometry)| (stable_key, geometry)),
+                                second_fill = ?second_fill.as_ref().map(|(_, stable_key, _, geometry)| (stable_key, geometry)),
+                                client_geometry = ?first_geometry,
+                                client_geometry_delta = ?client_geometry_delta,
+                                content_clip_physical = ?content_clip_physical,
+                                content_clip_physical_delta = ?content_clip_physical_delta,
+                                fill_client_edge_delta = ?fill_client_edge_delta,
+                                fill_client_edge_delta_delta = ?fill_client_edge_delta_delta,
+                                edge_delta = ?edge_delta,
+                                "gap debug tty frame summary"
+                            );
+                        }
+                    }
+                    let transformed: Vec<TtyRenderElements> = if bypass_clip {
+                        window_render::debug_surface_elements(
+                            window,
+                            &mut backend.renderer,
+                            physical_location,
+                            scale,
+                            visual_state.opacity,
                         );
-                        let content_clip_physical_delta = rect_delta(
-                            content_clip_physical,
-                            previous_client_state.and_then(|state| state.content_clip_physical),
+                        let raw_elements = window_render::surface_elements(
+                            window,
+                            &mut backend.renderer,
+                            physical_location,
+                            scale,
+                            visual_state.opacity,
                         );
-                        let fill_client_edge_delta_delta = fill_client_edge_delta
-                            .zip(
-                                previous_client_state
-                                    .and_then(|state| state.fill_client_edge_delta),
-                            )
-                            .map(|(current, previous)| {
-                                (
-                                    current.0 - previous.0,
-                                    current.1 - previous.1,
-                                    current.2 - previous.2,
-                                    current.3 - previous.3,
+                        if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                            let first_geometry = raw_elements.first().map(|element| {
+                                smithay::backend::renderer::element::Element::geometry(
+                                    element, scale,
                                 )
                             });
-                        let matching_fill = |ui_key: &str,
-                                             fills: &Vec<(
-                            usize,
-                            String,
-                            &'static str,
-                            smithay::utils::Rectangle<i32, smithay::utils::Physical>,
-                        )>| {
-                            fills
-                                .iter()
-                                .filter_map(|(order, fill_key, source_kind, geometry)| {
-                                    let fill_base = fill_key.strip_suffix(":fill")?;
-                                    (ui_key.starts_with(fill_base)
-                                        && ui_key.as_bytes().get(fill_base.len()) == Some(&b'/'))
-                                    .then_some((*order, fill_key.clone(), *source_kind, *geometry))
-                                })
-                                .max_by_key(|(_, fill_key, _, _)| fill_key.len())
-                        };
-                        let titlebar_ui_pre_transform_relative = Some(
-                            debug_ui_pre_geometries
-                                .iter()
-                                .filter_map(|(order, key, source_kind, geometry)| {
-                                    let (_, fill_key, _, fill) =
-                                        matching_fill(key, &titlebar_pre_fills)?;
-                                    Some((
-                                        *order,
-                                        key.clone(),
-                                        *source_kind,
-                                        fill_key,
-                                        (
-                                            geometry.loc.x - fill.loc.x,
-                                            geometry.loc.y - fill.loc.y,
-                                            geometry.size.w - fill.size.w,
-                                            geometry.size.h - fill.size.h,
+                            let first_src = raw_elements.first().map(|element| {
+                                smithay::backend::renderer::element::Element::src(element)
+                            });
+                            let first_transform = raw_elements.first().map(|element| {
+                                smithay::backend::renderer::element::Element::transform(element)
+                            });
+                            tracing::info!(
+                                output = %output.name(),
+                                window_id = %window_id,
+                                physical_location = ?physical_location,
+                                raw_count = raw_elements.len(),
+                                first_geometry = ?first_geometry,
+                                first_src = ?first_src,
+                                first_transform = ?first_transform,
+                                "gap debug tty raw surface elements"
+                            );
+                        }
+                        let expand_px = std::env::var_os("SHOJI_GAP_EXPAND_RAW_EDGE")
+                            .and_then(|value| {
+                                value.to_str().and_then(|value| value.parse::<i32>().ok())
+                            })
+                            .unwrap_or(0)
+                            .max(0);
+                        if expand_px == 0 {
+                            raw_elements
+                                .into_iter()
+                                .map(TtyRenderElements::Window)
+                                .collect()
+                        } else {
+                            raw_elements
+                                .into_iter()
+                                .map(|element| {
+                                    let geometry =
+                                        smithay::backend::renderer::element::Element::geometry(
+                                            &element, scale,
+                                        );
+                                    let scale_x = (geometry.size.w.saturating_add(expand_px).max(1)
+                                        as f64)
+                                        / geometry.size.w.max(1) as f64;
+                                    let scale_y = (geometry.size.h.saturating_add(expand_px).max(1)
+                                        as f64)
+                                        / geometry.size.h.max(1) as f64;
+                                    TtyRenderElements::TransformedWindow(
+                                        RelocateRenderElement::from_element(
+                                            RescaleRenderElement::from_element(
+                                                element,
+                                                geometry.loc,
+                                                smithay::utils::Scale::from((scale_x, scale_y)),
+                                            ),
+                                            smithay::utils::Point::from((0, 0)),
+                                            Relocate::Relative,
                                         ),
-                                    ))
+                                    )
                                 })
-                                .collect::<Vec<_>>(),
-                        );
-                        let titlebar_ui_relative = Some(
-                            debug_ui_geometries
-                                .iter()
-                                .filter_map(|(order, key, source_kind, geometry)| {
-                                    let (_, fill_key, _, fill) =
-                                        matching_fill(key, &titlebar_fills)?;
-                                    Some((
-                                        *order,
-                                        key.clone(),
-                                        *source_kind,
-                                        fill_key,
-                                        (
-                                            geometry.loc.x - fill.loc.x,
-                                            geometry.loc.y - fill.loc.y,
-                                            geometry.size.w - fill.size.w,
-                                            geometry.size.h - fill.size.h,
-                                        ),
-                                    ))
-                                })
-                                .collect::<Vec<_>>(),
-                        );
-                        tracing::info!(
-                            output = %output.name(),
-                            window_id = %window_id,
-                            background_pre_geometries = ?debug_background_pre_geometries,
-                            background_geometries = ?debug_background_geometries,
-                            ui_pre_geometries = ?debug_ui_pre_geometries,
-                            ui_geometries = ?debug_ui_geometries,
-                            titlebar_pre_fills = ?titlebar_pre_fills,
-                            titlebar_fills = ?titlebar_fills,
-                            first_pre_fill = ?first_pre_fill,
-                            first_pre_fill_delta = ?first_pre_fill_delta,
-                            first_fill = ?first_fill,
-                            second_pre_fill = ?second_pre_fill,
-                            second_pre_fill_delta = ?second_pre_fill_delta,
-                            second_fill = ?second_fill,
-                            client_geometry = ?first_geometry,
-                            client_geometry_delta = ?client_geometry_delta,
-                            content_clip_physical = ?content_clip_physical,
-                            content_clip_physical_delta = ?content_clip_physical_delta,
-                            shader_to_shader_gap = ?shader_to_shader_gap,
-                            shader_to_client_gap = ?shader_to_client_gap,
-                            fill_client_edge_delta = ?fill_client_edge_delta,
-                            fill_client_edge_delta_delta = ?fill_client_edge_delta_delta,
-                            titlebar_ui_pre_transform_relative = ?titlebar_ui_pre_transform_relative,
-                            titlebar_ui_relative = ?titlebar_ui_relative,
-                            "gap debug tty sibling geometry summary"
-                        );
-                        tracing::info!(
-                            output = %output.name(),
-                            window_id = %window_id,
-                            first_fill = ?first_fill.as_ref().map(|(_, stable_key, _, geometry)| (stable_key, geometry)),
-                            second_fill = ?second_fill.as_ref().map(|(_, stable_key, _, geometry)| (stable_key, geometry)),
-                            client_geometry = ?first_geometry,
-                            client_geometry_delta = ?client_geometry_delta,
-                            content_clip_physical = ?content_clip_physical,
-                            content_clip_physical_delta = ?content_clip_physical_delta,
-                            fill_client_edge_delta = ?fill_client_edge_delta,
-                            fill_client_edge_delta_delta = ?fill_client_edge_delta_delta,
-                            edge_delta = ?edge_delta,
-                            "gap debug tty frame summary"
-                        );
+                                .collect()
+                        }
+                    } else {
+                        clipped
+                            .into_iter()
+                            .flat_map(|element| match element {
+                                window_render::WindowClipElement::Clipped(element) => {
+                                    transform_clipped_elements(vec![element], visual_state)
+                                }
+                                window_render::WindowClipElement::Raw(element) => {
+                                    transform_window_elements(
+                                        vec![element],
+                                        visual_state,
+                                        TtyRenderElements::Window,
+                                        TtyRenderElements::TransformedWindow,
+                                    )
+                                }
+                            })
+                            .collect()
+                    };
+                    if std::env::var_os("SHOJI_GAP_READBACK_DEBUG").is_some() {
+                        if let Some(first_geometry) = transformed.first().map(|element| {
+                            smithay::backend::renderer::element::Element::geometry(element, scale)
+                        }) {
+                            log_gap_readback_edge_probes(
+                                &mut backend.renderer,
+                                scale,
+                                &transformed,
+                                first_geometry,
+                                "client",
+                                &output.name(),
+                                &window_id,
+                            );
+                        }
                     }
-                }
-                let transformed: Vec<TtyRenderElements> = if bypass_clip {
-                    window_render::debug_surface_elements(
-                        window,
-                        &mut backend.renderer,
-                        physical_location,
-                        scale,
-                        visual_state.opacity,
-                    );
-                    let raw_elements = window_render::surface_elements(
+                    transformed
+                } else {
+                    let surfaces = window_render::surface_elements(
                         window,
                         &mut backend.renderer,
                         physical_location,
@@ -3812,458 +4030,357 @@ fn render_surface(
                         visual_state.opacity,
                     );
                     if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
-                        let first_geometry = raw_elements.first().map(|element| {
+                        let first_geometry = surfaces.first().map(|element| {
                             smithay::backend::renderer::element::Element::geometry(element, scale)
                         });
-                        let first_src = raw_elements.first().map(|element| {
-                            smithay::backend::renderer::element::Element::src(element)
-                        });
-                        let first_transform = raw_elements.first().map(|element| {
-                            smithay::backend::renderer::element::Element::transform(element)
-                        });
+                        let window_geometry = window.geometry();
+                        let decoration_client_rect = window_decorations
+                            .get(window)
+                            .map(|decoration| decoration.client_rect);
                         tracing::info!(
                             output = %output.name(),
                             window_id = %window_id,
+                            window_geometry = ?window_geometry,
+                            decoration_client_rect = ?decoration_client_rect,
+                            window_bbox = ?window.bbox(),
                             physical_location = ?physical_location,
-                            raw_count = raw_elements.len(),
+                            surface_count = surfaces.len(),
                             first_geometry = ?first_geometry,
-                            first_src = ?first_src,
-                            first_transform = ?first_transform,
                             "gap debug tty raw surface elements"
                         );
                     }
-                    let expand_px = std::env::var_os("SHOJI_GAP_EXPAND_RAW_EDGE")
-                        .and_then(|value| {
-                            value.to_str().and_then(|value| value.parse::<i32>().ok())
-                        })
-                        .unwrap_or(0)
-                        .max(0);
-                    if expand_px == 0 {
-                        raw_elements
-                            .into_iter()
-                            .map(TtyRenderElements::Window)
-                            .collect()
-                    } else {
-                        raw_elements
-                            .into_iter()
-                            .map(|element| {
-                                let geometry =
-                                    smithay::backend::renderer::element::Element::geometry(
-                                        &element, scale,
-                                    );
-                                let scale_x = (geometry.size.w.saturating_add(expand_px).max(1)
-                                    as f64)
-                                    / geometry.size.w.max(1) as f64;
-                                let scale_y = (geometry.size.h.saturating_add(expand_px).max(1)
-                                    as f64)
-                                    / geometry.size.h.max(1) as f64;
-                                TtyRenderElements::TransformedWindow(
-                                    RelocateRenderElement::from_element(
-                                        RescaleRenderElement::from_element(
-                                            element,
-                                            geometry.loc,
-                                            smithay::utils::Scale::from((scale_x, scale_y)),
-                                        ),
-                                        smithay::utils::Point::from((0, 0)),
-                                        Relocate::Relative,
-                                    ),
-                                )
-                            })
-                            .collect()
-                    }
-                } else {
-                    clipped
-                        .into_iter()
-                        .flat_map(|element| match element {
-                            window_render::WindowClipElement::Clipped(element) => {
-                                transform_clipped_elements(vec![element], visual_state)
-                            }
-                            window_render::WindowClipElement::Raw(element) => {
-                                transform_window_elements(
-                                    vec![element],
-                                    visual_state,
-                                    TtyRenderElements::Window,
-                                    TtyRenderElements::TransformedWindow,
-                                )
-                            }
-                        })
-                        .collect()
-                };
-                if std::env::var_os("SHOJI_GAP_READBACK_DEBUG").is_some() {
-                    if let Some(first_geometry) = transformed.first().map(|element| {
-                        smithay::backend::renderer::element::Element::geometry(element, scale)
-                    }) {
-                        log_gap_readback_edge_probes(
-                            &mut backend.renderer,
-                            scale,
-                            &transformed,
-                            first_geometry,
-                            "client",
-                            &output.name(),
-                            &window_id,
-                        );
-                    }
-                }
-                transformed
-            } else {
-                let surfaces = window_render::surface_elements(
-                    window,
-                    &mut backend.renderer,
-                    physical_location,
-                    scale,
-                    visual_state.opacity,
-                );
-                if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
-                    let first_geometry = surfaces.first().map(|element| {
-                        smithay::backend::renderer::element::Element::geometry(element, scale)
-                    });
-                    let window_geometry = window.geometry();
-                    let decoration_client_rect = window_decorations
-                        .get(window)
-                        .map(|decoration| decoration.client_rect);
-                    tracing::info!(
-                        output = %output.name(),
-                        window_id = %window_id,
-                        window_geometry = ?window_geometry,
-                        decoration_client_rect = ?decoration_client_rect,
-                        window_bbox = ?window.bbox(),
-                        physical_location = ?physical_location,
-                        surface_count = surfaces.len(),
-                        first_geometry = ?first_geometry,
-                        "gap debug tty raw surface elements"
+                    let transformed = transform_window_elements(
+                        surfaces,
+                        visual_state,
+                        TtyRenderElements::Window,
+                        TtyRenderElements::TransformedWindow,
                     );
-                }
-                let transformed = transform_window_elements(
-                    surfaces,
-                    visual_state,
-                    TtyRenderElements::Window,
-                    TtyRenderElements::TransformedWindow,
-                );
-                if std::env::var_os("SHOJI_GAP_READBACK_DEBUG").is_some() {
-                    if let Some(first_geometry) = transformed.first().map(|element| {
-                        smithay::backend::renderer::element::Element::geometry(element, scale)
-                    }) {
-                        log_gap_readback_edge_probes(
-                            &mut backend.renderer,
-                            scale,
-                            &transformed,
-                            first_geometry,
-                            "client",
-                            &output.name(),
-                            &window_id,
-                        );
+                    if std::env::var_os("SHOJI_GAP_READBACK_DEBUG").is_some() {
+                        if let Some(first_geometry) = transformed.first().map(|element| {
+                            smithay::backend::renderer::element::Element::geometry(element, scale)
+                        }) {
+                            log_gap_readback_edge_probes(
+                                &mut backend.renderer,
+                                scale,
+                                &transformed,
+                                first_geometry,
+                                "client",
+                                &output.name(),
+                                &window_id,
+                            );
+                        }
                     }
+                    transformed
+                };
+                window_timing.client_phase_ms =
+                    client_phase_started_at.elapsed().as_secs_f64() * 1000.0;
+                let mut current_window_elements: Vec<TtyRenderElements> = Vec::new();
+                let popup_phase_started_at = Instant::now();
+                if is_identity_visual_geometry(visual_state) {
+                    // Steady state: compose per-popup effects. Effect elements
+                    // cannot ride the window animation transform, so this path is
+                    // only taken when the visual transform is identity.
+                    current_window_elements.extend(composed_window_popup_scene_elements(
+                        &mut backend.renderer,
+                        &output,
+                        output_geo,
+                        scale,
+                        window,
+                        physical_location,
+                        visual_state.opacity,
+                        &state.configured_popup_effects,
+                        &mut state.popup_effect_cache,
+                        &mut state.popup_framebuffer_effect_states,
+                    ));
+                } else {
+                    let popup_elements = transform_window_elements(
+                        window_render::popup_elements(
+                            window,
+                            &mut backend.renderer,
+                            physical_location,
+                            scale,
+                            visual_state.opacity,
+                        ),
+                        visual_state,
+                        TtyRenderElements::Window,
+                        TtyRenderElements::TransformedWindow,
+                    );
+                    current_window_elements.extend(popup_elements);
                 }
-                transformed
-            };
-            window_timing.client_phase_ms =
-                client_phase_started_at.elapsed().as_secs_f64() * 1000.0;
-            let mut current_window_elements: Vec<TtyRenderElements> = Vec::new();
-            let popup_phase_started_at = Instant::now();
-            if is_identity_visual_geometry(visual_state) {
-                // Steady state: compose per-popup effects. Effect elements
-                // cannot ride the window animation transform, so this path is
-                // only taken when the visual transform is identity.
-                current_window_elements.extend(composed_window_popup_scene_elements(
-                    &mut backend.renderer,
-                    &output,
-                    output_geo,
-                    scale,
-                    window,
-                    physical_location,
-                    visual_state.opacity,
-                    &state.configured_popup_effects,
-                    &mut state.popup_effect_cache,
-                    &mut state.popup_framebuffer_effect_states,
-                ));
-            } else {
-                let popup_elements = transform_window_elements(
-                    window_render::popup_elements(
+                if use_full_window_snapshot {
+                    current_window_elements.extend(non_root_surface_elements_for_window(
                         window,
                         &mut backend.renderer,
                         physical_location,
+                        client_physical_geometry,
+                        output_geo.loc,
                         scale,
+                        scale,
+                        visual_state,
                         visual_state.opacity,
-                    ),
-                    visual_state,
-                    TtyRenderElements::Window,
-                    TtyRenderElements::TransformedWindow,
-                );
-                current_window_elements.extend(popup_elements);
-            }
-            if use_full_window_snapshot {
-                current_window_elements.extend(non_root_surface_elements_for_window(
-                    window,
-                    &mut backend.renderer,
-                    physical_location,
-                    client_physical_geometry,
-                    output_geo.loc,
-                    scale,
-                    scale,
-                    visual_state,
-                    visual_state.opacity,
-                    content_clip,
-                ));
-            }
-            window_timing.popup_phase_ms = popup_phase_started_at.elapsed().as_secs_f64() * 1000.0;
-            if output_render_debug_enabled() {
-                let title = window_decorations
-                    .get(window)
-                    .map(|d| d.snapshot.title.as_str());
-                let root_rect = window_decorations.get(window).map(|d| d.layout.root.rect);
-                let content_clip_rect = window_decorations
-                    .get(window)
-                    .and_then(|d| d.content_clip)
-                    .map(|c| c.rect);
-                tracing::info!(
-                    output = %output.name(),
-                    window_id = %window_id,
-                    title = ?title,
-                    use_full_window_snapshot,
-                    direct_surface_count,
-                    client_elements_count = client_elements.len(),
-                    physical_location = ?physical_location,
-                    output_geo = ?output_geo,
-                    root_rect = ?root_rect,
-                    content_clip_rect = ?content_clip_rect,
-                    scale_x = scale.x,
-                    scale_y = scale.y,
-                    visual_scale_x = visual_state.scale.x,
-                    visual_scale_y = visual_state.scale.y,
-                    "output_render_debug: window rendered"
-                );
-            }
-            // Window-source effects sample only the top-level window. `Full` means
-            // root surface plus SSD decoration, but not popup/subsurface content.
-            let source_clip_scale = if use_full_window_snapshot {
-                scale
-            } else {
-                snap_scale
-            };
-            let (needs_root_surface_source, needs_full_window_source) = window_decorations
-                .get(window)
-                .and_then(|decoration| decoration.window_effects.as_ref())
-                .map(|effects| {
-                    let slots = [
-                        effects.behind.as_ref(),
-                        effects.behind_root_surface.as_ref(),
-                        effects.in_front.as_ref(),
-                        effects.replace.as_ref(),
-                    ];
-                    let needs_full =
-                        slots.iter().flatten().any(|effect| {
-                            matches!(
-                                &effect.effect.input,
-                                EffectInput::WindowSource(WindowSourceInclude::Full)
-                            )
-                        }) || effects.behind_root_surface.as_ref().is_some_and(|effect| {
-                            !matches!(
-                                &effect.effect.input,
-                                EffectInput::WindowSource(WindowSourceInclude::RootSurface)
-                            )
-                        });
-                    let needs_root = needs_full
-                        || slots.iter().flatten().any(|effect| {
-                            matches!(
-                                &effect.effect.input,
-                                EffectInput::WindowSource(WindowSourceInclude::RootSurface)
-                            )
-                        });
-                    (needs_root, needs_full)
-                })
-                .unwrap_or_default();
-            let root_surface_source_elements = if needs_root_surface_source {
-                root_surface_source_elements_for_window(
-                    window,
-                    &mut backend.renderer,
-                    physical_location,
-                    client_physical_geometry,
-                    output_geo.loc,
-                    scale,
-                    source_clip_scale,
-                    visual_state,
-                    visual_state.opacity,
-                    content_clip,
-                )
-            } else {
-                Vec::new()
-            };
-            let mut full_window_source_elements = if needs_full_window_source {
-                root_surface_source_elements_for_window(
-                    window,
-                    &mut backend.renderer,
-                    physical_location,
-                    client_physical_geometry,
-                    output_geo.loc,
-                    scale,
-                    source_clip_scale,
-                    visual_state,
-                    visual_state.opacity,
-                    content_clip,
-                )
-            } else {
-                Vec::new()
-            };
-            if needs_full_window_source
-                && decoration_ready
-                && let Some(root_origin) = root_origin
-            {
-                let source_alpha = visual_state.opacity;
-                let mut source_ui_elements: Vec<(usize, TtyRenderElements)> = Vec::new();
-                let mut source_backdrop_elements: Vec<(usize, TtyRenderElements)> = Vec::new();
-
-                let mut source_backdrop_items = backdrop_shader_elements_for_window(
-                    &mut backend.renderer,
-                    space,
-                    window_decorations,
-                    &state.window_commit_times,
-                    &state.window_source_damage,
-                    &state.lower_layer_source_damage,
-                    state.lower_layer_scene_generation,
-                    &output,
-                    output_geo,
-                    scale,
-                    &windows_top_to_bottom,
-                    _window_index,
-                    window,
-                    source_alpha,
-                    decoration_ready,
-                    false,
-                    false,
-                );
-                if let Some(effect_config) = state.configured_background_effect.as_ref() {
-                    source_backdrop_items.extend(
-                        configured_background_effect_elements_for_window(
-                            &mut backend.renderer,
-                            space,
-                            window_decorations,
-                            &state.window_commit_times,
-                            &state.window_source_damage,
-                            &state.lower_layer_source_damage,
-                            state.lower_layer_scene_generation,
-                            &output,
-                            output_geo,
-                            scale,
-                            &windows_top_to_bottom,
-                            _window_index,
-                            window,
-                            source_alpha,
-                            effect_config,
-                            false,
-                        )
-                        .into_iter()
-                        .map(|(order, element)| (order, element, true)),
+                        content_clip,
+                    ));
+                }
+                window_timing.popup_phase_ms =
+                    popup_phase_started_at.elapsed().as_secs_f64() * 1000.0;
+                if output_render_debug_enabled() {
+                    let title = window_decorations
+                        .get(window)
+                        .map(|d| d.snapshot.title.as_str());
+                    let root_rect = window_decorations.get(window).map(|d| d.layout.root.rect);
+                    let content_clip_rect = window_decorations
+                        .get(window)
+                        .and_then(|d| d.content_clip)
+                        .map(|c| c.rect);
+                    tracing::info!(
+                        output = %output.name(),
+                        window_id = %window_id,
+                        title = ?title,
+                        use_full_window_snapshot,
+                        direct_surface_count,
+                        client_elements_count = client_elements.len(),
+                        physical_location = ?physical_location,
+                        output_geo = ?output_geo,
+                        root_rect = ?root_rect,
+                        content_clip_rect = ?content_clip_rect,
+                        scale_x = scale.x,
+                        scale_y = scale.y,
+                        visual_scale_x = visual_state.scale.x,
+                        visual_scale_y = visual_state.scale.y,
+                        "output_render_debug: window rendered"
                     );
                 }
-                for (order, element, render_as_backdrop) in source_backdrop_items.drain(..) {
-                    let items =
-                        transform_backdrop_elements(vec![element], root_origin, visual_state)?;
-                    if render_as_backdrop {
-                        source_backdrop_elements
-                            .extend(items.into_iter().map(|item| (order, item)));
-                    } else {
-                        source_ui_elements.extend(items.into_iter().map(|item| (order, item)));
-                    }
-                }
+                // Window-source effects sample only the top-level window. `Full` means
+                // root surface plus SSD decoration, but not popup/subsurface content.
+                let source_clip_scale = if use_full_window_snapshot {
+                    scale
+                } else {
+                    snap_scale
+                };
+                let (needs_root_surface_source, needs_full_window_source) = window_decorations
+                    .get(window)
+                    .and_then(|decoration| decoration.window_effects.as_ref())
+                    .map(|effects| {
+                        let slots = [
+                            effects.behind.as_ref(),
+                            effects.behind_root_surface.as_ref(),
+                            effects.in_front.as_ref(),
+                            effects.replace.as_ref(),
+                        ];
+                        let needs_full =
+                            slots.iter().flatten().any(|effect| {
+                                matches!(
+                                    &effect.effect.input,
+                                    EffectInput::WindowSource(WindowSourceInclude::Full)
+                                )
+                            }) || effects.behind_root_surface.as_ref().is_some_and(|effect| {
+                                !matches!(
+                                    &effect.effect.input,
+                                    EffectInput::WindowSource(WindowSourceInclude::RootSurface)
+                                )
+                            });
+                        let needs_root = needs_full
+                            || slots.iter().flatten().any(|effect| {
+                                matches!(
+                                    &effect.effect.input,
+                                    EffectInput::WindowSource(WindowSourceInclude::RootSurface)
+                                )
+                            });
+                        (needs_root, needs_full)
+                    })
+                    .unwrap_or_default();
+                let root_surface_source_elements = if needs_root_surface_source {
+                    root_surface_source_elements_for_window(
+                        window,
+                        &mut backend.renderer,
+                        physical_location,
+                        client_physical_geometry,
+                        output_geo.loc,
+                        scale,
+                        source_clip_scale,
+                        visual_state,
+                        visual_state.opacity,
+                        content_clip,
+                    )
+                } else {
+                    Vec::new()
+                };
+                let mut full_window_source_elements = if needs_full_window_source {
+                    root_surface_source_elements_for_window(
+                        window,
+                        &mut backend.renderer,
+                        physical_location,
+                        client_physical_geometry,
+                        output_geo.loc,
+                        scale,
+                        source_clip_scale,
+                        visual_state,
+                        visual_state.opacity,
+                        content_clip,
+                    )
+                } else {
+                    Vec::new()
+                };
+                if needs_full_window_source
+                    && decoration_ready
+                    && let Some(root_origin) = root_origin
+                {
+                    let source_alpha = visual_state.opacity;
+                    let mut source_ui_elements: Vec<(usize, TtyRenderElements)> = Vec::new();
+                    let mut source_backdrop_elements: Vec<(usize, TtyRenderElements)> = Vec::new();
 
-                if let Some(decoration_state) = window_decorations.get_mut(window) {
-                    let mut source_background_items =
-                        decoration::ordered_background_elements_for_window(
-                            &mut backend.renderer,
-                            decoration_state,
-                            output_geo,
-                            source_clip_scale,
-                            source_alpha,
-                        )
-                        .inspect_err(|error| {
-                            warn!(
-                                ?error,
-                                "failed to build window effect source decoration backgrounds"
-                            );
-                        })
-                        .unwrap_or_default();
-                    source_background_items.sort_by_key(|(order, _)| *order);
-                    for (order, element) in source_background_items {
-                        source_ui_elements.extend(
-                            transform_decoration_elements(
-                                vec![element],
-                                root_origin,
-                                visual_state,
-                            )?
+                    let mut source_backdrop_items = backdrop_shader_elements_for_window(
+                        &mut backend.renderer,
+                        space,
+                        window_decorations,
+                        &state.window_commit_times,
+                        &state.window_source_damage,
+                        &state.lower_layer_source_damage,
+                        state.lower_layer_scene_generation,
+                        &output,
+                        output_geo,
+                        scale,
+                        &windows_top_to_bottom,
+                        _window_index,
+                        window,
+                        source_alpha,
+                        decoration_ready,
+                        false,
+                        false,
+                    );
+                    if let Some(effect_config) = state.configured_background_effect.as_ref() {
+                        source_backdrop_items.extend(
+                            configured_background_effect_elements_for_window(
+                                &mut backend.renderer,
+                                space,
+                                window_decorations,
+                                &state.window_commit_times,
+                                &state.window_source_damage,
+                                &state.lower_layer_source_damage,
+                                state.lower_layer_scene_generation,
+                                &output,
+                                output_geo,
+                                scale,
+                                &windows_top_to_bottom,
+                                _window_index,
+                                window,
+                                source_alpha,
+                                effect_config,
+                                false,
+                            )
                             .into_iter()
-                            .map(|item| (order, item)),
+                            .map(|(order, element)| (order, element, true)),
                         );
                     }
-                }
+                    for (order, element, render_as_backdrop) in source_backdrop_items.drain(..) {
+                        let items =
+                            transform_backdrop_elements(vec![element], root_origin, visual_state)?;
+                        if render_as_backdrop {
+                            source_backdrop_elements
+                                .extend(items.into_iter().map(|item| (order, item)));
+                        } else {
+                            source_ui_elements.extend(items.into_iter().map(|item| (order, item)));
+                        }
+                    }
 
-                for (order, element) in decoration::ordered_icon_elements_for_window(
-                    &mut backend.renderer,
-                    space,
-                    window_decorations,
-                    &output,
-                    window,
-                    source_alpha,
-                )? {
-                    source_ui_elements.extend(
-                        transform_text_elements(vec![element], root_origin, visual_state)?
+                    if let Some(decoration_state) = window_decorations.get_mut(window) {
+                        let mut source_background_items =
+                            decoration::ordered_background_elements_for_window(
+                                &mut backend.renderer,
+                                decoration_state,
+                                output_geo,
+                                source_clip_scale,
+                                source_alpha,
+                            )
+                            .inspect_err(|error| {
+                                warn!(
+                                    ?error,
+                                    "failed to build window effect source decoration backgrounds"
+                                );
+                            })
+                            .unwrap_or_default();
+                        source_background_items.sort_by_key(|(order, _)| *order);
+                        for (order, element) in source_background_items {
+                            source_ui_elements.extend(
+                                transform_decoration_elements(
+                                    vec![element],
+                                    root_origin,
+                                    visual_state,
+                                )?
+                                .into_iter()
+                                .map(|item| (order, item)),
+                            );
+                        }
+                    }
+
+                    for (order, element) in decoration::ordered_icon_elements_for_window(
+                        &mut backend.renderer,
+                        space,
+                        window_decorations,
+                        &output,
+                        window,
+                        source_alpha,
+                    )? {
+                        source_ui_elements.extend(
+                            transform_text_elements(vec![element], root_origin, visual_state)?
+                                .into_iter()
+                                .map(|item| (order, item)),
+                        );
+                    }
+
+                    for (order, element) in decoration::ordered_text_elements_for_window(
+                        &mut backend.renderer,
+                        space,
+                        window_decorations,
+                        &output,
+                        window,
+                        source_alpha,
+                    )? {
+                        source_ui_elements.extend(
+                            transform_text_elements(vec![element], root_origin, visual_state)?
+                                .into_iter()
+                                .map(|item| (order, item)),
+                        );
+                    }
+
+                    source_ui_elements.sort_by_key(|(order, _)| *order);
+                    source_backdrop_elements.sort_by_key(|(order, _)| *order);
+                    full_window_source_elements
+                        .extend(source_ui_elements.into_iter().map(|(_, element)| element));
+                    full_window_source_elements.extend(
+                        source_backdrop_elements
                             .into_iter()
-                            .map(|item| (order, item)),
+                            .map(|(_, element)| element),
                     );
                 }
 
-                for (order, element) in decoration::ordered_text_elements_for_window(
-                    &mut backend.renderer,
-                    space,
-                    window_decorations,
-                    &output,
-                    window,
-                    source_alpha,
-                )? {
-                    source_ui_elements.extend(
-                        transform_text_elements(vec![element], root_origin, visual_state)?
-                            .into_iter()
-                            .map(|item| (order, item)),
-                    );
-                }
-
-                source_ui_elements.sort_by_key(|(order, _)| *order);
-                source_backdrop_elements.sort_by_key(|(order, _)| *order);
-                full_window_source_elements
-                    .extend(source_ui_elements.into_iter().map(|(_, element)| element));
-                full_window_source_elements.extend(
-                    source_backdrop_elements
+                let mut original_window_body_elements: Vec<TtyRenderElements> = Vec::new();
+                original_window_body_elements.extend(client_elements.into_iter());
+                original_window_body_elements
+                    .extend(ordered_ui_elements.into_iter().map(|(_, element)| element));
+                original_window_body_elements.extend(
+                    ordered_backdrop_elements
                         .into_iter()
                         .map(|(_, element)| element),
                 );
-            }
-
-            let mut original_window_body_elements: Vec<TtyRenderElements> = Vec::new();
-            original_window_body_elements.extend(client_elements.into_iter());
-            original_window_body_elements
-                .extend(ordered_ui_elements.into_iter().map(|(_, element)| element));
-            original_window_body_elements.extend(
-                ordered_backdrop_elements
-                    .into_iter()
-                    .map(|(_, element)| element),
-            );
-            if let Some(decoration) = window_decorations.get(window) {
-                log_gap_final_composite_readback(
-                    &mut backend.renderer,
-                    scale,
-                    &original_window_body_elements,
-                    decoration,
-                    output_geo,
-                    visual_state,
-                    &output.name(),
-                    &window_id,
-                );
-            }
-            let replace_effect_slot = window_decorations
-                .get(window)
-                .and_then(|decoration| decoration.window_effects.as_ref())
-                .and_then(|effects| effects.replace.as_ref())
-                .cloned();
-            let replace_effects = replace_effect_slot.as_ref()
+                if let Some(decoration) = window_decorations.get(window) {
+                    log_gap_final_composite_readback(
+                        &mut backend.renderer,
+                        scale,
+                        &original_window_body_elements,
+                        decoration,
+                        output_geo,
+                        visual_state,
+                        &output.name(),
+                        &window_id,
+                    );
+                }
+                let replace_effect_slot = window_decorations
+                    .get(window)
+                    .and_then(|decoration| decoration.window_effects.as_ref())
+                    .and_then(|effects| effects.replace.as_ref())
+                    .cloned();
+                let replace_effects = replace_effect_slot.as_ref()
                 .and_then(|effect| {
                     let decoration = window_decorations.get(window)?;
                     let (rect, source_elements): (_, &[TtyRenderElements]) =
@@ -4325,57 +4442,126 @@ fn render_surface(
                     })
                     .ok()
             });
-            if let Some(replace_effects) = replace_effects {
-                if !use_full_window_snapshot {
-                    current_window_elements.extend(non_root_surface_elements_for_window(
-                        window,
-                        &mut backend.renderer,
-                        physical_location,
-                        client_physical_geometry,
-                        output_geo.loc,
-                        scale,
-                        source_clip_scale,
-                        visual_state,
-                        visual_state.opacity,
-                        content_clip,
-                    ));
+                if let Some(replace_effects) = replace_effects {
+                    if !use_full_window_snapshot {
+                        current_window_elements.extend(non_root_surface_elements_for_window(
+                            window,
+                            &mut backend.renderer,
+                            physical_location,
+                            client_physical_geometry,
+                            output_geo.loc,
+                            scale,
+                            source_clip_scale,
+                            visual_state,
+                            visual_state.opacity,
+                            content_clip,
+                        ));
+                    }
+                    current_window_elements.extend(replace_effects);
+                } else {
+                    current_window_elements.extend(original_window_body_elements);
                 }
-                current_window_elements.extend(replace_effects);
-            } else {
-                current_window_elements.extend(original_window_body_elements);
-            }
-            if window_effect_debug_enabled() {
-                let effect_summary = window_decorations.get(window).map(|decoration| {
-                    decoration.window_effects.as_ref().map(|effects| {
-                        (
-                            effects.behind.is_some(),
-                            effects.behind_root_surface.is_some(),
-                            effects.in_front.is_some(),
-                            effects.replace.is_some(),
-                            effects
-                                .behind_root_surface
-                                .as_ref()
-                                .or(effects.behind.as_ref())
-                                .map(|effect| effect.outsets),
+                if window_effect_debug_enabled() {
+                    let effect_summary = window_decorations.get(window).map(|decoration| {
+                        decoration.window_effects.as_ref().map(|effects| {
+                            (
+                                effects.behind.is_some(),
+                                effects.behind_root_surface.is_some(),
+                                effects.in_front.is_some(),
+                                effects.replace.is_some(),
+                                effects
+                                    .behind_root_surface
+                                    .as_ref()
+                                    .or(effects.behind.as_ref())
+                                    .map(|effect| effect.outsets),
+                            )
+                        })
+                    });
+                    info!(
+                        output = %output.name(),
+                        window_id = %window_id,
+                        use_full_window_snapshot,
+                        current_window_element_count = current_window_elements.len(),
+                        effect_summary = ?effect_summary,
+                        "window effect debug: window render effect state"
+                    );
+                }
+                let behind_root_surface_effect_slot = window_decorations
+                    .get(window)
+                    .and_then(|decoration| decoration.window_effects.as_ref())
+                    .and_then(|effects| effects.behind_root_surface.as_ref())
+                    .cloned();
+                let behind_root_surface_effects =
+                    behind_root_surface_effect_slot.as_ref().and_then(|effect| {
+                        let decoration = window_decorations.get(window)?;
+                        let (rect, source_elements): (_, &[TtyRenderElements]) =
+                            match &effect.effect.input {
+                                EffectInput::WindowSource(WindowSourceInclude::Full) => (
+                                    transformed_root_rect(
+                                        decoration.layout.root.rect,
+                                        decoration.visual_transform,
+                                    ),
+                                    &full_window_source_elements,
+                                ),
+                                EffectInput::WindowSource(WindowSourceInclude::RootSurface) => (
+                                    transformed_rect(
+                                        decoration.client_rect,
+                                        decoration.layout.root.rect,
+                                        decoration.visual_transform,
+                                    ),
+                                    &root_surface_source_elements,
+                                ),
+                                _ => (
+                                    transformed_root_rect(
+                                        decoration.layout.root.rect,
+                                        decoration.visual_transform,
+                                    ),
+                                    &full_window_source_elements,
+                                ),
+                            };
+                        let signature = window_effect_signature(
+                            "behind-root-surface",
+                            rect,
+                            effect,
+                            scale,
+                            source_elements,
+                        );
+                        let (element_id, commit_counter) =
+                            window_decorations.get_mut(window).map(|decoration| {
+                                window_effect_element_state(
+                                    decoration,
+                                    format!("behind-root-surface@{}", output.name()),
+                                    signature,
+                                )
+                            })?;
+                        window_effect_elements(
+                            &mut backend.renderer,
+                            &output,
+                            output_geo,
+                            scale,
+                            &window_id,
+                            "behind-root-surface",
+                            element_id,
+                            commit_counter,
+                            rect,
+                            effect,
+                            source_elements,
                         )
-                    })
-                });
-                info!(
-                    output = %output.name(),
-                    window_id = %window_id,
-                    use_full_window_snapshot,
-                    current_window_element_count = current_window_elements.len(),
-                    effect_summary = ?effect_summary,
-                    "window effect debug: window render effect state"
-                );
-            }
-            let behind_root_surface_effect_slot = window_decorations
-                .get(window)
-                .and_then(|decoration| decoration.window_effects.as_ref())
-                .and_then(|effects| effects.behind_root_surface.as_ref())
-                .cloned();
-            let behind_root_surface_effects =
-                behind_root_surface_effect_slot.as_ref().and_then(|effect| {
+                        .inspect_err(|error| {
+                            warn!(
+                                window_id = %window_id,
+                                ?error,
+                                "failed to build root-surface window behind effect"
+                            );
+                        })
+                        .ok()
+                    });
+                let behind_effect_slot = window_decorations
+                    .get(window)
+                    .and_then(|decoration| decoration.window_effects.as_ref())
+                    .and_then(|effects| effects.behind.as_ref())
+                    .cloned();
+                let behind_effects = behind_effect_slot.as_ref().and_then(|effect| {
                     let decoration = window_decorations.get(window)?;
                     let (rect, source_elements): (_, &[TtyRenderElements]) =
                         match &effect.effect.input {
@@ -4399,89 +4585,20 @@ fn render_surface(
                                     decoration.layout.root.rect,
                                     decoration.visual_transform,
                                 ),
-                                &full_window_source_elements,
+                                &current_window_elements,
                             ),
                         };
-                    let signature = window_effect_signature(
-                        "behind-root-surface",
-                        rect,
-                        effect,
-                        scale,
-                        source_elements,
-                    );
+                    let signature =
+                        window_effect_signature("behind", rect, effect, scale, source_elements);
                     let (element_id, commit_counter) =
                         window_decorations.get_mut(window).map(|decoration| {
                             window_effect_element_state(
                                 decoration,
-                                format!("behind-root-surface@{}", output.name()),
+                                format!("behind@{}", output.name()),
                                 signature,
                             )
                         })?;
                     window_effect_elements(
-                        &mut backend.renderer,
-                        &output,
-                        output_geo,
-                        scale,
-                        &window_id,
-                        "behind-root-surface",
-                        element_id,
-                        commit_counter,
-                        rect,
-                        effect,
-                        source_elements,
-                    )
-                    .inspect_err(|error| {
-                        warn!(
-                            window_id = %window_id,
-                            ?error,
-                            "failed to build root-surface window behind effect"
-                        );
-                    })
-                    .ok()
-                });
-            let behind_effect_slot = window_decorations
-                .get(window)
-                .and_then(|decoration| decoration.window_effects.as_ref())
-                .and_then(|effects| effects.behind.as_ref())
-                .cloned();
-            let behind_effects = behind_effect_slot.as_ref().and_then(|effect| {
-                let decoration = window_decorations.get(window)?;
-                let (rect, source_elements): (_, &[TtyRenderElements]) = match &effect.effect.input
-                {
-                    EffectInput::WindowSource(WindowSourceInclude::Full) => (
-                        transformed_root_rect(
-                            decoration.layout.root.rect,
-                            decoration.visual_transform,
-                        ),
-                        &full_window_source_elements,
-                    ),
-                    EffectInput::WindowSource(WindowSourceInclude::RootSurface) => (
-                        transformed_rect(
-                            decoration.client_rect,
-                            decoration.layout.root.rect,
-                            decoration.visual_transform,
-                        ),
-                        &root_surface_source_elements,
-                    ),
-                    _ => (
-                        transformed_root_rect(
-                            decoration.layout.root.rect,
-                            decoration.visual_transform,
-                        ),
-                        &current_window_elements,
-                    ),
-                };
-                let signature =
-                    window_effect_signature("behind", rect, effect, scale, source_elements);
-                let (element_id, commit_counter) =
-                    window_decorations.get_mut(window).map(|decoration| {
-                        window_effect_element_state(
-                            decoration,
-                            format!("behind@{}", output.name()),
-                            signature,
-                        )
-                    })?;
-                window_effect_elements(
                     &mut backend.renderer,
                     &output,
                     output_geo,
@@ -4498,185 +4615,188 @@ fn render_surface(
                     warn!(window_id = %window_id, ?error, "failed to build window behind effect");
                 })
                 .ok()
-            });
-            let in_front_effect_slot = window_decorations
-                .get(window)
-                .and_then(|decoration| decoration.window_effects.as_ref())
-                .and_then(|effects| effects.in_front.as_ref())
-                .cloned();
-            let in_front_effects = in_front_effect_slot.as_ref().and_then(|effect| {
-                let decoration = window_decorations.get(window)?;
-                let (rect, source_elements): (_, &[TtyRenderElements]) = match &effect.effect.input
+                });
+                let in_front_effect_slot = window_decorations
+                    .get(window)
+                    .and_then(|decoration| decoration.window_effects.as_ref())
+                    .and_then(|effects| effects.in_front.as_ref())
+                    .cloned();
+                let in_front_effects = in_front_effect_slot.as_ref().and_then(|effect| {
+                    let decoration = window_decorations.get(window)?;
+                    let (rect, source_elements): (_, &[TtyRenderElements]) =
+                        match &effect.effect.input {
+                            EffectInput::WindowSource(WindowSourceInclude::Full) => (
+                                transformed_root_rect(
+                                    decoration.layout.root.rect,
+                                    decoration.visual_transform,
+                                ),
+                                &full_window_source_elements,
+                            ),
+                            EffectInput::WindowSource(WindowSourceInclude::RootSurface) => (
+                                transformed_rect(
+                                    decoration.client_rect,
+                                    decoration.layout.root.rect,
+                                    decoration.visual_transform,
+                                ),
+                                &root_surface_source_elements,
+                            ),
+                            _ => (
+                                transformed_root_rect(
+                                    decoration.layout.root.rect,
+                                    decoration.visual_transform,
+                                ),
+                                &current_window_elements,
+                            ),
+                        };
+                    let signature =
+                        window_effect_signature("in-front", rect, effect, scale, source_elements);
+                    let (element_id, commit_counter) =
+                        window_decorations.get_mut(window).map(|decoration| {
+                            window_effect_element_state(
+                                decoration,
+                                format!("in-front@{}", output.name()),
+                                signature,
+                            )
+                        })?;
+                    window_effect_elements(
+                        &mut backend.renderer,
+                        &output,
+                        output_geo,
+                        scale,
+                        &window_id,
+                        "in-front",
+                        element_id,
+                        commit_counter,
+                        rect,
+                        effect,
+                        source_elements,
+                    )
+                    .inspect_err(|error| {
+                        warn!(
+                            window_id = %window_id,
+                            ?error,
+                            "failed to build in-front window effect"
+                        );
+                    })
+                    .ok()
+                });
+
+                // Smithay renders render elements in reverse order, so this vector is
+                // ordered front-to-back. Front effects go before the window elements;
+                // behind effects go after them but still above lower windows.
+                if let Some(in_front_effects) = in_front_effects {
+                    if window_effect_debug_enabled() {
+                        info!(
+                            output = %output.name(),
+                            window_id = %window_id,
+                            in_front_effect_count = in_front_effects.len(),
+                            "window effect debug: appending in-front effects"
+                        );
+                    }
+                    scene_elements.extend(in_front_effects);
+                }
+                scene_elements.extend(current_window_elements.into_iter());
+                if let Some(behind_effects) = behind_root_surface_effects {
+                    if window_effect_debug_enabled() {
+                        info!(
+                            output = %output.name(),
+                            window_id = %window_id,
+                            behind_effect_count = behind_effects.len(),
+                            "window effect debug: appending root-surface behind effects"
+                        );
+                    }
+                    scene_elements.extend(behind_effects);
+                }
+                if let Some(behind_effects) = behind_effects {
+                    if window_effect_debug_enabled() {
+                        info!(
+                            output = %output.name(),
+                            window_id = %window_id,
+                            behind_effect_count = behind_effects.len(),
+                            "window effect debug: appending behind effects"
+                        );
+                    }
+                    scene_elements.extend(behind_effects);
+                }
+
+                if windows_ready_for_decoration.insert(window_id.clone()) {
+                    newly_ready_initial_focus_window_ids.push(window_id.clone());
+                }
+
+                if let Some(decoration) = window_decorations.get(window)
+                    && let Some(live_snapshot) =
+                        live_window_snapshots.get_mut(&decoration.snapshot.id)
                 {
-                    EffectInput::WindowSource(WindowSourceInclude::Full) => (
-                        transformed_root_rect(
-                            decoration.layout.root.rect,
-                            decoration.visual_transform,
-                        ),
-                        &full_window_source_elements,
-                    ),
-                    EffectInput::WindowSource(WindowSourceInclude::RootSurface) => (
-                        transformed_rect(
-                            decoration.client_rect,
-                            decoration.layout.root.rect,
-                            decoration.visual_transform,
-                        ),
-                        &root_surface_source_elements,
-                    ),
-                    _ => (
-                        transformed_root_rect(
-                            decoration.layout.root.rect,
-                            decoration.visual_transform,
-                        ),
-                        &current_window_elements,
-                    ),
-                };
-                let signature =
-                    window_effect_signature("in-front", rect, effect, scale, source_elements);
-                let (element_id, commit_counter) =
-                    window_decorations.get_mut(window).map(|decoration| {
-                        window_effect_element_state(
-                            decoration,
-                            format!("in-front@{}", output.name()),
-                            signature,
-                        )
-                    })?;
-                window_effect_elements(
-                    &mut backend.renderer,
-                    &output,
-                    output_geo,
-                    scale,
-                    &window_id,
-                    "in-front",
-                    element_id,
-                    commit_counter,
-                    rect,
-                    effect,
-                    source_elements,
-                )
-                .inspect_err(|error| {
+                    snapshot::retarget_snapshot_rect(live_snapshot, decoration.client_rect);
+                }
+                let should_seed_close_snapshot = window_decorations
+                    .get(window)
+                    .map(|decoration| {
+                        live_window_snapshots
+                            .get(&decoration.snapshot.id)
+                            .map(|snapshot| {
+                                snapshot.rect.width != decoration.client_rect.width
+                                    || snapshot.rect.height != decoration.client_rect.height
+                            })
+                            .unwrap_or(true)
+                    })
+                    .unwrap_or(false);
+                if should_seed_close_snapshot {
+                    let snapshot_capture_started_at = Instant::now();
+                    timescope::scope!("tty live snapshot capture");
+                    if capture_live_snapshot_for_window(
+                        &mut backend.renderer,
+                        window,
+                        window_location,
+                        scale,
+                        0,
+                        window_decorations,
+                        live_window_snapshots,
+                        live_window_snapshot_trackers,
+                    )
+                    .is_ok()
+                    {
+                        snapshot_capture_count = snapshot_capture_count.saturating_add(1);
+                    }
+                    let elapsed_ms = snapshot_capture_started_at.elapsed().as_secs_f64() * 1000.0;
+                    snapshot_capture_elapsed_ms += elapsed_ms;
+                    window_timing.live_snapshot_refresh_ms += elapsed_ms;
+                }
+
+                // Content dirtiness is consumed by the transform-snapshot path above. The close
+                // backup is seeded only when missing or resized, so client commits and workspace
+                // movement do not maintain a second full client texture.
+                if let Some(snapshot_id) = snapshot_id.as_ref() {
+                    snapshot_dirty_window_ids.remove(snapshot_id);
+                }
+                let window_elapsed_ms = window_started_at.elapsed().as_secs_f64() * 1000.0;
+                if animation_timing_debug_enabled() && window_elapsed_ms >= spike_threshold_ms {
                     warn!(
-                        window_id = %window_id,
-                        ?error,
-                        "failed to build in-front window effect"
-                    );
-                })
-                .ok()
-            });
-
-            // Smithay renders render elements in reverse order, so this vector is
-            // ordered front-to-back. Front effects go before the window elements;
-            // behind effects go after them but still above lower windows.
-            if let Some(in_front_effects) = in_front_effects {
-                if window_effect_debug_enabled() {
-                    info!(
                         output = %output.name(),
                         window_id = %window_id,
-                        in_front_effect_count = in_front_effects.len(),
-                        "window effect debug: appending in-front effects"
+                        use_full_window_snapshot,
+                        direct_surface_count,
+                        direct_surface_lookup_ms = window_timing.direct_surface_lookup_ms,
+                        decoration_phase_ms = window_timing.decoration_phase_ms,
+                        backdrop_ms = window_timing.backdrop_ms,
+                        background_ms = window_timing.background_ms,
+                        icon_ms = window_timing.icon_ms,
+                        text_ms = window_timing.text_ms,
+                        client_phase_ms = window_timing.client_phase_ms,
+                        popup_phase_ms = window_timing.popup_phase_ms,
+                        full_snapshot_scene_ms = window_timing.full_snapshot_scene_ms,
+                        full_snapshot_capture_ms = window_timing.full_snapshot_capture_ms,
+                        live_snapshot_refresh_ms = window_timing.live_snapshot_refresh_ms,
+                        window_elapsed_ms,
+                        window_has_snapshot_damage,
+                        "animation timing: tty window spike"
                     );
                 }
-                scene_elements.extend(in_front_effects);
-            }
-            scene_elements.extend(current_window_elements.into_iter());
-            if let Some(behind_effects) = behind_root_surface_effects {
-                if window_effect_debug_enabled() {
-                    info!(
-                        output = %output.name(),
-                        window_id = %window_id,
-                        behind_effect_count = behind_effects.len(),
-                        "window effect debug: appending root-surface behind effects"
-                    );
+                window_loop_elapsed_ms += window_elapsed_ms;
+                if window_elapsed_ms > max_window_elapsed_ms {
+                    max_window_elapsed_ms = window_elapsed_ms;
+                    max_window_id = Some(window_id);
                 }
-                scene_elements.extend(behind_effects);
-            }
-            if let Some(behind_effects) = behind_effects {
-                if window_effect_debug_enabled() {
-                    info!(
-                        output = %output.name(),
-                        window_id = %window_id,
-                        behind_effect_count = behind_effects.len(),
-                        "window effect debug: appending behind effects"
-                    );
-                }
-                scene_elements.extend(behind_effects);
-            }
-
-            if windows_ready_for_decoration.insert(window_id.clone()) {
-                newly_ready_initial_focus_window_ids.push(window_id.clone());
-            }
-
-            if let Some(decoration) = window_decorations.get(window)
-                && let Some(live_snapshot) = live_window_snapshots.get_mut(&decoration.snapshot.id)
-            {
-                snapshot::retarget_snapshot_rect(live_snapshot, decoration.client_rect);
-            }
-            let should_seed_close_snapshot = window_decorations
-                .get(window)
-                .map(|decoration| {
-                    live_window_snapshots
-                        .get(&decoration.snapshot.id)
-                        .map(|snapshot| {
-                            snapshot.rect.width != decoration.client_rect.width
-                                || snapshot.rect.height != decoration.client_rect.height
-                        })
-                        .unwrap_or(true)
-                })
-                .unwrap_or(false);
-            if should_seed_close_snapshot {
-                let snapshot_capture_started_at = Instant::now();
-                if capture_live_snapshot_for_window(
-                    &mut backend.renderer,
-                    window,
-                    window_location,
-                    scale,
-                    0,
-                    window_decorations,
-                    live_window_snapshots,
-                    live_window_snapshot_trackers,
-                )
-                .is_ok()
-                {
-                    snapshot_capture_count = snapshot_capture_count.saturating_add(1);
-                }
-                let elapsed_ms = snapshot_capture_started_at.elapsed().as_secs_f64() * 1000.0;
-                snapshot_capture_elapsed_ms += elapsed_ms;
-                window_timing.live_snapshot_refresh_ms += elapsed_ms;
-            }
-
-            // Content dirtiness is consumed by the transform-snapshot path above. The close
-            // backup is seeded only when missing or resized, so client commits and workspace
-            // movement do not maintain a second full client texture.
-            if let Some(snapshot_id) = snapshot_id.as_ref() {
-                snapshot_dirty_window_ids.remove(snapshot_id);
-            }
-            let window_elapsed_ms = window_started_at.elapsed().as_secs_f64() * 1000.0;
-            if animation_timing_debug_enabled() && window_elapsed_ms >= spike_threshold_ms {
-                warn!(
-                    output = %output.name(),
-                    window_id = %window_id,
-                    use_full_window_snapshot,
-                    direct_surface_count,
-                    direct_surface_lookup_ms = window_timing.direct_surface_lookup_ms,
-                    decoration_phase_ms = window_timing.decoration_phase_ms,
-                    backdrop_ms = window_timing.backdrop_ms,
-                    background_ms = window_timing.background_ms,
-                    icon_ms = window_timing.icon_ms,
-                    text_ms = window_timing.text_ms,
-                    client_phase_ms = window_timing.client_phase_ms,
-                    popup_phase_ms = window_timing.popup_phase_ms,
-                    full_snapshot_scene_ms = window_timing.full_snapshot_scene_ms,
-                    full_snapshot_capture_ms = window_timing.full_snapshot_capture_ms,
-                    live_snapshot_refresh_ms = window_timing.live_snapshot_refresh_ms,
-                    window_elapsed_ms,
-                    window_has_snapshot_damage,
-                    "animation timing: tty window spike"
-                );
-            }
-            window_loop_elapsed_ms += window_elapsed_ms;
-            if window_elapsed_ms > max_window_elapsed_ms {
-                max_window_elapsed_ms = window_elapsed_ms;
-                max_window_id = Some(window_id);
             }
         }
         timing.transform_snapshot_window_count = frame_transform_snapshot_window_count;
@@ -4688,6 +4808,7 @@ fn render_surface(
         let lower_layers_started_at = Instant::now();
         // Fullscreen fast path: Bottom/Background layers are fully occluded.
         if fullscreen_window.is_none() {
+            timescope::scope!("tty lower layer scene");
             scene_elements.extend(lower_layer_scene_elements(
                 &mut backend.renderer,
                 &output,
@@ -4710,6 +4831,7 @@ fn render_surface(
         let should_profile_damage = should_capture_blink;
         let damage_profile_started_at = Instant::now();
         let computed_damage = if should_profile_damage {
+            timescope::scope!("tty damage profile");
             match surface
                 .blink_damage_tracker
                 .damage_output(1, &scene_elements)
@@ -4794,13 +4916,16 @@ fn render_surface(
         // local translation that we can't apply after wrapping into
         // TtyRenderElements::Cursor).
         let presented = start_time.elapsed();
-        crate::backend::image_copy_capture_render::process_image_copy_capture_for_toplevels(
-            image_copy_capture_pending,
-            space,
-            &mut backend.renderer,
-            &cursor_pointer_elements,
-            presented,
-        );
+        {
+            timescope::scope!("tty toplevel image capture");
+            crate::backend::image_copy_capture_render::process_image_copy_capture_for_toplevels(
+                image_copy_capture_pending,
+                space,
+                &mut backend.renderer,
+                &cursor_pointer_elements,
+                presented,
+            );
+        }
 
         // Now wrap cursor elements into the unified TtyRenderElements list
         // used by the output capture paths and the DRM render.
@@ -4819,6 +4944,7 @@ fn render_surface(
         let mut mirrored_display_content = None;
         let mut mirrored_render_states = None;
         if use_capture_mirror {
+            timescope::scope!("tty capture mirror");
             let output_name = output.name();
             let mut mirror = state.output_capture_mirrors.remove(&output_name);
             match render_output_capture_mirror(
@@ -4855,24 +4981,30 @@ fn render_surface(
             .as_deref()
             .unwrap_or(content_for_capture.as_slice());
 
-        crate::backend::screencopy_render::process_screencopy_queue_for_output(
-            screencopy_state,
-            loop_handle,
-            &mut backend.renderer,
-            &output,
-            capture_content_for_output,
-            &cursor_elements,
-        );
+        {
+            timescope::scope!("tty screencopy output");
+            crate::backend::screencopy_render::process_screencopy_queue_for_output(
+                screencopy_state,
+                loop_handle,
+                &mut backend.renderer,
+                &output,
+                capture_content_for_output,
+                &cursor_elements,
+            );
+        }
         // Phase 5b-ii: serve ext-image-copy-capture-v1 frames for this output
         // alongside the existing wlr-screencopy queue.
-        crate::backend::image_copy_capture_render::process_image_copy_capture_for_output(
-            image_copy_capture_pending,
-            &mut backend.renderer,
-            &output,
-            capture_content_for_output,
-            &cursor_elements,
-            presented,
-        );
+        {
+            timescope::scope!("tty output image capture");
+            crate::backend::image_copy_capture_render::process_image_copy_capture_for_output(
+                image_copy_capture_pending,
+                &mut backend.renderer,
+                &output,
+                capture_content_for_output,
+                &cursor_elements,
+                presented,
+            );
+        }
 
         // FPS overlay: pre-rasterized glyph buffers composed at the top-left
         // of this output. Built before render_frame so it sits in the
@@ -5003,73 +5135,87 @@ fn render_surface(
         // alternating async game frames with vblank-bound cursor frames produces visibly uneven
         // cursor motion even when both the game and the output are otherwise running fast.
         let mut fullscreen_root_buffer_details = None;
-        let result = crate::backend::shader_effect::with_gpu_timing_renderer_span(
-            &mut backend.renderer,
-            "tty-render-frame",
-            (output_geo.size.w, output_geo.size.h),
-            |renderer| {
-                if direct_scanout_debug_enabled()
-                    && let Some(root_id) = fullscreen_root_element_id.as_ref()
-                    && let Some(element) = elements.iter().find(|element| element.id() == root_id)
-                {
-                    let src = element.src();
-                    let geometry = element.geometry(scale);
-                    let transform = element.transform();
-                    let storage = describe_underlying_storage(element.underlying_storage(renderer));
-                    fullscreen_root_buffer_details = Some(format!(
-                        "element={} id={:?} src={src:?} geometry={geometry:?} \
+        let result = {
+            timescope::scope!("tty render_frame");
+            crate::backend::shader_effect::with_gpu_timing_renderer_span(
+                &mut backend.renderer,
+                "tty-render-frame",
+                (output_geo.size.w, output_geo.size.h),
+                |renderer| {
+                    if direct_scanout_debug_enabled()
+                        && let Some(root_id) = fullscreen_root_element_id.as_ref()
+                        && let Some(element) =
+                            elements.iter().find(|element| element.id() == root_id)
+                    {
+                        let src = element.src();
+                        let geometry = element.geometry(scale);
+                        let transform = element.transform();
+                        let storage =
+                            describe_underlying_storage(element.underlying_storage(renderer));
+                        fullscreen_root_buffer_details = Some(format!(
+                            "element={} id={:?} src={src:?} geometry={geometry:?} \
                          transform={transform:?} storage=[{storage}]",
-                        tty_render_element_name(element),
-                        element.id(),
-                    ));
-                }
-                if crate::backend::shader_effect::gpu_element_timing_debug_enabled() {
-                    let profiled_elements = elements
-                        .iter()
-                        .map(ProfiledTtyRenderElement::new)
-                        .collect::<Vec<_>>();
-                    surface
-                        .drm_output
-                        .render_frame(renderer, &profiled_elements, frame_clear_color, frame_flags)
-                        .map(|result| {
-                            let primary_scanout =
-                                matches!(result.primary_element, PrimaryPlaneElement::Element(_));
-                            let primary_plane_kind = match &result.primary_element {
-                                PrimaryPlaneElement::Element(_) => "element",
-                                PrimaryPlaneElement::Swapchain(_) => "swapchain",
-                            };
-                            TtyRenderFrameResult {
-                                is_empty: result.is_empty,
-                                primary_scanout,
-                                primary_plane_kind,
-                                overlay_plane_count: result.overlay_elements.len(),
-                                cursor_plane_assigned: result.cursor_element.is_some(),
-                                states: result.states,
-                            }
-                        })
-                } else {
-                    surface
-                        .drm_output
-                        .render_frame(renderer, &elements, frame_clear_color, frame_flags)
-                        .map(|result| {
-                            let primary_scanout =
-                                matches!(result.primary_element, PrimaryPlaneElement::Element(_));
-                            let primary_plane_kind = match &result.primary_element {
-                                PrimaryPlaneElement::Element(_) => "element",
-                                PrimaryPlaneElement::Swapchain(_) => "swapchain",
-                            };
-                            TtyRenderFrameResult {
-                                is_empty: result.is_empty,
-                                primary_scanout,
-                                primary_plane_kind,
-                                overlay_plane_count: result.overlay_elements.len(),
-                                cursor_plane_assigned: result.cursor_element.is_some(),
-                                states: result.states,
-                            }
-                        })
-                }
-            },
-        )?;
+                            tty_render_element_name(element),
+                            element.id(),
+                        ));
+                    }
+                    if crate::backend::shader_effect::gpu_element_timing_debug_enabled() {
+                        let profiled_elements = elements
+                            .iter()
+                            .map(ProfiledTtyRenderElement::new)
+                            .collect::<Vec<_>>();
+                        surface
+                            .drm_output
+                            .render_frame(
+                                renderer,
+                                &profiled_elements,
+                                frame_clear_color,
+                                frame_flags,
+                            )
+                            .map(|result| {
+                                let primary_scanout = matches!(
+                                    result.primary_element,
+                                    PrimaryPlaneElement::Element(_)
+                                );
+                                let primary_plane_kind = match &result.primary_element {
+                                    PrimaryPlaneElement::Element(_) => "element",
+                                    PrimaryPlaneElement::Swapchain(_) => "swapchain",
+                                };
+                                TtyRenderFrameResult {
+                                    is_empty: result.is_empty,
+                                    primary_scanout,
+                                    primary_plane_kind,
+                                    overlay_plane_count: result.overlay_elements.len(),
+                                    cursor_plane_assigned: result.cursor_element.is_some(),
+                                    states: result.states,
+                                }
+                            })
+                    } else {
+                        surface
+                            .drm_output
+                            .render_frame(renderer, &elements, frame_clear_color, frame_flags)
+                            .map(|result| {
+                                let primary_scanout = matches!(
+                                    result.primary_element,
+                                    PrimaryPlaneElement::Element(_)
+                                );
+                                let primary_plane_kind = match &result.primary_element {
+                                    PrimaryPlaneElement::Element(_) => "element",
+                                    PrimaryPlaneElement::Swapchain(_) => "swapchain",
+                                };
+                                TtyRenderFrameResult {
+                                    is_empty: result.is_empty,
+                                    primary_scanout,
+                                    primary_plane_kind,
+                                    overlay_plane_count: result.overlay_elements.len(),
+                                    cursor_plane_assigned: result.cursor_element.is_some(),
+                                    states: result.states,
+                                }
+                            })
+                    }
+                },
+            )?
+        };
         fps_counter.record_present(output.name().as_str());
         note_direct_scanout_transition(
             output.name().as_str(),
@@ -5454,20 +5600,23 @@ fn render_surface(
             // `should_tear` selects an immediate (async) page flip when the fullscreen
             // direct-scanout tearing fast path is active, and a normal vblank-synced flip
             // otherwise. See `should_tear` / the tearing fast-path block above.
-            if let Err(err) = surface
-                .drm_output
-                .queue_frame_tearing(Some(output_presentation_feedback), should_tear)
             {
-                if error_chain_has_permission_denied(&err) {
-                    warn!(
-                        output = %output.name(),
-                        ?err,
-                        "tty queue_frame lost drm access; waiting for session resume"
-                    );
-                    reset_surface_after_tty_pause(surface);
-                    return Ok(RenderSurfaceOutcome::Skipped);
+                timescope::scope!("tty queue_frame");
+                if let Err(err) = surface
+                    .drm_output
+                    .queue_frame_tearing(Some(output_presentation_feedback), should_tear)
+                {
+                    if error_chain_has_permission_denied(&err) {
+                        warn!(
+                            output = %output.name(),
+                            ?err,
+                            "tty queue_frame lost drm access; waiting for session resume"
+                        );
+                        reset_surface_after_tty_pause(surface);
+                        return Ok(RenderSurfaceOutcome::Skipped);
+                    }
+                    return Err(Box::new(err));
                 }
-                return Err(Box::new(err));
             }
             if animation_gap_debug_enabled() {
                 info!(

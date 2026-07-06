@@ -372,6 +372,12 @@ COMPOSITOR.key.bind("fps", "Super+Shift+F", () => {
   COMPOSITOR.debug.fpsCounter = fpsCounter;
 });
 
+let profileEnabled = false;
+COMPOSITOR.key.bind("profile", "Super+Shift+T", () => {
+  profileEnabled = !profileEnabled;
+  COMPOSITOR.debug.enableProfile(profileEnabled);
+});
+
 COMPOSITOR.output.configure((context) => {
   const display: DisplayConfigDraft = {};
 

@@ -22,6 +22,7 @@ pub mod handlers;
 pub mod input;
 pub mod install_paths;
 pub mod presentation;
+pub mod profiler;
 pub mod protocols;
 pub mod runtime_debug;
 pub mod runtime_input;
@@ -46,6 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = CliArgs::parse();
     init_logging(&args)?;
+    profiler::init();
     install_panic_hook();
     apply_runtime_overrides(&args);
     init_runtime_paths(&args);
@@ -58,7 +60,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     info!(?backend, "starting shoji_wm");
-    backend.run()?;
+    let result = backend.run();
+    profiler::dump_if_enabled("shutdown");
+    result?;
 
     Ok(())
 }

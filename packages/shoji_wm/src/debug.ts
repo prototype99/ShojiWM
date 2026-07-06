@@ -2,9 +2,11 @@ import type { DebugController } from "./types";
 
 interface DebugConfigSnapshot {
   fpsCounter: boolean;
+  profile: boolean;
 }
 
 let fpsCounterEnabled = false;
+let profileEnabled = false;
 let pendingDebugConfig = false;
 
 export const DEBUG_CONTROLLER: DebugController = {
@@ -17,6 +19,17 @@ export const DEBUG_CONTROLLER: DebugController = {
       return;
     }
     fpsCounterEnabled = next;
+    pendingDebugConfig = true;
+  },
+  get profile(): boolean {
+    return profileEnabled;
+  },
+  enableProfile(enabled: boolean) {
+    const next = enabled === true;
+    if (next === profileEnabled) {
+      return;
+    }
+    profileEnabled = next;
     pendingDebugConfig = true;
   },
 };
@@ -33,5 +46,5 @@ export function takePendingDebugConfig(): DebugConfigSnapshot | undefined {
     return undefined;
   }
   pendingDebugConfig = false;
-  return { fpsCounter: fpsCounterEnabled };
+  return { fpsCounter: fpsCounterEnabled, profile: profileEnabled };
 }

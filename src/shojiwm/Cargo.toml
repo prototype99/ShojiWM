@@ -43,3 +43,4 @@ calloop = { version = "0.14.0", features = ["signals"] }
 # source in calloop receives it deterministically (without random threads
 # catching it before we can read).
 libc = "0.2"
+timescope = "0.1.3"

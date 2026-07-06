@@ -44,6 +44,7 @@ pub fn process_screencopy_queue_for_output(
     content_elements: &[TtyRenderElements],
     cursor_elements: &[TtyRenderElements],
 ) {
+    timescope::scope!("screencopy queue output");
     let profile = std::env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some();
     let entry_at = std::time::Instant::now();
     let mut processed = 0usize;
@@ -77,8 +78,10 @@ pub fn process_screencopy_queue_for_output(
             } else {
                 content_elements.iter().collect()
             };
-            let render_result =
-                render_for_screencopy(renderer, output, &composed_refs, damage_tracker, front);
+            let render_result = {
+                timescope::scope!("screencopy render frame");
+                render_for_screencopy(renderer, output, &composed_refs, damage_tracker, front)
+            };
             let render_elapsed = render_started_at.elapsed();
 
             match render_result {
@@ -232,21 +235,25 @@ fn render_to_dmabuf(
     transform: Transform,
     elements: &[impl RenderElement<GlesRenderer>],
 ) -> Result<SyncPoint, Box<dyn std::error::Error>> {
+    timescope::scope!("screencopy render_to_dmabuf");
     let profile = std::env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some();
     let bind_at = std::time::Instant::now();
     let mut target = renderer.bind(&mut dmabuf)?;
     let bind_ms = bind_at.elapsed().as_secs_f64() * 1000.0;
     let render_at = std::time::Instant::now();
     let mut damage_tracker = OutputDamageTracker::new(size, scale, transform);
-    let sync = damage_tracker
-        .render_output(
-            renderer,
-            &mut target,
-            0,
-            elements,
-            Color32F::new(0.0, 0.0, 0.0, 1.0),
-        )?
-        .sync;
+    let sync = {
+        timescope::scope!("screencopy dmabuf render_output");
+        damage_tracker
+            .render_output(
+                renderer,
+                &mut target,
+                0,
+                elements,
+                Color32F::new(0.0, 0.0, 0.0, 1.0),
+            )?
+            .sync
+    };
     let render_ms = render_at.elapsed().as_secs_f64() * 1000.0;
     if profile {
         tracing::info!(bind_ms, render_ms, "screencopy: dmabuf bind+render");
@@ -262,6 +269,7 @@ fn render_to_shm(
     transform: Transform,
     elements: &[impl RenderElement<GlesRenderer>],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    timescope::scope!("screencopy render_to_shm");
     shm::with_buffer_contents_mut(buffer, |shm_buffer, shm_len, buffer_data| {
         if !(buffer_data.format == wl_shm::Format::Xrgb8888
             && buffer_data.width == size.w
@@ -290,20 +298,27 @@ fn render_and_download(
     fourcc: Fourcc,
     elements: &[impl RenderElement<GlesRenderer>],
 ) -> Result<smithay::backend::renderer::gles::GlesMapping, Box<dyn std::error::Error>> {
+    timescope::scope!("screencopy render_and_download");
     let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
     let mut texture: GlesTexture = renderer.create_buffer(fourcc, buffer_size)?;
     {
         let mut target = renderer.bind(&mut texture)?;
         let mut damage_tracker = OutputDamageTracker::new(size, scale, transform);
-        let _ = damage_tracker.render_output(
-            renderer,
-            &mut target,
-            0,
-            elements,
-            Color32F::new(0.0, 0.0, 0.0, 1.0),
-        )?;
+        let _ = {
+            timescope::scope!("screencopy shm render_output");
+            damage_tracker.render_output(
+                renderer,
+                &mut target,
+                0,
+                elements,
+                Color32F::new(0.0, 0.0, 0.0, 1.0),
+            )?
+        };
     }
     let target = renderer.bind(&mut texture)?;
-    let mapping = renderer.copy_framebuffer(&target, Rectangle::from_size(buffer_size), fourcc)?;
+    let mapping = {
+        timescope::scope!("screencopy shm copy_framebuffer");
+        renderer.copy_framebuffer(&target, Rectangle::from_size(buffer_size), fourcc)?
+    };
     Ok(mapping)
 }

@@ -11,9 +11,15 @@ use smithay::{
         protocol::{wl_buffer, wl_surface::WlSurface},
     },
     wayland::{
-        buffer::BufferHandler, compositor::{
-            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes, add_blocker, add_pre_commit_hook, get_parent, is_sync_subsurface, with_states
-        }, dmabuf::get_dmabuf, shell::xdg::SurfaceCachedState, shm::{ShmHandler, ShmState}
+        buffer::BufferHandler,
+        compositor::{
+            BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
+            SurfaceAttributes, add_blocker, add_pre_commit_hook, get_parent, is_sync_subsurface,
+            with_states,
+        },
+        dmabuf::get_dmabuf,
+        shell::xdg::SurfaceCachedState,
+        shm::{ShmHandler, ShmState},
     },
 };
 use std::{

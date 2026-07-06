@@ -2670,6 +2670,7 @@ fn apply_effect_pipeline_with_cache(
     cache: Option<&mut EffectPipelineCache>,
     finish_mode: BackdropFinishMode,
 ) -> Result<GlesTexture, ShaderEffectError> {
+    timescope::scope!("effect pipeline");
     let mut ctx = EffectExecutionContext {
         backdrop: texture,
         xray_backdrop: xray_texture,
@@ -3087,6 +3088,7 @@ fn run_effect_pipeline(
     mut cache: Option<&mut EffectPipelineCache>,
     finish_mode: BackdropFinishMode,
 ) -> Result<GlesTexture, ShaderEffectError> {
+    timescope::scope!("effect pipeline stages");
     let requested_output_size = requested_effect_output_size(sample_region, output_size);
     let input_uses_requested_size = effect_input_renders_directly_to_requested_size(&effect.input);
     let initial_input_size = if input_uses_requested_size {
@@ -3450,6 +3452,7 @@ fn apply_shader_input_stage(
     stage: &ShaderStage,
     cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
+    timescope::scope!("effect shader input stage");
     let effect = CompiledEffect {
         input: EffectInput::Shader(stage.clone()),
         invalidate: EffectInvalidationPolicy::Always,
@@ -3524,6 +3527,7 @@ fn apply_blend_stage(
     alpha: f32,
     cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
+    timescope::scope!("effect blend stage");
     let programs = blend_shader_programs(renderer)?;
     if programs.renderer_context_id != renderer.context_id() {
         return Err(ShaderEffectError::Gles(GlesError::FramebufferBindingError));
@@ -3610,6 +3614,7 @@ fn crop_texture_region(
     output_size: (i32, i32),
     cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
+    timescope::scope!("effect crop");
     if output_size == size
         && region.loc.x == 0.0
         && region.loc.y == 0.0
@@ -3657,6 +3662,7 @@ fn apply_texture_program_region(
     cache: Option<&mut EffectPipelineCache>,
     timing_label: &'static str,
 ) -> Result<GlesTexture, ShaderEffectError> {
+    timescope::scope!("effect texture program");
     with_gpu_timing_renderer_span(renderer, timing_label, output_size, |renderer| {
         let target = effect_pipeline_target(renderer, output_size, cache)?;
         let source_region =

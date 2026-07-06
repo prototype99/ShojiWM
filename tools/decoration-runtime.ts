@@ -482,7 +482,7 @@ interface SchedulerTickSuccess {
   eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
-  debugConfig?: { fpsCounter: boolean };
+  debugConfig?: { fpsCounter: boolean; profile: boolean };
 }
 
 interface WindowClosedSuccess {
@@ -598,6 +598,7 @@ interface InvokeKeyBindingSuccess {
   eventConfig?: RuntimeEventConfig;
   processConfig?: { entries: RuntimeProcessConfigEntry[] };
   processActions?: RuntimeProcessSpawnAction[];
+  debugConfig?: { fpsCounter: boolean; profile: boolean };
 }
 
 interface WindowResizeSuccess {
@@ -1507,6 +1508,7 @@ async function main() {
             const inputConfig = pendingInputConfigPayload();
             const processConfig = pendingProcessConfigPayload();
             const processActions = pendingProcessActionsPayload();
+            const debugConfig = takePendingDebugConfig();
             await writeResponse(output, {
               requestId: request.requestId,
               ok: true,
@@ -1518,6 +1520,7 @@ async function main() {
               inputConfig,
               processConfig,
               processActions,
+              debugConfig,
             });
           } else if (request.kind === "windowResize") {
             const result = invokeWindowResize(

@@ -308,6 +308,7 @@ pub struct DecorationKeyBindingInvocation {
     pub event_config: Option<RuntimeEventConfigUpdate>,
     pub process_config: Option<RuntimeProcessConfigUpdate>,
     pub process_actions: Vec<RuntimeProcessAction>,
+    pub debug_config: Option<RuntimeDebugConfigUpdate>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1300,6 +1301,8 @@ struct RuntimeInvokeKeyBindingResponse {
     process_config: Option<RuntimeProcessConfigUpdate>,
     #[serde(rename = "processActions")]
     process_actions: Option<Vec<RuntimeProcessAction>>,
+    #[serde(rename = "debugConfig")]
+    debug_config: Option<RuntimeDebugConfigUpdate>,
     error: Option<String>,
 }
 
@@ -2280,6 +2283,7 @@ impl Clone for NodeDecorationEvaluator {
 
 impl NodeDecorationRuntime {
     fn write_request(&mut self, request: &str) -> Result<(), DecorationEvaluationError> {
+        timescope::scope!("runtime write request");
         let bytes = request.as_bytes();
         let len = u32::try_from(bytes.len()).map_err(|_| {
             DecorationEvaluationError::RuntimeProtocol("runtime request too large".into())
@@ -2303,19 +2307,26 @@ impl NodeDecorationRuntime {
     fn read_response<T: serde::de::DeserializeOwned>(
         &mut self,
     ) -> Result<Option<T>, DecorationEvaluationError> {
-        let payload = match &mut self.connection {
-            RuntimeConnection::Stdio { stdout, .. } => read_framed_message(stdout)?,
-            RuntimeConnection::Uds { reader, .. } => read_framed_message(reader)?,
+        timescope::scope!("runtime read response");
+        let payload = {
+            timescope::scope!("runtime read frame");
+            match &mut self.connection {
+                RuntimeConnection::Stdio { stdout, .. } => read_framed_message(stdout)?,
+                RuntimeConnection::Uds { reader, .. } => read_framed_message(reader)?,
+            }
         };
         let Some(payload) = payload else {
             return Ok(None);
         };
-        let value: serde_json::Value = serde_json::from_slice(&payload).map_err(|error| {
-            DecorationEvaluationError::InvalidResponse(format!(
-                "{error}; payload={}",
-                String::from_utf8_lossy(&payload)
-            ))
-        })?;
+        let value: serde_json::Value = {
+            timescope::scope!("runtime json parse value");
+            serde_json::from_slice(&payload).map_err(|error| {
+                DecorationEvaluationError::InvalidResponse(format!(
+                    "{error}; payload={}",
+                    String::from_utf8_lossy(&payload)
+                ))
+            })?
+        };
 
         record_runtime_protocol_response(
             value
@@ -2326,6 +2337,7 @@ impl NodeDecorationRuntime {
         );
 
         if let Some(env_updates) = value.get("envUpdates") {
+            timescope::scope!("runtime env updates");
             let env_updates: RuntimeEnvUpdates = serde_json::from_value(env_updates.clone())
                 .map_err(|error| {
                     DecorationEvaluationError::InvalidResponse(format!(
@@ -2336,12 +2348,15 @@ impl NodeDecorationRuntime {
             apply_runtime_env_updates(env_updates, "typescript-runtime");
         }
 
-        serde_json::from_value(value).map(Some).map_err(|error| {
-            DecorationEvaluationError::InvalidResponse(format!(
-                "{error}; payload={}",
-                String::from_utf8_lossy(&payload)
-            ))
-        })
+        {
+            timescope::scope!("runtime deserialize response");
+            serde_json::from_value(value).map(Some).map_err(|error| {
+                DecorationEvaluationError::InvalidResponse(format!(
+                    "{error}; payload={}",
+                    String::from_utf8_lossy(&payload)
+                ))
+            })
+        }
     }
 }
 
@@ -2635,48 +2650,68 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         window: &WaylandWindowSnapshot,
         now_ms: u64,
     ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
+        timescope::scope!("runtime evaluate_window");
+        let mut runtime_guard = {
+            timescope::scope!("runtime lock");
+            self.runtime.lock().map_err(|_| {
+                DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
+            })?
+        };
+        let runtime = {
+            timescope::scope!("runtime ensure");
+            self.ensure_runtime(&mut runtime_guard)?
+        };
         let request_id = runtime.next_request_id;
         runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-        let input_state = self
-            .input_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::Evaluate {
-            request_id,
-            snapshot: window,
-            now_ms,
-            display_state: &display_state,
-            input_state: &input_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeEvaluateResponse = if let Some(response) = runtime.read_response()? {
-            response
-        } else {
-            let status = runtime
-                .child
-                .try_wait()?
-                .and_then(|status| status.code())
-                .unwrap_or(-1);
-            let stderr = runtime
-                .stderr_log
+        let (display_state, input_state) = {
+            timescope::scope!("runtime clone state");
+            let display_state = self
+                .display_state
                 .lock()
-                .map(|stderr| stderr.clone())
+                .map(|guard| guard.clone())
                 .unwrap_or_default();
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
+            let input_state = self
+                .input_state
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            (display_state, input_state)
+        };
+
+        let request = {
+            timescope::scope!("runtime serialize request");
+            serde_json::to_string(&RuntimeRequest::Evaluate {
+                request_id,
+                snapshot: window,
+                now_ms,
+                display_state: &display_state,
+                input_state: &input_state,
+            })
+            .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?
+        };
+        {
+            timescope::scope!("runtime evaluate_window write request");
+            runtime.write_request(&request)?;
+        }
+
+        let response: RuntimeEvaluateResponse = {
+            timescope::scope!("runtime evaluate_window read response");
+            if let Some(response) = runtime.read_response()? {
+                response
+            } else {
+                let status = runtime
+                    .child
+                    .try_wait()?
+                    .and_then(|status| status.code())
+                    .unwrap_or(-1);
+                let stderr = runtime
+                    .stderr_log
+                    .lock()
+                    .map(|stderr| stderr.clone())
+                    .unwrap_or_default();
+                *runtime_guard = None;
+                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
+            }
         };
         if response.request_id != request_id {
             *runtime_guard = None;
@@ -2707,17 +2742,28 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
                 "missing serialized tree".into(),
             ));
         };
-        let stdout = serde_json::to_string(&serialized)
-            .map_err(|err| DecorationEvaluationError::InvalidResponse(err.to_string()))?;
-        Ok(DecorationEvaluationResult {
-            node: decode_tree_json(stdout.trim()).map_err(DecorationEvaluationError::Bridge)?,
-            transform: response.transform.unwrap_or_default(),
-            managed_window: response.managed_window.unwrap_or_default(),
-            window_effects: response
+        let stdout = {
+            timescope::scope!("runtime serialize tree value");
+            serde_json::to_string(&serialized)
+                .map_err(|err| DecorationEvaluationError::InvalidResponse(err.to_string()))?
+        };
+        let node = {
+            timescope::scope!("runtime decode tree");
+            decode_tree_json(stdout.trim()).map_err(DecorationEvaluationError::Bridge)?
+        };
+        let window_effects = {
+            timescope::scope!("runtime convert window effects");
+            response
                 .window_effects
                 .map(TryInto::try_into)
                 .transpose()
-                .map_err(DecorationEvaluationError::Bridge)?,
+                .map_err(DecorationEvaluationError::Bridge)?
+        };
+        Ok(DecorationEvaluationResult {
+            node,
+            transform: response.transform.unwrap_or_default(),
+            managed_window: response.managed_window.unwrap_or_default(),
+            window_effects,
             dirty_node_ids: response.dirty_node_ids.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,
             actions: response.actions.unwrap_or_default(),
@@ -2736,48 +2782,68 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         window: &WaylandWindowSnapshot,
         now_ms: u64,
     ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
+        timescope::scope!("runtime evaluate_window_preview");
+        let mut runtime_guard = {
+            timescope::scope!("runtime lock");
+            self.runtime.lock().map_err(|_| {
+                DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
+            })?
+        };
+        let runtime = {
+            timescope::scope!("runtime ensure");
+            self.ensure_runtime(&mut runtime_guard)?
+        };
         let request_id = runtime.next_request_id;
         runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-        let input_state = self
-            .input_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::EvaluatePreview {
-            request_id,
-            snapshot: window,
-            now_ms,
-            display_state: &display_state,
-            input_state: &input_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeEvaluateResponse = if let Some(response) = runtime.read_response()? {
-            response
-        } else {
-            let status = runtime
-                .child
-                .try_wait()?
-                .and_then(|status| status.code())
-                .unwrap_or(-1);
-            let stderr = runtime
-                .stderr_log
+        let (display_state, input_state) = {
+            timescope::scope!("runtime clone state");
+            let display_state = self
+                .display_state
                 .lock()
-                .map(|stderr| stderr.clone())
+                .map(|guard| guard.clone())
                 .unwrap_or_default();
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
+            let input_state = self
+                .input_state
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            (display_state, input_state)
+        };
+
+        let request = {
+            timescope::scope!("runtime serialize request");
+            serde_json::to_string(&RuntimeRequest::EvaluatePreview {
+                request_id,
+                snapshot: window,
+                now_ms,
+                display_state: &display_state,
+                input_state: &input_state,
+            })
+            .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?
+        };
+        {
+            timescope::scope!("runtime evaluate_window_preview write request");
+            runtime.write_request(&request)?;
+        }
+
+        let response: RuntimeEvaluateResponse = {
+            timescope::scope!("runtime evaluate_window_preview read response");
+            if let Some(response) = runtime.read_response()? {
+                response
+            } else {
+                let status = runtime
+                    .child
+                    .try_wait()?
+                    .and_then(|status| status.code())
+                    .unwrap_or(-1);
+                let stderr = runtime
+                    .stderr_log
+                    .lock()
+                    .map(|stderr| stderr.clone())
+                    .unwrap_or_default();
+                *runtime_guard = None;
+                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
+            }
         };
         if response.request_id != request_id {
             *runtime_guard = None;
@@ -2808,17 +2874,26 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
                 "missing serialized tree".into(),
             ));
         };
-        let stdout = serde_json::to_string(&serialized)
-            .map_err(|err| DecorationEvaluationError::InvalidResponse(err.to_string()))?;
+        let stdout = {
+            timescope::scope!("runtime serialize tree value");
+            serde_json::to_string(&serialized)
+                .map_err(|err| DecorationEvaluationError::InvalidResponse(err.to_string()))?
+        };
         Ok(DecorationEvaluationResult {
-            node: decode_tree_json(stdout.trim()).map_err(DecorationEvaluationError::Bridge)?,
+            node: {
+                timescope::scope!("runtime decode tree");
+                decode_tree_json(stdout.trim()).map_err(DecorationEvaluationError::Bridge)?
+            },
             transform: response.transform.unwrap_or_default(),
             managed_window: response.managed_window.unwrap_or_default(),
-            window_effects: response
-                .window_effects
-                .map(TryInto::try_into)
-                .transpose()
-                .map_err(DecorationEvaluationError::Bridge)?,
+            window_effects: {
+                timescope::scope!("runtime convert window effects");
+                response
+                    .window_effects
+                    .map(TryInto::try_into)
+                    .transpose()
+                    .map_err(DecorationEvaluationError::Bridge)?
+            },
             dirty_node_ids: response.dirty_node_ids.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,
             actions: response.actions.unwrap_or_default(),
@@ -2839,50 +2914,70 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
         now_ms: u64,
         force_full_reevaluation: bool,
     ) -> Result<DecorationCachedEvaluationResult, DecorationEvaluationError> {
-        let mut runtime_guard = self.runtime.lock().map_err(|_| {
-            DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
-        })?;
-        let runtime = self.ensure_runtime(&mut runtime_guard)?;
+        timescope::scope!("runtime evaluate_cached_window");
+        let mut runtime_guard = {
+            timescope::scope!("runtime lock");
+            self.runtime.lock().map_err(|_| {
+                DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
+            })?
+        };
+        let runtime = {
+            timescope::scope!("runtime ensure");
+            self.ensure_runtime(&mut runtime_guard)?
+        };
         let request_id = runtime.next_request_id;
         runtime.next_request_id += 1;
-        let display_state = self
-            .display_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-        let input_state = self
-            .input_state
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-
-        let request = serde_json::to_string(&RuntimeRequest::EvaluateCached {
-            request_id,
-            window_id,
-            snapshot: window,
-            force_full_reevaluation,
-            now_ms,
-            display_state: &display_state,
-            input_state: &input_state,
-        })
-        .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?;
-        runtime.write_request(&request)?;
-
-        let response: RuntimeEvaluateResponse = if let Some(response) = runtime.read_response()? {
-            response
-        } else {
-            let status = runtime
-                .child
-                .try_wait()?
-                .and_then(|status| status.code())
-                .unwrap_or(-1);
-            let stderr = runtime
-                .stderr_log
+        let (display_state, input_state) = {
+            timescope::scope!("runtime clone state");
+            let display_state = self
+                .display_state
                 .lock()
-                .map(|stderr| stderr.clone())
+                .map(|guard| guard.clone())
                 .unwrap_or_default();
-            *runtime_guard = None;
-            return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
+            let input_state = self
+                .input_state
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            (display_state, input_state)
+        };
+
+        let request = {
+            timescope::scope!("runtime serialize request");
+            serde_json::to_string(&RuntimeRequest::EvaluateCached {
+                request_id,
+                window_id,
+                snapshot: window,
+                force_full_reevaluation,
+                now_ms,
+                display_state: &display_state,
+                input_state: &input_state,
+            })
+            .map_err(|err| DecorationEvaluationError::SnapshotSerialization(err.to_string()))?
+        };
+        {
+            timescope::scope!("runtime evaluate_cached_window write request");
+            runtime.write_request(&request)?;
+        }
+
+        let response: RuntimeEvaluateResponse = {
+            timescope::scope!("runtime evaluate_cached_window read response");
+            if let Some(response) = runtime.read_response()? {
+                response
+            } else {
+                let status = runtime
+                    .child
+                    .try_wait()?
+                    .and_then(|status| status.code())
+                    .unwrap_or(-1);
+                let stderr = runtime
+                    .stderr_log
+                    .lock()
+                    .map(|stderr| stderr.clone())
+                    .unwrap_or_default();
+                *runtime_guard = None;
+                return Err(DecorationEvaluationError::RuntimeFailed { status, stderr });
+            }
         };
         if response.request_id != request_id {
             *runtime_guard = None;
@@ -2917,19 +3012,29 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
                     "missing serialized tree".into(),
                 ));
             };
-            let stdout = serde_json::to_string(&serialized)
-                .map_err(|err| DecorationEvaluationError::InvalidResponse(err.to_string()))?;
-            Some(decode_tree_json(stdout.trim()).map_err(DecorationEvaluationError::Bridge)?)
+            let stdout = {
+                timescope::scope!("runtime serialize tree value");
+                serde_json::to_string(&serialized)
+                    .map_err(|err| DecorationEvaluationError::InvalidResponse(err.to_string()))?
+            };
+            Some({
+                timescope::scope!("runtime decode tree");
+                decode_tree_json(stdout.trim()).map_err(DecorationEvaluationError::Bridge)?
+            })
+        };
+        let window_effects = {
+            timescope::scope!("runtime convert window effects");
+            response
+                .window_effects
+                .map(TryInto::try_into)
+                .transpose()
+                .map_err(DecorationEvaluationError::Bridge)?
         };
         Ok(DecorationCachedEvaluationResult {
             node,
             transform: response.transform.unwrap_or_default(),
             managed_window: response.managed_window.unwrap_or_default(),
-            window_effects: response
-                .window_effects
-                .map(TryInto::try_into)
-                .transpose()
-                .map_err(DecorationEvaluationError::Bridge)?,
+            window_effects,
             dirty_node_ids: response.dirty_node_ids.unwrap_or_default(),
             managed_window_only,
             next_poll_in_ms: response.next_poll_in_ms,
@@ -3327,6 +3432,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
+            debug_config: response.debug_config,
         })
     }
 

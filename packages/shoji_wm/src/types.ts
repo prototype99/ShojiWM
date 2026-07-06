@@ -1990,6 +1990,17 @@ export interface DebugController {
    * cost beyond the composite of ~6-8 glyph buffers.
    */
   fpsCounter: boolean;
+
+  /**
+   * Enable or disable the built-in timescope profiler. Disabling after it was
+   * enabled dumps `summary.txt` and `report.html` under `~/shoji_wm/logs/`.
+   */
+  enableProfile(enabled: boolean): void;
+
+  /**
+   * Current timescope profiler state.
+   */
+  readonly profile: boolean;
 }
 
 export type SSDRebuildSuppressionViolationPolicy =

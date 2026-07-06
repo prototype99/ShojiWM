@@ -759,20 +759,33 @@ pub fn init_winit(
                 }
                 WinitEvent::Input(event) => state.process_input_event(event),
                 WinitEvent::Redraw => {
+                    timescope::scope!("winit redraw");
                     let redraw_started_at = Instant::now();
                     let spike_threshold_ms = animation_spike_threshold_ms();
                     let decorations_refresh_started_at = Instant::now();
-                    if let Err(err) = state.refresh_window_decorations_for_output(Some(output.name().as_str())) {
-                        warn!(error = ?err, "failed to refresh window decorations for winit");
+                    {
+                        timescope::scope!("winit refresh_window_decorations");
+                        if let Err(err) =
+                            state.refresh_window_decorations_for_output(Some(output.name().as_str()))
+                        {
+                            warn!(error = ?err, "failed to refresh window decorations for winit");
+                        }
                     }
                     let decorations_refresh_elapsed_ms =
                         decorations_refresh_started_at.elapsed().as_secs_f64() * 1000.0;
                     let layer_effects_started_at = Instant::now();
-                    if let Err(err) = state.refresh_layer_effects_for_output(output.name().as_str()) {
-                        warn!(error = ?err, "failed to refresh layer effects for winit");
-                    }
-                    if let Err(err) = state.refresh_popup_effects_for_output(output.name().as_str()) {
-                        warn!(error = ?err, "failed to refresh popup effects for winit");
+                    {
+                        timescope::scope!("winit refresh_layer_and_popup_effects");
+                        if let Err(err) =
+                            state.refresh_layer_effects_for_output(output.name().as_str())
+                        {
+                            warn!(error = ?err, "failed to refresh layer effects for winit");
+                        }
+                        if let Err(err) =
+                            state.refresh_popup_effects_for_output(output.name().as_str())
+                        {
+                            warn!(error = ?err, "failed to refresh popup effects for winit");
+                        }
                     }
                     let layer_effects_elapsed_ms =
                         layer_effects_started_at.elapsed().as_secs_f64() * 1000.0;
@@ -783,6 +796,7 @@ pub fn init_winit(
                     let mut should_submit_frame = false;
                     let mut timing = WinitAnimationTimingMetrics::default();
                     {
+                        timescope::scope!("winit scene build");
                         let scene_build_started_at = Instant::now();
                         let (renderer, mut framebuffer) = backend.bind().unwrap();
                         let output_geo = state.space.output_geometry(&output).unwrap();
@@ -1786,13 +1800,16 @@ pub fn init_winit(
                             state.pre_repaint(&output, frame_target);
 
                             let render_started_at = Instant::now();
-                            let render_output_result = damage_tracker.render_output(
-                                renderer,
-                                &mut framebuffer,
-                                0,
-                                &elements,
-                                [0.1, 0.1, 0.1, 1.0],
-                            );
+                            let render_output_result = {
+                                timescope::scope!("winit render_output");
+                                damage_tracker.render_output(
+                                    renderer,
+                                    &mut framebuffer,
+                                    0,
+                                    &elements,
+                                    [0.1, 0.1, 0.1, 1.0],
+                                )
+                            };
                             timing.render_elapsed_ms =
                                 render_started_at.elapsed().as_secs_f64() * 1000.0;
                             if let Ok(render_output_result) = render_output_result {

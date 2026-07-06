@@ -181,6 +181,7 @@ impl ShojiWM {
                 self.consume_runtime_input_config(invocation.input_config);
                 self.consume_runtime_event_config(invocation.event_config);
                 self.consume_runtime_process_config(invocation.process_config);
+                self.consume_runtime_debug_config(invocation.debug_config);
                 if !invocation.process_actions.is_empty() {
                     self.apply_runtime_process_actions(invocation.process_actions);
                 }
