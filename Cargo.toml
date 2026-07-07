@@ -12,3 +12,26 @@ members = [
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+# Iteration profile for the edit-test loop: same optimization level, but
+# parallel codegen, no LTO, and incremental rebuilds. Runtime perf is close
+# enough for testing; benchmark and tag releases with `release` only.
+# Usage: cargo build --profile release-fast -p shoji_wm
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+debug = "line-tables-only"
+
+# Dev builds: skip full debuginfo (backtraces still symbolize; flip back to
+# `debug = true` when a session under gdb is actually needed).
+[profile.dev]
+debug = "line-tables-only"
+
+# Compile dependencies optimized even in dev builds: smithay and the GL/text
+# stack do the heavy lifting at runtime, and sccache keeps their one-time
+# cost cheap. The workspace crates stay at opt-level 0 with incremental for
+# the fastest possible edit-rebuild loop.
+[profile.dev.package."*"]
+opt-level = 3
