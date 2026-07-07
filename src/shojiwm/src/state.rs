@@ -2066,8 +2066,20 @@ impl ShojiWM {
         }
         match preference {
             RuntimeDisplayModePreference::Best(value) if value == "best" => {
+                // Rank the output's preferred mode (seeded from the
+                // connector's PREFERRED/native timing at connect) above raw
+                // pixel area, mirroring select_output_mode in the tty
+                // backend: kernel `video=` parameters inject synthetic modes
+                // into every connector, and on panels like the UX482
+                // ScreenPad (native 1920x515) a synthetic 1920x1080 would
+                // otherwise win and drive the panel at a timing it cannot
+                // display.
+                let preferred = output.preferred_mode();
                 modes.into_iter().max_by_key(|mode| {
                     (
+                        Some(
+                            *mode
+                        ) == preferred,
                         i64::from(mode.size.w) * i64::from(mode.size.h),
                         mode.refresh,
                     )
