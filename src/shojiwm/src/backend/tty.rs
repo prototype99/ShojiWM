@@ -11483,29 +11483,36 @@ fn select_output_mode(
     preference: &DisplayModePreference,
 ) -> smithay::reexports::drm::control::Mode {
     match preference {
-        // Rank the connector's PREFERRED mode (the panel's native timing)
-        // above raw pixel area: kernel `video=` parameters inject synthetic
-        // modes into every connector, and on panels like the UX482
+        // Rank the connector's PREFERRED *resolution* (the panel's native
+        // timing) above raw pixel area: kernel `video=` parameters inject
+        // synthetic modes into every connector, and on panels like the UX482
         // ScreenPad (native 1920x515) a synthetic 1920x1080 would otherwise
-        // win and drive the panel at a timing it cannot display.
-        DisplayModePreference::Auto => connector
-            .modes()
-            .iter()
-            .copied()
-            .max_by_key(|mode| {
-                let wl_mode = WlMode::from(*mode);
-                (
-                    mode
-                        .mode_type()
-                        .contains(
-                            ModeTypeFlags::PREFERRED
-                        ),
-                    i64::from(wl_mode.size.w) * i64::from(wl_mode.size.h),
-                    mode.vrefresh(),
-                    wl_mode.refresh,
-                )
-            })
-            .unwrap_or(connector.modes()[0]),
+        // win and drive the panel at a timing it cannot display. Compare
+        // sizes only, not the PREFERRED flag itself: the flag typically
+        // marks the native resolution at 60Hz, and ranking by the flag would
+        // pin such panels to 60Hz even when higher-refresh modes at the same
+        // resolution exist. The trailing refresh keys pick the fastest one.
+        DisplayModePreference::Auto => {
+            let preferred_size = connector
+                .modes()
+                .iter()
+                .find(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
+                .map(|mode| mode.size());
+            connector
+                .modes()
+                .iter()
+                .copied()
+                .max_by_key(|mode| {
+                    let wl_mode = WlMode::from(*mode);
+                    (
+                        Some(mode.size()) == preferred_size,
+                        i64::from(wl_mode.size.w) * i64::from(wl_mode.size.h),
+                        mode.vrefresh(),
+                        wl_mode.refresh,
+                    )
+                })
+                .unwrap_or(connector.modes()[0])
+        }
         DisplayModePreference::Exact {
             width,
             height,
