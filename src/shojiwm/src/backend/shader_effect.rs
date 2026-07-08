@@ -1062,6 +1062,84 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
             sample_src.size.h as f32 / full_size.h.max(1) as f32,
         ];
 
+        if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+            // Rate-limited: these run every frame per backdrop element.
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static DRAW_LOG_TICK: AtomicUsize = AtomicUsize::new(0);
+            if DRAW_LOG_TICK.fetch_add(1, Ordering::Relaxed) % 240 == 0 {
+                tracing::info!(
+                    dst = ?dst,
+                    damage = ?damage,
+                    area = ?self.area,
+                    geometry = ?self.geometry,
+                    clip_rect = ?self.clip_rect,
+                    clip_radius = radius,
+                    render_scale = self.render_scale,
+                    sample_src = ?sample_src,
+                    texture_size = ?full_size,
+                    uv_offset = ?uv_offset,
+                    uv_scale = ?uv_scale,
+                    used_rendered = inner.rendered.is_some(),
+                    "gap debug framebuffer backdrop display draw"
+                );
+                if std::env::var_os("SHOJI_GAP_TEXTURE_READBACK").is_some() {
+                    // Read the right-edge columns of the pipeline output and
+                    // the raw capture. If the output's last column matches the
+                    // raw capture instead of blurred content, the blur/effect
+                    // chain is not writing that column.
+                    let rendered_tex = texture.clone();
+                    let capture_tex = inner.framebuffer.clone();
+                    let _ = frame.with_context(|gl| unsafe {
+                        let mut prev_read_fbo = 0i32;
+                        gl.GetIntegerv(ffi::READ_FRAMEBUFFER_BINDING, &mut prev_read_fbo);
+                        let fbo = ensure_blur_scratch_fbo(gl);
+                        let dump = |label: &str, tex: &GlesTexture| {
+                            let size = tex.size();
+                            gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, fbo);
+                            gl.FramebufferTexture2D(
+                                ffi::READ_FRAMEBUFFER,
+                                ffi::COLOR_ATTACHMENT0,
+                                ffi::TEXTURE_2D,
+                                tex.tex_id(),
+                                0,
+                            );
+                            let w = 3.min(size.w);
+                            let rows = [size.h / 4, size.h / 2, size.h * 3 / 4];
+                            let mut pixels = [0u8; 3 * 4];
+                            let mut out: Vec<[[u8; 4]; 3]> = Vec::new();
+                            for y in rows {
+                                gl.ReadPixels(
+                                    size.w - w,
+                                    y.clamp(0, size.h - 1),
+                                    w,
+                                    1,
+                                    ffi::RGBA,
+                                    ffi::UNSIGNED_BYTE,
+                                    pixels.as_mut_ptr().cast(),
+                                );
+                                let mut row = [[0u8; 4]; 3];
+                                for (i, px) in pixels.chunks_exact(4).enumerate() {
+                                    row[i] = [px[0], px[1], px[2], px[3]];
+                                }
+                                out.push(row);
+                            }
+                            tracing::info!(
+                                label,
+                                tex_size = ?size,
+                                right_edge_rows = ?out,
+                                "gap debug texture right-edge readback"
+                            );
+                        };
+                        dump("pipeline-output", &rendered_tex);
+                        if let Some(capture_tex) = capture_tex.as_ref() {
+                            dump("raw-capture", capture_tex);
+                        }
+                        gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, prev_read_fbo as u32);
+                    });
+                }
+            }
+        }
+
         let timing =
             begin_gpu_timing_frame_span(frame, "backdrop-display-draw", (dst.size.w, dst.size.h));
         let result = if self.framebuffer_regions.is_empty() {
@@ -1317,7 +1395,7 @@ impl StableBackdropFramebufferElement {
     }
 }
 
-fn framebuffer_blur_padding(effect: &CompiledEffect, render_scale: f32) -> i32 {
+pub(crate) fn framebuffer_blur_padding(effect: &CompiledEffect, render_scale: f32) -> i32 {
     effect
         .blur_stage()
         .map(|blur| {
@@ -2263,11 +2341,12 @@ fn wrap_backdrop_shader_source(source: &str) -> String {
 #extension GL_OES_EGL_image_external : require
 #endif
 
-#ifdef GL_FRAGMENT_PRECISION_HIGH
+// Unconditional highp: with the GL_FRAGMENT_PRECISION_HIGH fallback the
+// NVIDIA GLES driver ended up evaluating these shaders in fp16, whose ulp
+// is 2 at coordinates ~2454 — uv * rect_size quantized to even pixels and
+// produced visible seams at effect edges. Smithay's own texture.frag also
+// declares highp unconditionally, so every supported driver accepts this.
 precision highp float;
-#else
-precision mediump float;
-#endif
 
 #if defined(EXTERNAL)
 uniform samplerExternalOES tex;
@@ -2339,11 +2418,9 @@ fn wrap_texture_stage_source(source: &str) -> String {
 #extension GL_OES_EGL_image_external : require
 #endif
 
-#ifdef GL_FRAGMENT_PRECISION_HIGH
+// Unconditional highp — see wrap_backdrop_shader_source for the rationale
+// (fp16 fallback quantized uv * rect_size to even pixels on NVIDIA).
 precision highp float;
-#else
-precision mediump float;
-#endif
 
 #if defined(EXTERNAL)
 uniform samplerExternalOES tex;
@@ -3122,7 +3199,38 @@ fn run_effect_pipeline(
         );
     }
 
+    // Rate-limit per input size so cheap always-running pipelines (layer
+    // bars) do not starve the rarely-invalidated window pipelines out of the
+    // dump budget.
+    let stage_readback = std::env::var_os("SHOJI_GAP_STAGE_READBACK").is_some() && {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+        static LAST_DUMP: Mutex<Option<HashMap<(i32, i32), Instant>>> = Mutex::new(None);
+        let mut guard = LAST_DUMP.lock().unwrap();
+        let map = guard.get_or_insert_with(HashMap::new);
+        let now = Instant::now();
+        match map.get(&initial_input_size) {
+            Some(last) if now.duration_since(*last) < Duration::from_secs(2) => false,
+            _ => {
+                map.insert(initial_input_size, now);
+                true
+            }
+        }
+    };
+    if stage_readback {
+        gap_stage_readback(renderer, "pipeline-input", &current);
+    }
+
     for stage in &effect.pipeline {
+        let stage_label = match stage {
+            EffectStage::Noise(_) => "noise",
+            EffectStage::DualKawaseBlur(_) => "blur",
+            EffectStage::Shader(_) => "shader",
+            EffectStage::Save(_) => "save",
+            EffectStage::Blend { .. } => "blend",
+            EffectStage::Unit(_) => "unit",
+        };
         current = match stage {
             EffectStage::Noise(noise) => apply_noise_stage(
                 renderer,
@@ -3155,6 +3263,9 @@ fn run_effect_pipeline(
                         cache.as_deref_mut(),
                     )?;
                     current_size = target_size;
+                    if stage_readback {
+                        gap_stage_readback(renderer, "shader-crop", &current);
+                    }
                 }
                 apply_texture_shader_stage(
                     renderer,
@@ -3208,6 +3319,9 @@ fn run_effect_pipeline(
                 current
             }
         };
+        if stage_readback {
+            gap_stage_readback(renderer, stage_label, &current);
+        }
     }
 
     if effect.is_backdrop() && finish_mode == BackdropFinishMode::Materialize {
@@ -3252,6 +3366,9 @@ fn run_effect_pipeline(
                 cache.as_deref_mut(),
                 "effect-finish",
             )?;
+        }
+        if stage_readback {
+            gap_stage_readback(renderer, "finish", &current);
         }
     }
 
@@ -3864,6 +3981,52 @@ fn scale_rgba(
     scaled
 }
 
+/// Debug probe (SHOJI_GAP_STAGE_READBACK): read the 3 right-edge pixels of
+/// the middle row of `tex` and log them, to find which pipeline stage stops
+/// writing the last column. No-op cost is one env lookup at each gate site.
+fn gap_stage_readback(renderer: &mut GlesRenderer, label: &str, tex: &GlesTexture) {
+    let tex = tex.clone();
+    let _ = renderer.with_context(|gl| unsafe {
+        let size = tex.size();
+        if size.w < 1 || size.h < 1 {
+            return;
+        }
+        let mut prev_read_fbo = 0i32;
+        gl.GetIntegerv(ffi::READ_FRAMEBUFFER_BINDING, &mut prev_read_fbo);
+        let fbo = ensure_blur_scratch_fbo(gl);
+        gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, fbo);
+        gl.FramebufferTexture2D(
+            ffi::READ_FRAMEBUFFER,
+            ffi::COLOR_ATTACHMENT0,
+            ffi::TEXTURE_2D,
+            tex.tex_id(),
+            0,
+        );
+        let w = 3.min(size.w);
+        let mut pixels = [0u8; 3 * 4];
+        gl.ReadPixels(
+            size.w - w,
+            size.h / 2,
+            w,
+            1,
+            ffi::RGBA,
+            ffi::UNSIGNED_BYTE,
+            pixels.as_mut_ptr().cast(),
+        );
+        gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, prev_read_fbo as u32);
+        let mut row = [[0u8; 4]; 3];
+        for (i, px) in pixels.chunks_exact(4).enumerate() {
+            row[i] = [px[0], px[1], px[2], px[3]];
+        }
+        tracing::info!(
+            label,
+            tex_size = ?size,
+            right_mid_row = ?row,
+            "gap debug stage right-edge readback"
+        );
+    });
+}
+
 pub fn preblur_backdrop_texture(
     renderer: &mut GlesRenderer,
     texture: GlesTexture,
@@ -3944,6 +4107,12 @@ fn preblur_using_pyramid(
 ) -> Result<GlesTexture, ShaderEffectError> {
     prepare_blur_pyramid(renderer, pyramid, source_size, passes)?;
 
+    let stage_readback = std::env::var_os("SHOJI_GAP_STAGE_READBACK").is_some() && {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static TICK: AtomicUsize = AtomicUsize::new(0);
+        TICK.fetch_add(1, Ordering::Relaxed) % 600 == 0
+    };
+
     // Down-sample chain
     let mut current_tex = source;
     let mut current_size = source_size;
@@ -3962,6 +4131,9 @@ fn preblur_using_pyramid(
         )?;
         current_tex = dst_tex;
         current_size = dst_size;
+        if stage_readback {
+            gap_stage_readback(renderer, &format!("blur-down-{i}"), &current_tex);
+        }
     }
 
     // Up-sample chain, writing back into the larger pyramid level each step.
@@ -3981,6 +4153,9 @@ fn preblur_using_pyramid(
             [0.5f32 / src_size.0 as f32, 0.5f32 / src_size.1 as f32],
             offset,
         )?;
+        if stage_readback {
+            gap_stage_readback(renderer, &format!("blur-up-{i}"), &dst_tex);
+        }
     }
 
     Ok(pyramid[0].clone())

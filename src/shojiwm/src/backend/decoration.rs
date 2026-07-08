@@ -1862,7 +1862,16 @@ fn shader_effect_spec(
         rect: local_rect,
         geometry,
         framebuffer_regions: Vec::new(),
-        framebuffer_capture_padding: 0,
+        // Backdrop blur must sample beyond the visible rect: with a zero
+        // padding the dual-kawase chain clamps at the capture edge and the
+        // outermost column/row degenerates into an edge-duplicate that no
+        // longer matches the true blurred neighborhood — visible as a 1px
+        // seam between the effect and the window border. The layer-surface
+        // path already pads (see shader_effect.rs), windows must match.
+        framebuffer_capture_padding: crate::backend::shader_effect::framebuffer_blur_padding(
+            &cached.shader,
+            render_scale,
+        ),
         shader: cached.shader.clone(),
         alpha_bits: alpha.to_bits(),
         render_scale,
