@@ -39,7 +39,9 @@ float combined_noise(vec2 noise_uv) {
     return coarse * 0.82 + fine * 0.18;
 }
 
-vec4 shader_main(vec2 uv, vec2 rect_size) {
+vec4 shader_main(EffectContext effect) {
+    vec2 uv = effect_content_uv(effect);
+    vec2 rect_size = effect.content_rect_px.zw;
     vec2 px = uv * rect_size;
 
     float outer = rounded_rect_sdf(px, rect_size, radius_px);

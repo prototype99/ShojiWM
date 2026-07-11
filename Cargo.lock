@@ -518,9 +518,9 @@ dependencies = [
 
 [[package]]
 name = "borsh"
-version = "1.6.1"
+version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfd1e3f8955a5d7de9fab72fc8373fade9fb8a703968cb200ae3dc6cf08e185a"
+checksum = "2f3f6da4992df95bbcd9af42a6c7dcb994498fc9048230405f3b36ff7cd3f145"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3712,6 +3712,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "reis"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81f3fedd2777cde52c1be5e572efbec485eac7b801c47820eda388d4f13b9c4b"
+dependencies = [
+ "calloop 0.14.4",
+ "enumflags2",
+ "log",
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4103,7 +4115,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "smithay"
 version = "0.7.0"
-source = "git+https://github.com/bea4dev/smithay.git?rev=61de4b26a251edab4d857ddfc9b818540eab709f#61de4b26a251edab4d857ddfc9b818540eab709f"
+source = "git+https://github.com/bea4dev/smithay.git?rev=4ff4739d12631d1732da005204e3da96ff12de40#4ff4739d12631d1732da005204e3da96ff12de40"
 dependencies = [
  "aliasable",
  "appendlist",
@@ -4131,6 +4143,7 @@ dependencies = [
  "pkg-config",
  "profiling",
  "rand",
+ "reis",
  "rustix 1.1.4",
  "scopeguard",
  "sha2",
@@ -4219,7 +4232,7 @@ dependencies = [
 [[package]]
 name = "smithay-drm-extras"
 version = "0.1.0"
-source = "git+https://github.com/bea4dev/smithay.git?rev=61de4b26a251edab4d857ddfc9b818540eab709f#61de4b26a251edab4d857ddfc9b818540eab709f"
+source = "git+https://github.com/bea4dev/smithay.git?rev=4ff4739d12631d1732da005204e3da96ff12de40#4ff4739d12631d1732da005204e3da96ff12de40"
 dependencies = [
  "drm",
 ]

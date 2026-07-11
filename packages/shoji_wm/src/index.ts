@@ -539,6 +539,9 @@ export type {
   WindowResizeHitArea,
   CompositorDefinition,
   CompositorEffectConfig,
+  CompositorRenderingConfig,
+  SurfacePolicy,
+  SurfacePolicyTarget,
   CompositorWindowController,
   WindowPosition,
   WindowSize,
@@ -829,6 +832,7 @@ function createCompositorDefinition(): CompositorDefinition {
     effect: {
       background_effect: null,
     },
+    rendering: {},
     output: OUTPUT_CONTROLLER,
     workspace: WORKSPACE_CONTROLLER,
     env: ENV_CONTROLLER,

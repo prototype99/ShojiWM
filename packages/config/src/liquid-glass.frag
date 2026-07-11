@@ -19,13 +19,18 @@ vec2 safeNormalize(vec2 value) {
     return scaled / max(length(scaled), 0.0001);
 }
 
-vec3 getTextureColorAt(vec2 coord, vec2 rect_size) {
-    vec2 sample_uv = clamp(coord / max(rect_size, vec2(1.0)), vec2(0.0), vec2(1.0));
+vec3 getTextureColorAt(EffectContext effect, vec2 content_coord) {
+    vec2 sample_uv = clamp(
+        effect_texture_uv_from_content_px(effect, content_coord),
+        vec2(0.0),
+        vec2(1.0)
+    );
     return texture2D(tex, sample_uv).rgb;
 }
 
-vec4 shader_main(vec2 uv, vec2 rect_size) {
-    vec2 fragCoord = uv * rect_size;
+vec4 shader_main(EffectContext effect) {
+    vec2 rect_size = effect.content_rect_px.zw;
+    vec2 fragCoord = effect_content_px(effect);
     vec2 glassSize = vec2(
         glass_width_px > 0.0 ? glass_width_px : rect_size.x,
         glass_height_px > 0.0 ? glass_height_px : rect_size.y
@@ -44,7 +49,7 @@ vec4 shader_main(vec2 uv, vec2 rect_size) {
     ) * sdfScale / size;
 
     if (inversedSDF < 0.0) {
-        return vec4(getTextureColorAt(fragCoord, rect_size), 1.0);
+        return vec4(getTextureColorAt(effect, fragCoord), 1.0);
     }
 
     vec2 normalizedGlassCoord = safeNormalize(glassCoord);
@@ -56,9 +61,9 @@ vec4 shader_main(vec2 uv, vec2 rect_size) {
     float edge = smoothstep(0.0, 0.02, inversedSDF);
     vec2 shift = normalizedGlassCoord * edge * chromatic_shift_px;
     vec3 glassColor = vec3(
-        getTextureColorAt(glassColorCoord - shift, rect_size).r,
-        getTextureColorAt(glassColorCoord, rect_size).g,
-        getTextureColorAt(glassColorCoord + shift, rect_size).b
+        getTextureColorAt(effect, glassColorCoord - shift).r,
+        getTextureColorAt(effect, glassColorCoord).g,
+        getTextureColorAt(effect, glassColorCoord + shift).b
     );
 
     glassColor *= vec3(glass_tint);

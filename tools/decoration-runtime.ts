@@ -98,6 +98,7 @@ import {
   updateInputState,
   updateLayerSnapshots,
   COMPOSITOR,
+  type SurfacePolicy,
   type WaylandLayerSnapshot,
   type WaylandLayer,
   type WaylandPopup,
@@ -813,6 +814,8 @@ interface RuntimeLayerEffectAssignment {
 interface RuntimePopupEffectAssignment {
   popupId: string;
   effects: PopupEffectAssignment | null;
+  /** COMPOSITOR.rendering.surfacePolicy result for this popup's surface. */
+  surfacePolicy?: SurfacePolicy | null;
 }
 
 interface RuntimeEffectConfig {
@@ -2640,6 +2643,10 @@ function evaluatePopupEffects(
   nextPollInMs?: number;
 } {
   const evaluate = effectConfig.popup;
+  // Surface policies ride along with the popup-effect evaluation: same
+  // trigger (surface set changed / hot reload), same cache lifetime. Signals
+  // are resolved once here, not subscribed.
+  const evaluatePolicy = COMPOSITOR.rendering?.surfacePolicy;
   return {
     effects: popups
       .filter((popup) => popup.outputName === outputName)
@@ -2647,6 +2654,11 @@ function evaluatePopupEffects(
         popupId: popup.id,
         effects: evaluate
           ? (resolveSignals(evaluate(popup)) as PopupEffectAssignment | null)
+          : null,
+        surfacePolicy: evaluatePolicy
+          ? (resolveSignals(
+              evaluatePolicy({ kind: "popup", ...popup }),
+            ) as SurfacePolicy | null)
           : null,
       })),
     nextPollInMs: hasActiveAnimations() ? 0 : peekNextPollDelay(),

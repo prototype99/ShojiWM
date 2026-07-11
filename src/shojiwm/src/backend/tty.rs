@@ -117,6 +117,11 @@ fn output_render_debug_enabled() -> bool {
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
+fn overlay_planes_disabled() -> bool {
+    std::env::var_os("SHOJI_DISABLE_OVERLAY_PLANES")
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
 fn direct_scanout_debug_enabled() -> bool {
     std::env::var_os("SHOJI_DIRECT_SCANOUT_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
@@ -362,6 +367,31 @@ fn direct_scanout_state_map() -> &'static Mutex<HashMap<String, bool>> {
 fn fullscreen_fast_path_state_map() -> &'static Mutex<HashMap<String, bool>> {
     static STATE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn overlay_plane_state_map() -> &'static Mutex<HashMap<String, usize>> {
+    static STATE: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Edge-triggered log of overlay plane assignments (SHOJI_DIRECT_SCANOUT_DEBUG).
+/// Overlay promotion of translucent client surfaces is a suspect for
+/// "transparent regions render black / flicker, but screencopy looks fine",
+/// so log which elements sit on overlay planes whenever the count changes.
+fn note_overlay_plane_transition(output_name: &str, count: usize, details: &[String]) {
+    let Ok(mut guard) = overlay_plane_state_map().lock() else {
+        return;
+    };
+    let previous = guard.insert(output_name.to_string(), count);
+    if previous == Some(count) {
+        return;
+    }
+    tracing::info!(
+        output = %output_name,
+        overlay_plane_count = count,
+        overlay_elements = ?details,
+        "overlay plane assignment changed"
+    );
 }
 
 /// Logs fullscreen-fast-path transitions edge-triggered. Separate from the
@@ -699,6 +729,9 @@ struct TtyRenderFrameResult {
     primary_scanout: bool,
     primary_plane_kind: &'static str,
     overlay_plane_count: usize,
+    /// Id/geometry/alpha of elements assigned to overlay planes. Only
+    /// populated when SHOJI_DIRECT_SCANOUT_DEBUG is set.
+    overlay_details: Vec<String>,
     cursor_plane_assigned: bool,
     states: RenderElementStates,
 }
@@ -1286,6 +1319,7 @@ fn finish_processed_outputs(state: &mut ShojiWM, processed_outputs: &[String]) {
 render_elements! {
     pub TtyRenderElements<=GlesRenderer>;
     Window=WaylandSurfaceRenderElement<GlesRenderer>,
+    PolicyWindow=crate::backend::visual::IgnoredOpaqueRegionElement<WaylandSurfaceRenderElement<GlesRenderer>>,
     TransformedWindow=RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>,
     Clipped=crate::backend::clipped_surface::ClippedSurfaceElement,
     TransformedClipped=RelocateRenderElement<RescaleRenderElement<crate::backend::clipped_surface::ClippedSurfaceElement>>,
@@ -1308,6 +1342,7 @@ render_elements! {
 fn tty_render_element_name(element: &TtyRenderElements) -> &'static str {
     match element {
         TtyRenderElements::Window(_) => "Window",
+        TtyRenderElements::PolicyWindow(_) => "PolicyWindow",
         TtyRenderElements::TransformedWindow(_) => "TransformedWindow",
         TtyRenderElements::Clipped(_) => "Clipped",
         TtyRenderElements::TransformedClipped(_) => "TransformedClipped",
@@ -1501,6 +1536,10 @@ impl Element for ProfiledTtyRenderElement<'_> {
 
     fn is_framebuffer_effect(&self) -> bool {
         self.inner.is_framebuffer_effect()
+    }
+
+    fn framebuffer_capture_region(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.inner.framebuffer_capture_region(scale)
     }
 }
 
@@ -4835,6 +4874,7 @@ fn render_surface(
                 scale,
                 fullscreen_window.is_some(),
                 &state.configured_popup_effects,
+                &state.configured_popup_surface_policies,
                 &mut state.popup_effect_cache,
                 &mut state.popup_framebuffer_effect_states,
             )
@@ -5141,6 +5181,9 @@ fn render_surface(
             });
         surface.tearing_active = should_tear;
         let mut frame_flags = TTY_FRAME_FLAGS;
+        if overlay_planes_disabled() {
+            frame_flags = frame_flags.difference(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
+        }
         if fullscreen_overlay_visible {
             frame_flags = frame_flags.difference(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY);
         }
@@ -5213,11 +5256,28 @@ fn render_surface(
                                     PrimaryPlaneElement::Element(_) => "element",
                                     PrimaryPlaneElement::Swapchain(_) => "swapchain",
                                 };
+                                let overlay_details = if direct_scanout_debug_enabled() {
+                                    result
+                                        .overlay_elements
+                                        .iter()
+                                        .map(|element| {
+                                            format!(
+                                                "id={:?} geo={:?} alpha={:.3}",
+                                                element.id(),
+                                                element.geometry(scale),
+                                                element.alpha(),
+                                            )
+                                        })
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
                                 TtyRenderFrameResult {
                                     is_empty: result.is_empty,
                                     primary_scanout,
                                     primary_plane_kind,
                                     overlay_plane_count: result.overlay_elements.len(),
+                                    overlay_details,
                                     cursor_plane_assigned: result.cursor_element.is_some(),
                                     states: result.states,
                                 }
@@ -5250,11 +5310,28 @@ fn render_surface(
                                     PrimaryPlaneElement::Element(_) => "element",
                                     PrimaryPlaneElement::Swapchain(_) => "swapchain",
                                 };
+                                let overlay_details = if direct_scanout_debug_enabled() {
+                                    result
+                                        .overlay_elements
+                                        .iter()
+                                        .map(|element| {
+                                            format!(
+                                                "id={:?} geo={:?} alpha={:.3}",
+                                                element.id(),
+                                                element.geometry(scale),
+                                                element.alpha(),
+                                            )
+                                        })
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
                                 TtyRenderFrameResult {
                                     is_empty: result.is_empty,
                                     primary_scanout,
                                     primary_plane_kind,
                                     overlay_plane_count: result.overlay_elements.len(),
+                                    overlay_details,
                                     cursor_plane_assigned: result.cursor_element.is_some(),
                                     states: result.states,
                                 }
@@ -5264,6 +5341,13 @@ fn render_surface(
             )?
         };
         fps_counter.record_present(output.name().as_str());
+        if direct_scanout_debug_enabled() {
+            note_overlay_plane_transition(
+                output.name().as_str(),
+                result.overlay_plane_count,
+                &result.overlay_details,
+            );
+        }
         note_direct_scanout_transition(
             output.name().as_str(),
             result.primary_scanout,
@@ -7377,6 +7461,7 @@ fn composed_popup_scene_elements(
     scale: smithay::utils::Scale<f64>,
     layer_surface: &smithay::desktop::LayerSurface,
     configured_popup_effects: &std::collections::HashMap<String, crate::ssd::WindowEffectConfig>,
+    surface_policies: &std::collections::HashMap<String, crate::ssd::SurfacePolicy>,
     popup_effect_cache: &mut std::collections::HashMap<
         String,
         crate::backend::shader_effect::WindowEffectElementState,
@@ -7394,9 +7479,25 @@ fn composed_popup_scene_elements(
     let output_loc = output.current_location();
     let mut elements = Vec::new();
     for (popup_id, local_rect, raw_elements) in groups {
+        // Surface policy applies to the popup's raw surface elements whether
+        // or not an effect is configured for it.
+        let ignore_opaque = matches!(
+            surface_policies
+                .get(&popup_id)
+                .map(|policy| policy.opaque_region),
+            Some(crate::ssd::OpaqueRegionPolicy::Ignore)
+        );
         let popup_elements = raw_elements
             .into_iter()
-            .map(TtyRenderElements::Window)
+            .map(|element| {
+                if ignore_opaque {
+                    TtyRenderElements::PolicyWindow(
+                        crate::backend::visual::IgnoredOpaqueRegionElement::from_element(element),
+                    )
+                } else {
+                    TtyRenderElements::Window(element)
+                }
+            })
             .collect::<Vec<_>>();
         let Some(effects) = configured_popup_effects.get(&popup_id) else {
             elements.extend(popup_elements);
@@ -7437,6 +7538,7 @@ fn layer_popup_scene_elements(
     scale: smithay::utils::Scale<f64>,
     overlay_only: bool,
     configured_popup_effects: &std::collections::HashMap<String, crate::ssd::WindowEffectConfig>,
+    surface_policies: &std::collections::HashMap<String, crate::ssd::SurfacePolicy>,
     popup_effect_cache: &mut std::collections::HashMap<
         String,
         crate::backend::shader_effect::WindowEffectElementState,
@@ -7456,6 +7558,7 @@ fn layer_popup_scene_elements(
                 scale,
                 &layer_surface,
                 configured_popup_effects,
+                surface_policies,
                 popup_effect_cache,
                 popup_framebuffer_effect_states,
             )
@@ -7811,15 +7914,7 @@ fn backdrop_shader_elements_for_window(
                 output_geo.size.h,
             )
                 .hash(&mut hasher);
-            let blur_padding = cached
-                .shader
-                .blur_stage()
-                .map(|blur| {
-                    let radius = blur.radius.max(1);
-                    let passes = blur.passes.max(1);
-                    (radius * passes * 24 + 32).max(32)
-                })
-                .unwrap_or(0);
+            let blur_padding = cached.shader.capture_padding.max(0);
             (blur_padding, cached.clip_radius).hash(&mut hasher);
             if uses_backdrop || uses_xray {
                 lower_layer_scene_generation.hash(&mut hasher);
@@ -8817,15 +8912,7 @@ fn configured_background_effect_elements_for_layer(
     let Some(effect_rect) = crate::backend::window::bounding_box_for_rects(&rects) else {
         return Ok(Vec::new());
     };
-    let blur_padding = effect_config
-        .effect
-        .blur_stage()
-        .map(|blur| {
-            let radius = blur.radius.max(1);
-            let passes = blur.passes.max(1);
-            (radius * passes * 24 + 32).max(32)
-        })
-        .unwrap_or(0);
+    let blur_padding = effect_config.effect.capture_padding.max(0);
     let capture_geo = smithay::utils::Rectangle::new(
         smithay::utils::Point::from((effect_rect.x - blur_padding, effect_rect.y - blur_padding)),
         (
@@ -9376,15 +9463,7 @@ fn lower_layer_scene_elements(
                 effect_rect.width,
                 effect_rect.height
             );
-            let blur_padding = effect_config
-                .effect
-                .blur_stage()
-                .map(|blur| {
-                    let radius = blur.radius.max(1);
-                    let passes = blur.passes.max(1);
-                    (radius * passes * 24 + 32).max(32)
-                })
-                .unwrap_or(0);
+            let blur_padding = effect_config.effect.capture_padding.max(0);
             let capture_geo = smithay::utils::Rectangle::new(
                 smithay::utils::Point::from((
                     effect_rect.x - blur_padding,
@@ -9996,15 +10075,7 @@ fn configured_background_effect_elements_for_window(
                 output_geo.size.h,
             )
                 .hash(&mut hasher);
-            let blur_padding = effect_config
-                .effect
-                .blur_stage()
-                .map(|blur| {
-                    let radius = blur.radius.max(1);
-                    let passes = blur.passes.max(1);
-                    (radius * passes * 24 + 32).max(32)
-                })
-                .unwrap_or(0);
+            let blur_padding = effect_config.effect.capture_padding.max(0);
             blur_padding.hash(&mut hasher);
             if uses_backdrop || uses_xray {
                 lower_layer_scene_generation.hash(&mut hasher);

@@ -537,9 +537,115 @@ impl<E: Element> Element for AlphaRenderElement<E> {
     fn is_framebuffer_effect(&self) -> bool {
         self.element.is_framebuffer_effect()
     }
+
+    fn framebuffer_capture_region(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.element.framebuffer_capture_region(scale)
+    }
 }
 
 impl<R: Renderer, E: RenderElement<R>> RenderElement<R> for AlphaRenderElement<E> {
+    fn draw(
+        &self,
+        frame: &mut R::Frame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), R::Error> {
+        self.element
+            .draw(frame, src, dst, damage, opaque_regions, cache)
+    }
+
+    fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        self.element.underlying_storage(renderer)
+    }
+
+    fn capture_framebuffer(
+        &self,
+        frame: &mut R::Frame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        cache: &UserDataMap,
+    ) -> Result<(), R::Error> {
+        self.element.capture_framebuffer(frame, src, dst, cache)
+    }
+}
+
+/// Wraps a render element and discards its claimed opaque regions.
+///
+/// Applied when `COMPOSITOR.rendering.surfacePolicy` resolves
+/// `opaqueRegion: "ignore"` for a surface: the damage tracker then neither
+/// culls elements composited behind this one nor renders any of its pixels
+/// with blending disabled. Used for clients that over-declare their opaque
+/// region (e.g. GTK3 tooltips claim the full rect despite transparent
+/// rounded corners).
+#[derive(Debug)]
+pub struct IgnoredOpaqueRegionElement<E> {
+    element: E,
+}
+
+impl<E> IgnoredOpaqueRegionElement<E> {
+    pub fn from_element(element: E) -> Self {
+        Self { element }
+    }
+}
+
+impl<E: Element> Element for IgnoredOpaqueRegionElement<E> {
+    fn id(&self) -> &Id {
+        self.element.id()
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.element.current_commit()
+    }
+
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        self.element.src()
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.element.geometry(scale)
+    }
+
+    fn location(&self, scale: Scale<f64>) -> Point<i32, Physical> {
+        self.element.location(scale)
+    }
+
+    fn transform(&self) -> Transform {
+        self.element.transform()
+    }
+
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        self.element.damage_since(scale, commit)
+    }
+
+    fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        OpaqueRegions::default()
+    }
+
+    fn alpha(&self) -> f32 {
+        self.element.alpha()
+    }
+
+    fn kind(&self) -> Kind {
+        self.element.kind()
+    }
+
+    fn is_framebuffer_effect(&self) -> bool {
+        self.element.is_framebuffer_effect()
+    }
+
+    fn framebuffer_capture_region(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.element.framebuffer_capture_region(scale)
+    }
+}
+
+impl<R: Renderer, E: RenderElement<R>> RenderElement<R> for IgnoredOpaqueRegionElement<E> {
     fn draw(
         &self,
         frame: &mut R::Frame<'_, '_>,

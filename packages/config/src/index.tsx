@@ -500,13 +500,15 @@ HYBRID_WINDOW_MANAGER.configureWorkspaceGestureSpeed({
 
 COMPOSITOR.effect.background_effect = compileEffect({
   input: backdropSource(),
-  invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
+  capturePadding: 24,
+  invalidate: { kind: "on-source-damage-box", damagePadding: 8 },
   pipeline: [dualKawaseBlur({ radius: 4, passes: 2 })],
 });
 
 const LAYER_BLUR_MASK = compileLayerEffect({
   input: backdropSource(),
-  invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
+  capturePadding: 24,
+  invalidate: { kind: "on-source-damage-box", damagePadding: 8 },
   // The mask stage intentionally outputs transparency (the blur is clipped
   // to the layer's own alpha), so the pipeline's alpha must survive the
   // finish/display passes instead of being forced opaque.
@@ -537,7 +539,8 @@ COMPOSITOR.effect.layer = (layer) => {
 
 const POPUP_BLUR = compilePopupEffect({
   input: backdropSource(),
-  invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
+  capturePadding: 4 * 2 * 2 + 24 + 32,
+  invalidate: { kind: "on-source-damage-box", damagePadding: 8 },
   // The mask stage intentionally outputs transparency (the blur is clipped
   // to the layer's own alpha), so the pipeline's alpha must survive the
   // finish/display passes instead of being forced opaque.
@@ -564,6 +567,16 @@ COMPOSITOR.effect.popup = (popup) => {
   return {
     behind: POPUP_BLUR,
   };
+};
+
+// GTK3 tooltips (waybar) declare their whole rect opaque despite transparent
+// rounded corners, which paints the corners as a solid fill and culls the
+// behind-blur. Ignore the declaration for layer-shell popups.
+COMPOSITOR.rendering.surfacePolicy = (surface) => {
+  if (surface.kind === "popup" && surface.parentKind === "layer") {
+    return { opaqueRegion: "ignore" };
+  }
+  return null;
 };
 
 COMPOSITOR.event.onOpen((window) => {
@@ -717,7 +730,8 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
 
   const backgroundShader = compileEffect({
     input: backdropSource(),
-    invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
+    capturePadding: 24,
+    invalidate: { kind: "on-source-damage-box", damagePadding: 8 },
     pipeline: [
       dualKawaseBlur({ radius: 4, passes: 2 }),
       shaderStage(loadShader("./src/liquid-glass.frag"), {
@@ -734,7 +748,8 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
 
   const titleOnlyShader = compileEffect({
     input: backdropSource(),
-    invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
+    capturePadding: 24,
+    invalidate: { kind: "on-source-damage-box", damagePadding: 8 },
     pipeline: [dualKawaseBlur({ radius: 4, passes: 2 })],
   });
 

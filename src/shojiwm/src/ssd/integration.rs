@@ -2187,14 +2187,23 @@ impl ShojiWM {
 
         for popup_id in &output_popup_ids {
             self.configured_popup_effects.remove(popup_id);
+            self.configured_popup_surface_policies.remove(popup_id);
         }
         for assignment in evaluation.effects {
+            // Surface policies are independent of effect assignments: a popup
+            // can have `opaqueRegion: "ignore"` with no effect configured.
+            if let Some(policy) = assignment.surface_policy {
+                self.configured_popup_surface_policies
+                    .insert(assignment.popup_id.clone(), policy);
+            }
             if let Some(effects) = assignment.effects {
                 self.configured_popup_effects
                     .insert(assignment.popup_id, effects);
             }
         }
         retain_effect_assignments_for_live_ids(&mut self.configured_popup_effects, &live_popup_ids);
+        self.configured_popup_surface_policies
+            .retain(|id, _| live_popup_ids.contains(id));
         self.popup_effect_evaluation_cache.insert(
             output_name.to_string(),
             EffectEvaluationCacheEntry {

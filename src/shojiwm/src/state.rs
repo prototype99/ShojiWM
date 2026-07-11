@@ -361,6 +361,9 @@ pub struct ShojiWM {
     pub configured_background_effect: Option<BackgroundEffectConfig>,
     pub configured_layer_effects: HashMap<String, crate::ssd::WindowEffectConfig>,
     pub configured_popup_effects: HashMap<String, crate::ssd::WindowEffectConfig>,
+    /// Per-popup surface policies from `COMPOSITOR.rendering.surfacePolicy`,
+    /// keyed by popup runtime id. Maintained alongside popup effects.
+    pub configured_popup_surface_policies: HashMap<String, crate::ssd::SurfacePolicy>,
     pub layer_effect_evaluation_cache: HashMap<String, crate::ssd::EffectEvaluationCacheEntry>,
     pub popup_effect_evaluation_cache: HashMap<String, crate::ssd::EffectEvaluationCacheEntry>,
     pub config_error_report: Option<crate::config_error::ConfigErrorReport>,
@@ -1240,6 +1243,7 @@ impl ShojiWM {
             configured_background_effect: None,
             configured_layer_effects: HashMap::new(),
             configured_popup_effects: HashMap::new(),
+            configured_popup_surface_policies: HashMap::new(),
             layer_effect_evaluation_cache: HashMap::new(),
             popup_effect_evaluation_cache: HashMap::new(),
             config_error_report,
@@ -1524,6 +1528,7 @@ impl ShojiWM {
             &self.display_handle,
             None,
             std::iter::empty::<(String, String)>(),
+            std::iter::empty::<String>(),
             true,
             Stdio::null(),
             Stdio::null(),
@@ -1952,6 +1957,7 @@ impl ShojiWM {
         self.runtime_dirty_window_ids.extend(live_window_ids);
         self.configured_layer_effects.clear();
         self.configured_popup_effects.clear();
+        self.configured_popup_surface_policies.clear();
         self.layer_effect_evaluation_cache.clear();
         self.popup_effect_evaluation_cache.clear();
         self.request_tty_maintenance("config-hot-reload");

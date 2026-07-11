@@ -470,6 +470,7 @@ fn composed_popup_scene_elements(
     scale: smithay::utils::Scale<f64>,
     layer_surface: &smithay::desktop::LayerSurface,
     configured_popup_effects: &std::collections::HashMap<String, crate::ssd::WindowEffectConfig>,
+    surface_policies: &std::collections::HashMap<String, crate::ssd::SurfacePolicy>,
     popup_effect_cache: &mut std::collections::HashMap<
         String,
         crate::backend::shader_effect::WindowEffectElementState,
@@ -487,9 +488,25 @@ fn composed_popup_scene_elements(
     let output_loc = output.current_location();
     let mut elements = Vec::new();
     for (popup_id, local_rect, raw_elements) in groups {
+        // Surface policy applies to the popup's raw surface elements whether
+        // or not an effect is configured for it.
+        let ignore_opaque = matches!(
+            surface_policies
+                .get(&popup_id)
+                .map(|policy| policy.opaque_region),
+            Some(crate::ssd::OpaqueRegionPolicy::Ignore)
+        );
         let popup_elements = raw_elements
             .into_iter()
-            .map(WinitRenderElements::Window)
+            .map(|element| {
+                if ignore_opaque {
+                    WinitRenderElements::PolicyWindow(
+                        crate::backend::visual::IgnoredOpaqueRegionElement::from_element(element),
+                    )
+                } else {
+                    WinitRenderElements::Window(element)
+                }
+            })
             .collect::<Vec<_>>();
         let Some(effects) = configured_popup_effects.get(&popup_id) else {
             elements.extend(popup_elements);
@@ -527,6 +544,7 @@ fn layer_popup_scene_elements(
     scale: smithay::utils::Scale<f64>,
     overlay_only: bool,
     configured_popup_effects: &std::collections::HashMap<String, crate::ssd::WindowEffectConfig>,
+    surface_policies: &std::collections::HashMap<String, crate::ssd::SurfacePolicy>,
     popup_effect_cache: &mut std::collections::HashMap<
         String,
         crate::backend::shader_effect::WindowEffectElementState,
@@ -546,6 +564,7 @@ fn layer_popup_scene_elements(
                 scale,
                 &layer_surface,
                 configured_popup_effects,
+                surface_policies,
                 popup_effect_cache,
                 popup_framebuffer_effect_states,
             )
@@ -1734,6 +1753,8 @@ pub fn init_winit(
                         // Bottom-layer parent would wrongly place them behind
                         // regular toplevels.
                         let configured_popup_effects = state.configured_popup_effects.clone();
+                        let configured_popup_surface_policies =
+                            state.configured_popup_surface_policies.clone();
                         let mut layer_popup_elements = layer_popup_scene_elements(
                             renderer,
                             &output,
@@ -1741,6 +1762,7 @@ pub fn init_winit(
                             scale,
                             fullscreen_scanout.is_some(),
                             &configured_popup_effects,
+                            &configured_popup_surface_policies,
                             &mut state.popup_effect_cache,
                             &mut state.popup_framebuffer_effect_states,
                         );
@@ -1997,6 +2019,7 @@ pub fn init_winit(
 smithay::render_elements! {
     pub WinitRenderElements<=GlesRenderer>;
     Window=WaylandSurfaceRenderElement<GlesRenderer>,
+    PolicyWindow=crate::backend::visual::IgnoredOpaqueRegionElement<WaylandSurfaceRenderElement<GlesRenderer>>,
     TransformedWindow=RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>,
     Clipped=crate::backend::clipped_surface::ClippedSurfaceElement,
     TransformedClipped=RelocateRenderElement<RescaleRenderElement<crate::backend::clipped_surface::ClippedSurfaceElement>>,
@@ -2375,15 +2398,7 @@ fn backdrop_shader_elements_for_window(
                 output_geo.size.h,
             )
                 .hash(&mut hasher);
-            let blur_padding = cached
-                .shader
-                .blur_stage()
-                .map(|blur| {
-                    let radius = blur.radius.max(1);
-                    let passes = blur.passes.max(1);
-                    (radius * passes * 24 + 32).max(32)
-                })
-                .unwrap_or(0);
+            let blur_padding = cached.shader.capture_padding.max(0);
             (blur_padding, cached.clip_radius).hash(&mut hasher);
             if uses_backdrop || uses_xray {
                 state.lower_layer_scene_generation.hash(&mut hasher);
@@ -3237,15 +3252,7 @@ fn lower_layer_scene_elements(
             effect_rect.width,
             effect_rect.height
         );
-        let blur_padding = config
-            .effect
-            .blur_stage()
-            .map(|blur| {
-                let radius = blur.radius.max(1);
-                let passes = blur.passes.max(1);
-                (radius * passes * 24 + 32).max(32)
-            })
-            .unwrap_or(0);
+        let blur_padding = config.effect.capture_padding.max(0);
         let capture_geo = Rectangle::new(
             smithay::utils::Point::from((
                 effect_rect.x - blur_padding,
@@ -3621,15 +3628,7 @@ fn configured_background_effect_elements_for_layer(
     let Some(effect_rect) = crate::backend::window::bounding_box_for_rects(&rects) else {
         return Vec::new();
     };
-    let blur_padding = config
-        .effect
-        .blur_stage()
-        .map(|blur| {
-            let radius = blur.radius.max(1);
-            let passes = blur.passes.max(1);
-            (radius * passes * 24 + 32).max(32)
-        })
-        .unwrap_or(0);
+    let blur_padding = config.effect.capture_padding.max(0);
     let capture_geo = Rectangle::new(
         smithay::utils::Point::from((effect_rect.x - blur_padding, effect_rect.y - blur_padding)),
         (
@@ -4333,15 +4332,7 @@ fn configured_background_effect_elements_for_window(
                 output_geo.size.h,
             )
                 .hash(&mut hasher);
-            let blur_padding = config
-                .effect
-                .blur_stage()
-                .map(|blur| {
-                    let radius = blur.radius.max(1);
-                    let passes = blur.passes.max(1);
-                    (radius * passes * 24 + 32).max(32)
-                })
-                .unwrap_or(0);
+            let blur_padding = config.effect.capture_padding.max(0);
             blur_padding.hash(&mut hasher);
             if uses_backdrop || uses_xray {
                 state.lower_layer_scene_generation.hash(&mut hasher);

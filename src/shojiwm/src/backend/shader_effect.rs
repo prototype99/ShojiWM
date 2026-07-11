@@ -595,7 +595,7 @@ pub fn framebuffer_backdrop_element_for_output_rects_with_popup_source(
     );
     let geometry =
         crate::backend::visual::logical_rect_to_physical_rect(rect, output_geo.loc, scale);
-    let framebuffer_capture_padding = framebuffer_blur_padding(&effect, scale.x as f32);
+    let framebuffer_capture_padding = framebuffer_capture_padding(&effect, scale.x as f32);
     let framebuffer_regions = if rects.len() == 1 && rects[0] == rect {
         Vec::new()
     } else {
@@ -793,7 +793,8 @@ struct TextureStageProgramCache(Mutex<HashMap<String, GlesTexProgram>>);
 struct MultiTextureStageProgram {
     program: ffi::types::GLuint,
     uniform_tex: ffi::types::GLint,
-    uniform_rect_size: ffi::types::GLint,
+    uniform_texture_size: ffi::types::GLint,
+    uniform_content_rect: ffi::types::GLint,
     texture_uniforms: Vec<(String, ffi::types::GLint)>,
     value_uniforms: Vec<(String, ffi::types::GLint)>,
     attrib_vert: ffi::types::GLint,
@@ -820,6 +821,7 @@ struct EffectExecutionContext {
     layer_source: Option<GlesTexture>,
     popup_source: Option<GlesTexture>,
     size: (i32, i32),
+    content_rect: Rectangle<i32, Buffer>,
     named: HashMap<String, GlesTexture>,
 }
 
@@ -1020,6 +1022,27 @@ impl Element for StableBackdropFramebufferElement {
 
     fn is_framebuffer_effect(&self) -> bool {
         true
+    }
+
+    fn framebuffer_capture_region(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        // capture_framebuffer samples dst expanded by the blur padding; the
+        // damage tracker must treat that whole rect as the capture source so
+        // the padding ring is redrawn (below this element) before capture.
+        let padding = self.framebuffer_capture_padding.max(0);
+        Rectangle::new(
+            Point::from((self.geometry.loc.x - padding, self.geometry.loc.y - padding)),
+            (
+                self.geometry
+                    .size
+                    .w
+                    .saturating_add(padding.saturating_mul(2)),
+                self.geometry
+                    .size
+                    .h
+                    .saturating_add(padding.saturating_mul(2)),
+            )
+                .into(),
+        )
     }
 }
 
@@ -1249,6 +1272,28 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
                 gl.GetFloatv(ffi::COLOR_CLEAR_VALUE, clear_color.as_mut_ptr());
                 gl.Disable(ffi::SCISSOR_TEST);
 
+                // The blit must read from the framebuffer this frame is being
+                // composited into. Never rely on the ambient READ binding:
+                // effect pipelines and snapshot captures running earlier in
+                // the same frame leave READ_FRAMEBUFFER pointing at their own
+                // offscreen targets (or an older swapchain buffer), and a blit
+                // from there silently captures a stale composite — including
+                // this element itself and everything above it.
+                let mut prev_read_fbo = 0i32;
+                gl.GetIntegerv(ffi::READ_FRAMEBUFFER_BINDING, &mut prev_read_fbo as *mut _);
+                if prev_read_fbo != current_fbo {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static MISMATCH_LOG: AtomicUsize = AtomicUsize::new(0);
+                    if MISMATCH_LOG.fetch_add(1, Ordering::Relaxed) % 120 == 0 {
+                        tracing::warn!(
+                            prev_read_fbo,
+                            draw_fbo = current_fbo,
+                            "backdrop capture: READ framebuffer was not the frame target; rebinding"
+                        );
+                    }
+                }
+                gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, current_fbo as u32);
+
                 let fbo = ensure_blur_scratch_fbo(gl);
                 gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbo);
                 gl.FramebufferTexture2D(
@@ -1273,6 +1318,7 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
                     ffi::COLOR_BUFFER_BIT,
                     ffi::LINEAR,
                 );
+                gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, prev_read_fbo as u32);
                 gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, current_fbo as u32);
                 gl.ClearColor(
                     clear_color[0],
@@ -1395,15 +1441,8 @@ impl StableBackdropFramebufferElement {
     }
 }
 
-pub(crate) fn framebuffer_blur_padding(effect: &CompiledEffect, render_scale: f32) -> i32 {
-    effect
-        .blur_stage()
-        .map(|blur| {
-            let radius = blur.radius.max(1);
-            let passes = blur.passes.max(1);
-            (((radius * passes * 24 + 32).max(32) as f32) * render_scale.max(1.0)).ceil() as i32
-        })
-        .unwrap_or(0)
+pub(crate) fn framebuffer_capture_padding(effect: &CompiledEffect, render_scale: f32) -> i32 {
+    ((effect.capture_padding.max(0) as f32) * render_scale.max(1.0)).ceil() as i32
 }
 
 fn scale_physical_subrect(
@@ -1676,8 +1715,8 @@ fn compile_display_texture_program(
         let program = renderer.compile_custom_texture_shader(
             wrap_backdrop_shader_source(
                 r#"
-vec4 shader_main(vec2 uv, vec2 rect_size) {
-    vec4 color = texture2D(tex, uv);
+vec4 shader_main(EffectContext effect) {
+    vec4 color = texture2D(tex, effect.texture_uv);
     color.a = 1.0;
     return color;
 }
@@ -1744,8 +1783,8 @@ fn compile_display_texture_program_preserve_alpha(
         let program = renderer.compile_custom_texture_shader(
             wrap_backdrop_shader_source(
                 r#"
-vec4 shader_main(vec2 uv, vec2 rect_size) {
-    return texture2D(tex, uv);
+vec4 shader_main(EffectContext effect) {
+    return texture2D(tex, effect.texture_uv);
 }
 "#,
             ),
@@ -1808,8 +1847,12 @@ fn compile_noise_salt_program(
             wrap_texture_stage_source(include_str!("noise_salt.frag")),
             &[
                 UniformName::new(
-                    "rect_size",
+                    "effect_texture_size_px",
                     smithay::backend::renderer::gles::UniformType::_2f,
+                ),
+                UniformName::new(
+                    "effect_content_rect_px",
+                    smithay::backend::renderer::gles::UniformType::_4f,
                 ),
                 UniformName::new(
                     "noise_amount",
@@ -1844,17 +1887,23 @@ fn compile_opaque_finish_program(
         let program = renderer.compile_custom_texture_shader(
             wrap_texture_stage_source(
                 r#"
-vec4 shader_main(vec2 uv, vec2 rect_size) {
-    vec4 color = texture2D(tex, uv);
+vec4 shader_main(EffectContext effect) {
+    vec4 color = texture2D(tex, effect.texture_uv);
     color.a = 1.0;
     return color;
 }
 "#,
             ),
-            &[UniformName::new(
-                "rect_size",
-                smithay::backend::renderer::gles::UniformType::_2f,
-            )],
+            &[
+                UniformName::new(
+                    "effect_texture_size_px",
+                    smithay::backend::renderer::gles::UniformType::_2f,
+                ),
+                UniformName::new(
+                    "effect_content_rect_px",
+                    smithay::backend::renderer::gles::UniformType::_4f,
+                ),
+            ],
         )?;
         renderer
             .egl_context()
@@ -1886,15 +1935,21 @@ fn compile_alpha_preserving_finish_program(
         let program = renderer.compile_custom_texture_shader(
             wrap_texture_stage_source(
                 r#"
-vec4 shader_main(vec2 uv, vec2 rect_size) {
-    return texture2D(tex, uv);
+vec4 shader_main(EffectContext effect) {
+    return texture2D(tex, effect.texture_uv);
 }
 "#,
             ),
-            &[UniformName::new(
-                "rect_size",
-                smithay::backend::renderer::gles::UniformType::_2f,
-            )],
+            &[
+                UniformName::new(
+                    "effect_texture_size_px",
+                    smithay::backend::renderer::gles::UniformType::_2f,
+                ),
+                UniformName::new(
+                    "effect_content_rect_px",
+                    smithay::backend::renderer::gles::UniformType::_4f,
+                ),
+            ],
         )?;
         renderer
             .egl_context()
@@ -1995,16 +2050,25 @@ fn wrap_multi_texture_stage_source(source: &str) -> String {
 precision highp float;
 
 uniform sampler2D tex;
-uniform vec2 rect_size;
+uniform vec2 effect_texture_size_px;
+uniform vec4 effect_content_rect_px;
 
 varying vec2 v_coords;
+
+{effect_context}
 
 {source}
 
 void main() {{
-    gl_FragColor = shader_main(v_coords, rect_size);
+    EffectContext effect = make_effect_context(
+        v_coords,
+        effect_texture_size_px,
+        effect_content_rect_px
+    );
+    gl_FragColor = shader_main(effect);
 }}
-"#
+"#,
+        effect_context = effect_context_shader_prelude(),
     )
 }
 
@@ -2023,7 +2087,7 @@ fn multi_texture_stage_program(
             .user_data()
             .insert_if_missing(MultiTextureStageProgramCache::default);
     }
-    let mut cache_key = format!("multi-texture:{}", stage.shader.path);
+    let mut cache_key = format!("effect-context-v1:multi-texture:{}", stage.shader.path);
     for name in stage.textures.keys() {
         cache_key.push_str(":texture:");
         cache_key.push_str(name);
@@ -2072,7 +2136,8 @@ fn multi_texture_stage_program(
         Ok::<_, GlesError>(MultiTextureStageProgram {
             program,
             uniform_tex: location("tex"),
-            uniform_rect_size: location("rect_size"),
+            uniform_texture_size: location("effect_texture_size_px"),
+            uniform_content_rect: location("effect_content_rect_px"),
             texture_uniforms: stage
                 .textures
                 .keys()
@@ -2118,7 +2183,7 @@ fn compile_texture_program(
             .insert_if_missing(TextureStageProgramCache::default);
     }
 
-    let mut cache_key = format!("{namespace}:{path}:{with_clip}");
+    let mut cache_key = format!("effect-context-v1:{namespace}:{path}:{with_clip}");
     if let Some(uniforms) = uniforms {
         for (name, value) in uniforms {
             let kind = match value {
@@ -2188,10 +2253,16 @@ fn compile_texture_program(
             ),
         ]
     } else {
-        vec![UniformName::new(
-            "rect_size",
-            smithay::backend::renderer::gles::UniformType::_2f,
-        )]
+        vec![
+            UniformName::new(
+                "effect_texture_size_px",
+                smithay::backend::renderer::gles::UniformType::_2f,
+            ),
+            UniformName::new(
+                "effect_content_rect_px",
+                smithay::backend::renderer::gles::UniformType::_4f,
+            ),
+        ]
     };
     if let Some(uniforms) = uniforms {
         for (name, value) in uniforms {
@@ -2300,6 +2371,8 @@ uniform vec4 clip_radius;
 
 varying vec2 v_coords;
 
+{effect_context}
+
 float rounded_rect_alpha(vec2 coords, vec2 rect_size, vec4 radius) {{
     vec2 half_size = rect_size * 0.5;
     vec2 p = coords - half_size;
@@ -2319,7 +2392,8 @@ float rounded_rect_alpha(vec2 coords, vec2 rect_size, vec4 radius) {{
 
 void main() {{
     vec2 coords = v_coords * size;
-    vec4 color = shader_main(v_coords, size);
+    EffectContext effect = make_effect_context(v_coords, size, vec4(0.0, 0.0, size));
+    vec4 color = shader_main(effect);
     color.a *= alpha;
     color.rgb *= color.a;
     if (clip_enabled > 0.5) {{
@@ -2328,7 +2402,8 @@ void main() {{
     }}
     gl_FragColor = color;
 }}
-"#
+"#,
+        effect_context = effect_context_shader_prelude(),
     )
 }
 
@@ -2365,6 +2440,8 @@ uniform vec4 clip_radius;
 
 varying vec2 v_coords;
 
+{effect_context}
+
 #if defined(DEBUG_FLAGS)
 uniform float tint;
 #endif
@@ -2387,8 +2464,12 @@ float rounded_rect_alpha(vec2 coords, vec2 rect_size, vec4 radius) {{
 {source}
 
 void main() {{
-    vec2 local_uv = (v_coords - uv_offset) / max(uv_scale, vec2(0.0001));
-    vec4 color = shader_main(v_coords, rect_size);
+    EffectContext effect = make_effect_context(
+        v_coords,
+        rect_size,
+        vec4(0.0, 0.0, rect_size)
+    );
+    vec4 color = shader_main(effect);
     color.a *= alpha;
     color.rgb *= color.a;
 
@@ -2405,8 +2486,44 @@ void main() {{
 
     gl_FragColor = color;
 }}
-"#
+"#,
+        effect_context = effect_context_shader_prelude(),
     )
+}
+
+fn effect_context_shader_prelude() -> &'static str {
+    r#"
+struct EffectContext {
+    vec2 texture_uv;
+    vec2 texture_size_px;
+    vec4 content_rect_px;
+};
+
+EffectContext make_effect_context(
+    vec2 texture_uv,
+    vec2 texture_size_px,
+    vec4 content_rect_px
+) {
+    return EffectContext(texture_uv, texture_size_px, content_rect_px);
+}
+
+vec2 effect_texture_px(EffectContext effect) {
+    return effect.texture_uv * effect.texture_size_px;
+}
+
+vec2 effect_content_px(EffectContext effect) {
+    return effect_texture_px(effect) - effect.content_rect_px.xy;
+}
+
+vec2 effect_content_uv(EffectContext effect) {
+    return effect_content_px(effect) / max(effect.content_rect_px.zw, vec2(1.0));
+}
+
+vec2 effect_texture_uv_from_content_px(EffectContext effect, vec2 content_px) {
+    return (effect.content_rect_px.xy + content_px) /
+        max(effect.texture_size_px, vec2(1.0));
+}
+"#
 }
 
 fn wrap_texture_stage_source(source: &str) -> String {
@@ -2428,16 +2545,25 @@ uniform samplerExternalOES tex;
 uniform sampler2D tex;
 #endif
 
-uniform vec2 rect_size;
+uniform vec2 effect_texture_size_px;
+uniform vec4 effect_content_rect_px;
 
 varying vec2 v_coords;
+
+{effect_context}
 
 {source}
 
 void main() {{
-    gl_FragColor = shader_main(v_coords, rect_size);
+    EffectContext effect = make_effect_context(
+        v_coords,
+        effect_texture_size_px,
+        effect_content_rect_px
+    );
+    gl_FragColor = shader_main(effect);
 }}
-"#
+"#,
+        effect_context = effect_context_shader_prelude(),
     )
 }
 
@@ -2748,12 +2874,14 @@ fn apply_effect_pipeline_with_cache(
     finish_mode: BackdropFinishMode,
 ) -> Result<GlesTexture, ShaderEffectError> {
     timescope::scope!("effect pipeline");
+    let content_rect = effect_content_rect(size, sample_region);
     let mut ctx = EffectExecutionContext {
         backdrop: texture,
         xray_backdrop: xray_texture,
         layer_source: None,
         popup_source: None,
         size,
+        content_rect,
         named: HashMap::new(),
     };
     with_gpu_timing_renderer_span(renderer, "effect-pipeline-total", size, |renderer| {
@@ -2789,6 +2917,7 @@ pub fn apply_effect_pipeline_cached_for_key_with_layer_source(
             layer_source: Some(layer_source),
             popup_source: None,
             size,
+            content_rect: effect_content_rect(size, sample_region),
             named: HashMap::new(),
         };
         run_effect_pipeline(
@@ -2850,6 +2979,7 @@ fn apply_effect_pipeline_cached_with_popup_source_and_finish_mode(
         layer_source: None,
         popup_source: Some(popup_source),
         size,
+        content_rect: effect_content_rect(size, sample_region),
         named: HashMap::new(),
     };
     run_effect_pipeline(
@@ -3002,10 +3132,8 @@ fn invalidation_sample_rect_for_policy(
     visible_rect: Rectangle<i32, Logical>,
 ) -> Rectangle<i32, Logical> {
     match policy {
-        EffectInvalidationPolicy::OnSourceDamageBox {
-            anti_artifact_margin,
-        } => {
-            let margin = (*anti_artifact_margin).max(0);
+        EffectInvalidationPolicy::OnSourceDamageBox { damage_padding } => {
+            let margin = (*damage_padding).max(0);
             Rectangle::new(
                 Point::from((visible_rect.loc.x - margin, visible_rect.loc.y - margin)),
                 (
@@ -3180,8 +3308,8 @@ fn run_effect_pipeline(
         initial_input_size,
         cache.as_deref_mut(),
     )?;
-    let mut current_size = initial_input_size;
-    let mut pending_sample_region = if input_uses_requested_size {
+    let current_size = initial_input_size;
+    let final_sample_region = if input_uses_requested_size {
         None
     } else {
         sample_region
@@ -3194,7 +3322,7 @@ fn run_effect_pipeline(
             requested_output_size = ?requested_output_size,
             initial_input_size = ?initial_input_size,
             input_uses_requested_size,
-            pending_sample_region = ?pending_sample_region,
+            final_sample_region = ?final_sample_region,
             "gap debug shader effect pipeline sizing"
         );
     }
@@ -3236,6 +3364,7 @@ fn run_effect_pipeline(
                 renderer,
                 current,
                 current_size,
+                ctx.content_rect,
                 noise.clone(),
                 cache.as_deref_mut(),
             )?,
@@ -3250,50 +3379,19 @@ fn run_effect_pipeline(
                     pyramid,
                 )?
             }
-            EffectStage::Shader(shader) => {
-                if let Some(region) = pending_sample_region.take() {
-                    let target_size = output_size
-                        .unwrap_or((region.size.w.round() as i32, region.size.h.round() as i32));
-                    current = crop_texture_region(
-                        renderer,
-                        current,
-                        current_size,
-                        region,
-                        target_size,
-                        cache.as_deref_mut(),
-                    )?;
-                    current_size = target_size;
-                    if stage_readback {
-                        gap_stage_readback(renderer, "shader-crop", &current);
-                    }
-                }
-                apply_texture_shader_stage(
-                    renderer,
-                    current,
-                    current_size,
-                    shader,
-                    ctx,
-                    cache.as_deref_mut(),
-                )?
-            }
+            EffectStage::Shader(shader) => apply_texture_shader_stage(
+                renderer,
+                current,
+                current_size,
+                shader,
+                ctx,
+                cache.as_deref_mut(),
+            )?,
             EffectStage::Save(name) => {
                 ctx.named.insert(name.clone(), current.clone());
                 current
             }
             EffectStage::Blend { input, mode, alpha } => {
-                if let Some(region) = pending_sample_region.take() {
-                    let target_size = output_size
-                        .unwrap_or((region.size.w.round() as i32, region.size.h.round() as i32));
-                    current = crop_texture_region(
-                        renderer,
-                        current,
-                        current_size,
-                        region,
-                        target_size,
-                        cache.as_deref_mut(),
-                    )?;
-                    current_size = target_size;
-                }
                 let other =
                     resolve_effect_input(renderer, input, ctx, current_size, cache.as_deref_mut())?;
                 apply_blend_stage(
@@ -3311,7 +3409,7 @@ fn run_effect_pipeline(
                     renderer,
                     effect,
                     ctx,
-                    pending_sample_region,
+                    final_sample_region,
                     output_size,
                     cache.as_deref_mut(),
                     BackdropFinishMode::Materialize,
@@ -3337,7 +3435,7 @@ fn run_effect_pipeline(
             }
             crate::ssd::EffectAlphaMode::Opaque => compile_opaque_finish_program(renderer)?,
         };
-        if let Some(region) = pending_sample_region.take() {
+        if let Some(region) = final_sample_region {
             let target_size =
                 output_size.unwrap_or((region.size.w.round() as i32, region.size.h.round() as i32));
             current = apply_texture_program_region(
@@ -3346,10 +3444,10 @@ fn run_effect_pipeline(
                 target_size,
                 Some(region),
                 program,
-                vec![Uniform::new(
-                    "rect_size",
-                    [target_size.0 as f32, target_size.1 as f32],
-                )],
+                effect_context_uniforms(
+                    current_size,
+                    effect_content_rect(current_size, Some(region)),
+                ),
                 cache.as_deref_mut(),
                 "effect-crop-finish",
             )?;
@@ -3359,10 +3457,7 @@ fn run_effect_pipeline(
                 current,
                 current_size,
                 program,
-                vec![Uniform::new(
-                    "rect_size",
-                    [current_size.0 as f32, current_size.1 as f32],
-                )],
+                effect_context_uniforms(current_size, ctx.content_rect),
                 cache.as_deref_mut(),
                 "effect-finish",
             )?;
@@ -3382,7 +3477,7 @@ fn resolve_effect_input(
     requested_size: (i32, i32),
     cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
-    match input {
+    let texture = match input {
         EffectInput::Backdrop | EffectInput::WindowSource(_) => Ok(ctx.backdrop.clone()),
         EffectInput::LayerSource(_) => ctx
             .layer_source
@@ -3409,7 +3504,85 @@ fn resolve_effect_input(
             .cloned()
             .ok_or(ShaderEffectError::Gles(GlesError::FramebufferBindingError)),
         EffectInput::Image(path) => load_image_texture(renderer, path, requested_size),
+    }?;
+    align_effect_input_texture(renderer, texture, requested_size, ctx.content_rect)
+}
+
+fn effect_content_rect(
+    size: (i32, i32),
+    sample_region: Option<Rectangle<f64, Buffer>>,
+) -> Rectangle<i32, Buffer> {
+    sample_region
+        .map(|region| {
+            Rectangle::new(
+                Point::from((region.loc.x.round() as i32, region.loc.y.round() as i32)),
+                (
+                    region.size.w.round().max(1.0) as i32,
+                    region.size.h.round().max(1.0) as i32,
+                )
+                    .into(),
+            )
+        })
+        .unwrap_or_else(|| Rectangle::from_size(size.into()))
+}
+
+fn effect_context_uniforms(
+    size: (i32, i32),
+    content_rect: Rectangle<i32, Buffer>,
+) -> Vec<Uniform<'static>> {
+    vec![
+        Uniform::new("effect_texture_size_px", [size.0 as f32, size.1 as f32]),
+        Uniform::new(
+            "effect_content_rect_px",
+            [
+                content_rect.loc.x as f32,
+                content_rect.loc.y as f32,
+                content_rect.size.w as f32,
+                content_rect.size.h as f32,
+            ],
+        ),
+    ]
+}
+
+fn align_effect_input_texture(
+    renderer: &mut GlesRenderer,
+    texture: GlesTexture,
+    canvas_size: (i32, i32),
+    content_rect: Rectangle<i32, Buffer>,
+) -> Result<GlesTexture, ShaderEffectError> {
+    let texture_size = texture.size();
+    if texture_size.w == canvas_size.0 && texture_size.h == canvas_size.1 {
+        return Ok(texture);
     }
+
+    let mut target =
+        Offscreen::<GlesTexture>::create_buffer(renderer, Fourcc::Abgr8888, canvas_size.into())?;
+    let element = TextureRenderElement::from_static_texture(
+        Id::new(),
+        renderer.context_id(),
+        Point::<f64, Physical>::from((content_rect.loc.x as f64, content_rect.loc.y as f64)),
+        texture,
+        1,
+        Transform::Normal,
+        Some(1.0),
+        None,
+        Some((content_rect.size.w, content_rect.size.h).into()),
+        None,
+        Kind::Unspecified,
+    );
+    let mut framebuffer = renderer.bind(&mut target)?;
+    let mut damage_tracker = OutputDamageTracker::new(canvas_size, 1.0, Transform::Normal);
+    damage_tracker
+        .render_output(
+            renderer,
+            &mut framebuffer,
+            0,
+            &[element],
+            [0.0, 0.0, 0.0, 0.0],
+        )
+        .map_err(|_| GlesError::FramebufferBindingError)?;
+    drop(framebuffer);
+    Ok(target)
 }
 
 fn requested_effect_output_size(
@@ -3444,10 +3617,29 @@ fn apply_texture_shader_stage(
                 ))
             })
             .collect::<Result<Vec<_>, ShaderEffectError>>()?;
-        return apply_multi_texture_shader_stage(renderer, texture, textures, size, stage, cache);
+        return apply_multi_texture_shader_stage(
+            renderer,
+            texture,
+            textures,
+            size,
+            ctx.content_rect,
+            stage,
+            cache,
+        );
     }
     let program = compile_texture_stage_program(renderer, stage)?;
-    let mut uniforms = vec![Uniform::new("rect_size", [size.0 as f32, size.1 as f32])];
+    let mut uniforms = vec![
+        Uniform::new("effect_texture_size_px", [size.0 as f32, size.1 as f32]),
+        Uniform::new(
+            "effect_content_rect_px",
+            [
+                ctx.content_rect.loc.x as f32,
+                ctx.content_rect.loc.y as f32,
+                ctx.content_rect.size.w as f32,
+                ctx.content_rect.size.h as f32,
+            ],
+        ),
+    ];
     for (name, value) in &stage.uniforms {
         let uniform = match value {
             ShaderUniformValue::Float(value) => Uniform::new(name.clone(), *value),
@@ -3473,6 +3665,7 @@ fn apply_multi_texture_shader_stage(
     current: GlesTexture,
     textures: Vec<(String, GlesTexture)>,
     size: (i32, i32),
+    content_rect: Rectangle<i32, Buffer>,
     stage: &ShaderStage,
     cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
@@ -3499,7 +3692,14 @@ fn apply_multi_texture_shader_stage(
             gl.Viewport(0, 0, size.0, size.1);
             gl.UseProgram(program.program);
             gl.Uniform1i(program.uniform_tex, 0);
-            gl.Uniform2f(program.uniform_rect_size, size.0 as f32, size.1 as f32);
+            gl.Uniform2f(program.uniform_texture_size, size.0 as f32, size.1 as f32);
+            gl.Uniform4f(
+                program.uniform_content_rect,
+                content_rect.loc.x as f32,
+                content_rect.loc.y as f32,
+                content_rect.size.w as f32,
+                content_rect.size.h as f32,
+            );
 
             for (index, ((_, location), (_, texture))) in program
                 .texture_uniforms
@@ -3572,6 +3772,7 @@ fn apply_shader_input_stage(
     timescope::scope!("effect shader input stage");
     let effect = CompiledEffect {
         input: EffectInput::Shader(stage.clone()),
+        capture_padding: 0,
         invalidate: EffectInvalidationPolicy::Always,
         pipeline: Vec::new(),
         alpha: crate::ssd::EffectAlphaMode::Opaque,
@@ -3613,6 +3814,7 @@ fn apply_noise_stage(
     renderer: &mut GlesRenderer,
     texture: GlesTexture,
     size: (i32, i32),
+    content_rect: Rectangle<i32, Buffer>,
     noise: NoiseStage,
     cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
@@ -3624,10 +3826,11 @@ fn apply_noise_stage(
                 texture,
                 size,
                 program,
-                vec![
-                    Uniform::new("rect_size", [size.0 as f32, size.1 as f32]),
-                    Uniform::new("noise_amount", noise.amount),
-                ],
+                {
+                    let mut uniforms = effect_context_uniforms(size, content_rect);
+                    uniforms.push(Uniform::new("noise_amount", noise.amount));
+                    uniforms
+                },
                 cache,
                 "effect-noise",
             )
@@ -3721,31 +3924,6 @@ fn blend_mode_value(mode: BlendMode) -> f32 {
         BlendMode::Screen => 2.0,
         BlendMode::Multiply => 3.0,
     }
-}
-
-fn crop_texture_region(
-    renderer: &mut GlesRenderer,
-    texture: GlesTexture,
-    size: (i32, i32),
-    region: Rectangle<f64, Buffer>,
-    output_size: (i32, i32),
-    cache: Option<&mut EffectPipelineCache>,
-) -> Result<GlesTexture, ShaderEffectError> {
-    timescope::scope!("effect crop");
-    if output_size == size
-        && region.loc.x == 0.0
-        && region.loc.y == 0.0
-        && region.size.w == size.0 as f64
-        && region.size.h == size.1 as f64
-    {
-        return Ok(texture);
-    }
-
-    with_gpu_timing_renderer_span(renderer, "effect-crop", output_size, |renderer| {
-        let target = effect_pipeline_target(renderer, output_size, cache)?;
-        renderer.render_texture_to_texture(&texture, &target, region, None, &[])?;
-        Ok(target)
-    })
 }
 
 fn apply_texture_program(

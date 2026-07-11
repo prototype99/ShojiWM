@@ -32,7 +32,8 @@ import {COMPOSITOR, compileEffect, backdropSource, dualKawaseBlur} from 'shoji_w
 
 COMPOSITOR.effect.background_effect = compileEffect({
   input: backdropSource(),
-  invalidate: {kind: 'on-source-damage-box', antiArtifactMargin: 8},
+  capturePadding: 24,
+  invalidate: {kind: 'on-source-damage-box', damagePadding: 8},
   pipeline: [dualKawaseBlur({radius: 4, passes: 2})],
 });
 ```
@@ -46,6 +47,8 @@ the surface (the default config blurs everything behind bars and menus):
 ```ts
 const LAYER_BLUR = compileLayerEffect({
   input: backdropSource(),
+  capturePadding: 24,
+  invalidate: {kind: 'on-source-damage-box', damagePadding: 8},
   alpha: 'preserve',
   pipeline: [dualKawaseBlur({radius: 4, passes: 2})],
 });
@@ -78,20 +81,27 @@ Options:
 | Option | Type | Meaning |
 | --- | --- | --- |
 | `input` | source handle | What the pipeline reads from (e.g. `backdropSource()`) |
+| `capturePadding` | `MaybeSignal<number>` | Extra logical pixels captured around the visible content and processed by every stage (default `0`) |
 | `pipeline` | stage array | Stages applied in order |
-| `invalidate` | policy | When to re-render (see below) |
-| `alpha` | `"opaque" \| "preserve"` | Keep transparency through to display (default `"opaque"`) |
-| `outsets` | `EffectOutsets` | (window effects) render beyond the window bounds |
+| `invalidate` | policy | When to re-render (default: source damage with zero padding) |
+| `alpha` | `"opaque" \| "preserve"` | Final output-alpha policy (default `"opaque"`) |
+| `outsets` | `EffectOutsets` | (window/layer/popup effects) render beyond the surface bounds |
 
 ### Sources
 
 | Source | Reads |
 | --- | --- |
 | `backdropSource()` | The composited scene behind the target |
+| `xrayBackdropSource()` | The backdrop as if the current surface were absent |
 | `windowSource()` | The window's own surface |
 | `layerSource()` | The layer surface's own content |
 | `popupSource()` | The popup's own content |
 | `imageSource(path)` | A static image file |
+| `shaderInput(shader, opts)` | A shader-generated input texture |
+| `get(name)` | An intermediate previously stored by `save(name)` |
+
+`windowSource`, `layerSource`, and `popupSource` accept
+`{include: 'full' | 'root-surface'}`. The default is `'full'`.
 
 ### Stages
 
@@ -101,17 +111,29 @@ Options:
 | `shaderStage(shader, {uniforms, textures})` | Run a custom GLSL fragment shader |
 | `noise({...})` | Add film-grain style noise |
 | `save(name)` / `blend(input, {...})` | Save/composite intermediate results |
+| `unit(effect)` | Embed a compiled reusable sub-effect |
+
+For `dualKawaseBlur`, `radius` defaults to `8` and controls the sampling offset;
+`passes` defaults to `2` and controls the downsample/upsample depth (clamped to
+`0`–`8`). Neither value automatically changes `capturePadding` or
+`damagePadding`.
 
 `shaderStage` takes a shader (a path, or a `loadShader(path)` handle) plus
 `uniforms` (numbers/colors passed to the shader) and `textures` (extra source
 handles bound by name).
+
+Uniform values may be numbers or 2/3/4-component arrays, and each component may
+be a signal. `tex`, `effect_texture_size_px`, and `effect_content_rect_px` are
+reserved compositor bindings and cannot be used as custom uniform or texture
+names.
 
 ```ts
 import {compileEffect, backdropSource, dualKawaseBlur, shaderStage, loadShader} from 'shoji_wm';
 
 const liquidGlass = compileEffect({
   input: backdropSource(),
-  invalidate: {kind: 'on-source-damage-box', antiArtifactMargin: 8},
+  capturePadding: 24,
+  invalidate: {kind: 'on-source-damage-box', damagePadding: 8},
   pipeline: [
     dualKawaseBlur({radius: 4, passes: 2}),
     shaderStage(loadShader('./src/liquid-glass.frag'), {
@@ -129,16 +151,55 @@ const liquidGlass = compileEffect({
 
 `invalidate` controls when the effect re-renders, trading freshness for cost:
 
-- `{kind: 'on-source-damage-box', antiArtifactMargin: N}` — re-render only the
-  region that changed, padded by `N` px to avoid edge artifacts. The usual choice.
-- `'always'` — re-render every frame (expensive; for animated shaders).
-- A manual policy you invalidate yourself.
+- `{kind: 'on-source-damage-box', damagePadding: N}` — re-render only the
+  region that changed, extending both damage detection and the redraw region by
+  `N` logical pixels. The usual choice.
+- `{kind: 'always'}` — re-render every frame (expensive; for animated shaders).
+- `{kind: 'manual', dirtyWhen, base?}` — re-render while the `MaybeSignal<boolean>`
+  `dirtyWhen` is true. While false, reuse the cached result unless the optional
+  automatic `base` policy also invalidates it.
+
+For example, a manually controlled effect that still responds to nearby source
+damage can use:
+
+```ts
+invalidate: {
+  kind: 'manual',
+  dirtyWhen: effectParametersChanged,
+  base: {kind: 'on-source-damage-box', damagePadding: 24},
+}
+```
+
+`damagePadding` does not add pixels to a shader's input. Use `capturePadding`
+when blur, distortion, or another sampling operation needs source pixels beyond
+the visible content boundary.
+
+### Capture padding
+
+With `capturePadding: N`, ShojiWM captures `N` extra logical pixels around the
+effect's visible content. The padded texture passes through the entire pipeline,
+including custom shaders, blur stages, saved intermediates, and blends. ShojiWM
+crops it back to the visible content only once, after the last stage.
+
+This avoids edge clamping in effects that sample neighboring pixels. The value
+is expressed in logical pixels; ShojiWM applies the output scale when allocating
+the physical texture. By contrast, the `EffectContext` pixel fields passed to
+GLSL are physical pixels. A value of `0` keeps the exact visible bounds.
+
+ShojiWM cannot infer a custom shader's sampling reach. Set `capturePadding` large
+enough for the farthest sample and normally set `damagePadding` to cover the
+same affected source area. Texture edge clamping is only a safety behavior; it
+repeats the cropped edge pixel and cannot recover scene pixels that were never
+captured. At a physical output edge, unavailable padding is naturally clipped.
 
 ### Alpha
 
-Set `alpha: 'preserve'` when the pipeline's output is meant to be transparent
-(e.g. a blur clipped to a layer's own alpha mask), so the transparency survives
-to the display pass instead of being forced opaque.
+With the default `alpha: 'opaque'`, the final pass forces alpha to `1.0`. This is
+appropriate for ordinary backdrop blur, whose captured edge alpha is not useful
+content. Set `alpha: 'preserve'` when the pipeline intentionally produces
+transparency (for example, a blur clipped to a layer's own alpha mask). In that
+mode the shader pipeline is responsible for meaningful alpha throughout the
+working texture.
 
 ---
 
@@ -168,40 +229,70 @@ few provided variables (below) differ.
 
 You don't write a full GLSL program — you write **one function**:
 
+:::warning[Shader ABI]
+The current ABI requires `shader_main(EffectContext)`. Shaders using the former
+`shader_main(vec2 uv, vec2 rect_size)` signature must be migrated.
+:::
+
 ```glsl
-vec4 shader_main(vec2 uv, vec2 rect_size) {
+vec4 shader_main(EffectContext effect) {
     // compute and return this pixel's color
     return vec4(1.0, 0.0, 0.0, 1.0); // opaque red
 }
 ```
 
-ShojiWM wraps your file with this preamble before compiling, so you don't have to
-write any of it yourself:
+ShojiWM defines `EffectContext` and constructs it before calling your function.
+The relevant contract is equivalent to:
 
 ```glsl
-#version 100
-precision highp float;
-
-uniform sampler2D tex;   // the input source (e.g. the backdrop)
-uniform vec2 rect_size;  // region size in pixels
-varying vec2 v_coords;   // passed to you as `uv`
-
-// ...your file is inserted here...
-
-void main() {
-    gl_FragColor = shader_main(v_coords, rect_size);
-}
+struct EffectContext {
+    vec2 texture_uv;       // normalized coordinates over the full working texture
+    vec2 texture_size_px;  // full working-texture size in physical pixels
+    vec4 content_rect_px;  // visible content: x, y, width, height in that texture
+};
 ```
 
 That gives you these built-ins for free inside `shader_main`:
 
 | Name | Type | Meaning |
 | --- | --- | --- |
-| `uv` (first arg) | `vec2` | Normalized coordinate, `0.0`–`1.0`, spanning the region. `(0,0)` and `(1,1)` are opposite corners. |
-| `rect_size` (second arg) | `vec2` | The region's size in pixels — useful to convert `uv` to pixels (`uv * rect_size`). |
-| `tex` | `sampler2D` | The pipeline's input source for this stage (e.g. `backdropSource()`). Sample it with `texture2D(tex, uv)`. |
+| `effect.texture_uv` | `vec2` | Normalized coordinates over the complete texture, including capture padding |
+| `effect.texture_size_px` | `vec2` | Complete working-texture size in physical pixels |
+| `effect.content_rect_px` | `vec4` | Visible content rectangle as `(x, y, width, height)` inside the texture |
+| `tex` | `sampler2D` | This stage's pipeline input; sample it with `texture2D(tex, effect.texture_uv)` |
+
+All `*_px` values are physical pixels. ShojiWM also provides:
+
+| Helper | Result |
+| --- | --- |
+| `effect_texture_px(effect)` | Current fragment position in the complete working texture |
+| `effect_content_px(effect)` | Current fragment position relative to the visible content's top-left |
+| `effect_content_uv(effect)` | Content-relative normalized coordinates; `0.0`–`1.0` over visible content and outside that range in padding |
+| `effect_texture_uv_from_content_px(effect, px)` | Convert content-relative physical pixels back to texture UV for sampling |
+
+Use texture UV for sampling and content coordinates for geometry tied to the
+visible rectangle. The content rectangle can start at a non-zero offset because
+capture padding precedes it in the working texture.
 
 Return the pixel color as a `vec4(r, g, b, a)` with components in `0.0`–`1.0`.
+
+For a distortion expressed in physical pixels, convert the displaced content
+position back to texture UV. Do not clamp content UV to `0.0`–`1.0` first;
+doing so throws away the pixels supplied by `capturePadding`.
+
+```glsl
+uniform vec2 displacement_px;
+
+vec4 shader_main(EffectContext effect) {
+    vec2 sample_px = effect_content_px(effect) + displacement_px;
+    vec2 sample_uv = clamp(
+        effect_texture_uv_from_content_px(effect, sample_px),
+        vec2(0.0),
+        vec2(1.0)
+    );
+    return texture2D(tex, sample_uv);
+}
+```
 
 ### A first shader: a solid color
 
@@ -209,7 +300,7 @@ The simplest possible shader ignores everything and returns one color:
 
 ```glsl
 // shaders/white.frag
-vec4 shader_main(vec2 uv, vec2 rect_size) {
+vec4 shader_main(EffectContext effect) {
     return vec4(1.0, 1.0, 1.0, 1.0); // opaque white
 }
 ```
@@ -231,19 +322,19 @@ const white = compileEffect({
 ### Reading the source texture
 
 Usually you want to transform what's *behind* the region rather than paint a flat
-color. Sample the source with `texture2D(tex, uv)`. This shader desaturates the
+color. Sample the source with `texture2D(tex, effect.texture_uv)`. This shader desaturates the
 backdrop to grayscale:
 
 ```glsl
 // shaders/grayscale.frag
-vec4 shader_main(vec2 uv, vec2 rect_size) {
-    vec4 source = texture2D(tex, uv);
+vec4 shader_main(EffectContext effect) {
+    vec4 source = texture2D(tex, effect.texture_uv);
     float gray = dot(source.rgb, vec3(0.299, 0.587, 0.114));
     return vec4(vec3(gray), source.a);
 }
 ```
 
-`texture2D(tex, uv)` returns the source pixel under the current fragment as a
+`texture2D(tex, effect.texture_uv)` returns the source pixel under the current fragment as a
 `vec4` (RGBA). From there it's ordinary math.
 
 ### Parameters: uniforms
@@ -256,8 +347,8 @@ from `shaderStage`. A uniform is the same value for every pixel in a draw.
 uniform vec3 tint;       // an RGB color
 uniform float strength;  // 0..1
 
-vec4 shader_main(vec2 uv, vec2 rect_size) {
-    vec4 source = texture2D(tex, uv);
+vec4 shader_main(EffectContext effect) {
+    vec4 source = texture2D(tex, effect.texture_uv);
     vec3 tinted = mix(source.rgb, tint, strength);
     return vec4(tinted, source.a);
 }
@@ -286,7 +377,7 @@ The TypeScript value type maps to the GLSL uniform type by length:
 Every uniform value (each component) may be a **signal**, so you animate a shader
 by feeding it a changing value — there is no built-in `time`. Drive a `phase`
 uniform from an [animation variable](./animations.md) or any signal, and set the
-effect's [`invalidate`](#invalidation-policy) to `'always'` so it re-renders each
+effect's [`invalidate`](#invalidation-policy) to `{kind: 'always'}` so it re-renders each
 frame:
 
 Here `window` comes from the composition function's argument (a per-window effect
@@ -304,7 +395,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
 
   const glow = compileEffect({
     input: backdropSource(),
-    invalidate: 'always',
+    invalidate: {kind: 'always'},
     pipeline: [
       shaderStage(loadShader('./shaders/glow.frag'), {
         uniforms: {
@@ -330,8 +421,8 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
 uniform float phase;     // 0..1, animated from TS
 uniform float intensity;
 
-vec4 shader_main(vec2 uv, vec2 rect_size) {
-    vec4 source = texture2D(tex, uv);
+vec4 shader_main(EffectContext effect) {
+    vec4 source = texture2D(tex, effect.texture_uv);
     float k = 1.0 + intensity * phase;
     return vec4(source.rgb * k, source.a);
 }
@@ -349,9 +440,9 @@ uniform sampler2D layer_mask;
 uniform float opacity_threshold;
 uniform float mask_feather;
 
-vec4 shader_main(vec2 uv, vec2 rect_size) {
-    vec4 blurred = texture2D(tex, uv);           // the implicit source
-    float a = texture2D(layer_mask, uv).a;       // the extra texture
+vec4 shader_main(EffectContext effect) {
+    vec4 blurred = texture2D(tex, effect.texture_uv);      // implicit source
+    float a = texture2D(layer_mask, effect.texture_uv).a;  // extra texture
     float mask = smoothstep(opacity_threshold - mask_feather,
                             opacity_threshold + mask_feather, a);
     return blurred * mask;
@@ -364,6 +455,10 @@ shaderStage(loadShader('./shaders/layer-mask.frag'), {
   uniforms: {opacity_threshold: 0.25, mask_feather: 0.04},
 });
 ```
+
+Extra sources are aligned to the same padded working texture. Pixels outside an
+extra source's visible content are transparent, so all samplers use the same
+`effect.texture_uv` coordinate system.
 
 ### GLSL ES 1.00 reminders
 

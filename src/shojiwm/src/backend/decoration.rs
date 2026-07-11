@@ -1868,7 +1868,7 @@ fn shader_effect_spec(
         // longer matches the true blurred neighborhood — visible as a 1px
         // seam between the effect and the window border. The layer-surface
         // path already pads (see shader_effect.rs), windows must match.
-        framebuffer_capture_padding: crate::backend::shader_effect::framebuffer_blur_padding(
+        framebuffer_capture_padding: crate::backend::shader_effect::framebuffer_capture_padding(
             &cached.shader,
             render_scale,
         ),

@@ -451,7 +451,8 @@ export type NoiseKind = "salt";
 export type BlendMode = "normal" | "add" | "screen" | "multiply";
 export interface OnSourceDamageBoxInvalidationHandle {
   kind: "on-source-damage-box";
-  antiArtifactMargin: MaybeSignal<number>;
+  /** Logical padding around the visible rect used for source-damage intersection. */
+  damagePadding: MaybeSignal<number>;
 }
 
 export interface AlwaysInvalidationHandle {
@@ -598,6 +599,12 @@ export type EffectAlphaMode = "opaque" | "preserve";
 export interface CompiledEffectHandle {
   kind: "compiled-effect";
   input: EffectInputHandle;
+  /**
+   * Logical padding added around the visible content while capturing and
+   * processing backdrop textures. Every pipeline stage sees the padded
+   * texture; only the final result is cropped back to the content rect.
+   */
+  capturePadding: MaybeSignal<number>;
   invalidate: EffectInvalidationPolicyHandle;
   pipeline: EffectStageHandle[];
   /** Output alpha handling. Defaults to `"opaque"`. See {@link EffectAlphaMode}. */
@@ -784,6 +791,59 @@ export interface CompositorEffectConfig {
    * ```
    */
   popup?: (popup: WaylandPopup) => PopupEffectAssignment | null;
+}
+
+/**
+ * The surface a `COMPOSITOR.rendering.surfacePolicy` callback is deciding
+ * about. Currently only popups are delivered; the union will grow to layer
+ * and window surfaces without breaking existing callbacks.
+ * `COMPOSITOR.rendering.surfacePolicy` コールバックが判断対象とするサーフェス。
+ * 現在はポップアップのみ配送されます。将来レイヤー・ウィンドウが union に
+ * 追加されても既存コールバックは壊れません。
+ */
+export type SurfacePolicyTarget = { kind: "popup" } & WaylandPopup;
+
+/**
+ * Per-surface rendering policy. All fields optional; omitted fields keep the
+ * compositor default.
+ * サーフェス単位のレンダリングポリシー。省略したフィールドはコンポジターの
+ * デフォルトのまま。
+ */
+export interface SurfacePolicy {
+  /**
+   * How to treat the opaque region the client declared with
+   * `wl_surface.set_opaque_region`.
+   *
+   * - `"trust"` (default): honor the declaration. Opaque areas may occlude
+   *   content composited behind the surface and are drawn without blending.
+   * - `"ignore"`: discard the declaration and treat the whole surface as
+   *   potentially transparent. Use this for clients that over-declare — e.g.
+   *   GTK3 tooltips claim their full rect opaque despite transparent rounded
+   *   corners, which paints the corners as a solid fill and culls any
+   *   `behind` effect.
+   *
+   * クライアントが `wl_surface.set_opaque_region` で申告した不透明領域の扱い。
+   * `"trust"`（デフォルト）は申告を尊重。`"ignore"` は申告を破棄して
+   * サーフェス全体を透明の可能性ありとして扱います（GTK3 ツールチップのような
+   * 過剰申告クライアント向け）。
+   */
+  opaqueRegion?: "trust" | "ignore";
+}
+
+/**
+ * Rendering policy configuration under `COMPOSITOR.rendering`.
+ * `COMPOSITOR.rendering` 配下のレンダリングポリシー設定。
+ */
+export interface CompositorRenderingConfig {
+  /**
+   * Per-surface policy factory. Evaluated when the surface set changes (and
+   * on config hot-reload) and cached — signals are resolved once, not
+   * subscribed. Return `null` (or omit fields) for compositor defaults.
+   * サーフェスごとのポリシーファクトリー。サーフェス集合の変化時と設定の
+   * ホットリロード時に評価されてキャッシュされます（signal は購読されず
+   * 一度だけ解決）。デフォルトのままにするなら `null` を返します。
+   */
+  surfacePolicy?: (surface: SurfacePolicyTarget) => SurfacePolicy | null;
 }
 
 export interface OutputMode {
@@ -1878,6 +1938,21 @@ export interface CompositorDefinition {
    * ```
    */
   effect: CompositorEffectConfig;
+  /**
+   * Rendering policies that override how the compositor treats individual
+   * surfaces, independent of effects and decorations.
+   * エフェクトや装飾から独立して、コンポジターの個別サーフェスの扱いを
+   * 上書きするレンダリングポリシー。
+   *
+   * @example Ignore a lying opaque region / 嘘の opaque region を無視
+   * ```ts
+   * COMPOSITOR.rendering.surfacePolicy = (surface) =>
+   *   surface.kind === "popup" && surface.parentKind === "layer"
+   *     ? { opaqueRegion: "ignore" }
+   *     : null;
+   * ```
+   */
+  rendering: CompositorRenderingConfig;
   /**
    * Output (monitor) access and display layout configuration.
    * 出力（モニター）へのアクセスとディスプレイレイアウト設定。

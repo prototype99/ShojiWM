@@ -28,12 +28,18 @@ import type {
   PopupSourceHandle,
   WindowEffectHandle,
   WindowSourceHandle,
+  MaybeSignal,
 } from "./types";
 
 let assetBaseDir = "/";
 
 export interface CompileEffectOptions {
   input: EffectInputHandle;
+  /**
+   * Logical padding around the visible content used as the pipeline working
+   * area. The final pipeline result is cropped back to the content rect.
+   */
+  capturePadding?: MaybeSignal<number>;
   invalidate?: EffectInvalidationPolicyHandle;
   pipeline: Array<
     | ShaderStageHandle
@@ -301,15 +307,15 @@ export function noise(
 
 /**
  * GPU dual-Kawase blur stage. Runs a downscale/upscale blur pyramid; increasing
- * `passes` spreads the blur radius, increasing `offset` sharpens each sample.
- * A good starting point for background blur is `{ passes: 3, offset: 2.5 }`.
+ * `passes` spreads the blur radius, while `radius` increases each pass's
+ * sampling offset. A good starting point is `{ passes: 3, radius: 4 }`.
  * GPU デュアル川瀬ブラーステージ。ダウンスケール・アップスケールのブラーピラミッドを
- * 実行します。`passes` を増やすとブラー半径が広がり、`offset` を増やすと各サンプルが
- * 鮮明になります。背景ブラーの出発点として `{ passes: 3, offset: 2.5 }` が適切です。
+ * 実行します。`passes` を増やすとブラー範囲が広がり、`radius` を増やすと各パスの
+ * サンプリング間隔が広がります。出発点として `{ passes: 3, radius: 4 }` が適切です。
  *
  * @example
  * ```ts
- * pipeline: [dualKawaseBlur({ passes: 4, offset: 3 })]
+ * pipeline: [dualKawaseBlur({ passes: 4, radius: 3 })]
  * ```
  */
 export function dualKawaseBlur(
@@ -432,7 +438,8 @@ function normalizePath(path: string): string {
  * ```ts
  * COMPOSITOR.effect.background_effect = compileEffect({
  *   input: backdropSource(),
- *   pipeline: [dualKawaseBlur({ passes: 3, offset: 2.5 }), noise({ amount: 0.03 })],
+ *   capturePadding: 32,
+ *   pipeline: [dualKawaseBlur({ passes: 3, radius: 4 }), noise({ amount: 0.03 })],
  * });
  * ```
  */
@@ -442,9 +449,10 @@ export function compileEffect(
   return {
     kind: "compiled-effect",
     input: options.input,
+    capturePadding: options.capturePadding ?? 0,
     invalidate: options.invalidate ?? {
       kind: "on-source-damage-box",
-      antiArtifactMargin: 0,
+      damagePadding: 0,
     },
     pipeline: options.pipeline,
     alpha: options.alpha ?? "opaque",

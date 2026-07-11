@@ -114,6 +114,8 @@ pub enum WireEffectStage {
 pub struct WireCompiledEffect {
     pub kind: String,
     pub input: Option<WireEffectInput>,
+    #[serde(default)]
+    pub capture_padding: i32,
     pub invalidate: Option<WireEffectInvalidationPolicy>,
     #[serde(default)]
     pub pipeline: Vec<WireEffectStage>,
@@ -131,7 +133,7 @@ pub struct WireCompiledEffect {
 )]
 pub enum WireEffectInvalidationPolicy {
     OnSourceDamageBox {
-        anti_artifact_margin: i32,
+        damage_padding: i32,
     },
     Always,
     Manual {
@@ -147,7 +149,7 @@ pub enum WireEffectInvalidationPolicy {
     rename_all_fields = "camelCase"
 )]
 pub enum WireAutomaticEffectInvalidationPolicy {
-    OnSourceDamageBox { anti_artifact_margin: i32 },
+    OnSourceDamageBox { damage_padding: i32 },
     Always,
 }
 
@@ -492,7 +494,11 @@ impl TryFrom<WireCompiledEffect> for CompiledEffect {
                         || stage
                             .textures
                             .keys()
-                            .any(|name| name == "tex" || name == "rect_size" || name.is_empty())
+                            .any(|name| is_reserved_effect_binding_name(name))
+                        || stage
+                            .uniforms
+                            .keys()
+                            .any(|name| is_reserved_effect_binding_name(name))
                         || stage
                             .textures
                             .keys()
@@ -583,26 +589,24 @@ impl TryFrom<WireCompiledEffect> for CompiledEffect {
             return Err(DecorationBridgeError::InvalidShaderDescriptor);
         }
 
-        let invalidate =
-            match value
-                .invalidate
-                .unwrap_or(WireEffectInvalidationPolicy::OnSourceDamageBox {
-                    anti_artifact_margin: 0,
-                }) {
-                WireEffectInvalidationPolicy::OnSourceDamageBox {
-                    anti_artifact_margin,
-                } => EffectInvalidationPolicy::OnSourceDamageBox {
-                    anti_artifact_margin: anti_artifact_margin.max(0),
-                },
-                WireEffectInvalidationPolicy::Always => EffectInvalidationPolicy::Always,
-                WireEffectInvalidationPolicy::Manual { dirty_when, base } => {
-                    EffectInvalidationPolicy::Manual {
-                        dirty_when,
-                        base: base
-                            .map(|policy| Box::new(decode_automatic_invalidation_policy(*policy))),
-                    }
+        let invalidate = match value
+            .invalidate
+            .unwrap_or(WireEffectInvalidationPolicy::OnSourceDamageBox { damage_padding: 0 })
+        {
+            WireEffectInvalidationPolicy::OnSourceDamageBox { damage_padding } => {
+                EffectInvalidationPolicy::OnSourceDamageBox {
+                    damage_padding: damage_padding.max(0),
                 }
-            };
+            }
+            WireEffectInvalidationPolicy::Always => EffectInvalidationPolicy::Always,
+            WireEffectInvalidationPolicy::Manual { dirty_when, base } => {
+                EffectInvalidationPolicy::Manual {
+                    dirty_when,
+                    base: base
+                        .map(|policy| Box::new(decode_automatic_invalidation_policy(*policy))),
+                }
+            }
+        };
 
         let alpha = match value.alpha.as_deref() {
             None | Some("opaque") => EffectAlphaMode::Opaque,
@@ -612,6 +616,7 @@ impl TryFrom<WireCompiledEffect> for CompiledEffect {
 
         Ok(CompiledEffect {
             input,
+            capture_padding: value.capture_padding.max(0),
             invalidate,
             pipeline: stages,
             alpha,
@@ -725,7 +730,11 @@ fn decode_effect_input(value: WireEffectInput) -> Result<EffectInput, Decoration
                 || stage
                     .textures
                     .keys()
-                    .any(|name| name == "tex" || name == "rect_size" || name.is_empty())
+                    .any(|name| is_reserved_effect_binding_name(name))
+                || stage
+                    .uniforms
+                    .keys()
+                    .any(|name| is_reserved_effect_binding_name(name))
                 || stage
                     .textures
                     .keys()
@@ -773,15 +782,23 @@ fn decode_effect_input(value: WireEffectInput) -> Result<EffectInput, Decoration
     })
 }
 
+fn is_reserved_effect_binding_name(name: &str) -> bool {
+    name.is_empty()
+        || matches!(
+            name,
+            "tex" | "effect_texture_size_px" | "effect_content_rect_px"
+        )
+}
+
 fn decode_automatic_invalidation_policy(
     value: WireAutomaticEffectInvalidationPolicy,
 ) -> EffectInvalidationPolicy {
     match value {
-        WireAutomaticEffectInvalidationPolicy::OnSourceDamageBox {
-            anti_artifact_margin,
-        } => EffectInvalidationPolicy::OnSourceDamageBox {
-            anti_artifact_margin: anti_artifact_margin.max(0),
-        },
+        WireAutomaticEffectInvalidationPolicy::OnSourceDamageBox { damage_padding } => {
+            EffectInvalidationPolicy::OnSourceDamageBox {
+                damage_padding: damage_padding.max(0),
+            }
+        }
         WireAutomaticEffectInvalidationPolicy::Always => EffectInvalidationPolicy::Always,
     }
 }
@@ -1239,9 +1256,10 @@ mod tests {
                     "effect": {
                         "kind": "compiled-effect",
                         "input": { "kind": "layer-source", "include": "full" },
+                        "capturePadding": 24,
                         "invalidate": {
                             "kind": "on-source-damage-box",
-                            "antiArtifactMargin": 12
+                            "damagePadding": 12
                         },
                         "pipeline": [{ "kind": "noise", "noiseKind": "salt", "amount": 0.1 }]
                     },
@@ -1259,10 +1277,9 @@ mod tests {
         ));
         assert!(matches!(
             behind.effect.invalidate,
-            EffectInvalidationPolicy::OnSourceDamageBox {
-                anti_artifact_margin: 12
-            }
+            EffectInvalidationPolicy::OnSourceDamageBox { damage_padding: 12 }
         ));
+        assert_eq!(behind.effect.capture_padding, 24);
         assert_eq!(
             behind.outsets,
             EffectOutsets {

@@ -7,7 +7,8 @@ vec3 hsv2rgb(vec3 c) {
     return c.z * mix(k.xxx, clamp(p - k.xxx, 0.0, 1.0), c.y);
 }
 
-vec4 shader_main(vec2 uv, vec2 rect_size) {
+vec4 shader_main(EffectContext effect) {
+    vec2 uv = effect_content_uv(effect);
     float hue = fract(uv.x - phase_01 * speed);
     vec3 rainbow = hsv2rgb(vec3(hue, 0.9, 1.0));
 

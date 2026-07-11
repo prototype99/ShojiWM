@@ -783,7 +783,7 @@ pub enum BlendMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectInvalidationPolicy {
     OnSourceDamageBox {
-        anti_artifact_margin: i32,
+        damage_padding: i32,
     },
     Always,
     Manual {
@@ -837,9 +837,34 @@ pub enum EffectAlphaMode {
     Preserve,
 }
 
+/// How the compositor treats the opaque region a client declared on its
+/// surface (`wl_surface.set_opaque_region`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpaqueRegionPolicy {
+    /// Honor the declaration: opaque areas can occlude elements below and be
+    /// rendered without blending. Correct and fastest for honest clients.
+    #[default]
+    Trust,
+    /// Discard the declaration and treat the whole surface as potentially
+    /// transparent. For clients that over-declare (e.g. GTK3 tooltips claim
+    /// their full rect opaque despite transparent rounded corners), a trusted
+    /// declaration both culls anything composited behind the surface and
+    /// paints the "transparent" pixels unblended.
+    Ignore,
+}
+
+/// Per-surface rendering policy resolved by `COMPOSITOR.rendering.surfacePolicy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SurfacePolicy {
+    pub opaque_region: OpaqueRegionPolicy,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledEffect {
     pub input: EffectInput,
+    /// Logical padding around the visible content used as the pipeline's
+    /// capture and processing area.
+    pub capture_padding: i32,
     pub invalidate: EffectInvalidationPolicy,
     pub pipeline: Vec<EffectStage>,
     /// Declared explicitly by the config (`compileEffect({ alpha: ... })`).
@@ -3658,6 +3683,7 @@ mod tests {
             direction: LayoutDirection::Column,
             shader: CompiledEffect {
                 input: EffectInput::Backdrop,
+                capture_padding: 0,
                 invalidate: EffectInvalidationPolicy::Always,
                 pipeline: Vec::new(),
                 alpha: EffectAlphaMode::Opaque,
@@ -3765,6 +3791,7 @@ mod tests {
             direction: LayoutDirection::Column,
             shader: CompiledEffect {
                 input: EffectInput::Backdrop,
+                capture_padding: 0,
                 invalidate: EffectInvalidationPolicy::Always,
                 pipeline: Vec::new(),
                 alpha: EffectAlphaMode::Opaque,
@@ -4848,6 +4875,7 @@ mod tests {
         let titlebar = DecorationNode::new(DecorationNodeKind::ShaderEffect(ShaderEffectNode {
             shader: CompiledEffect {
                 input: EffectInput::Backdrop,
+                capture_padding: 0,
                 invalidate: EffectInvalidationPolicy::Always,
                 pipeline: Vec::new(),
                 alpha: EffectAlphaMode::Opaque,
@@ -4923,6 +4951,7 @@ mod tests {
     fn framebuffer_backdrop_support_depends_on_inputs_not_pipeline_shape() {
         let backdrop = CompiledEffect {
             input: EffectInput::Backdrop,
+            capture_padding: 0,
             invalidate: EffectInvalidationPolicy::Always,
             pipeline: vec![
                 EffectStage::Noise(NoiseStage {
@@ -4942,9 +4971,11 @@ mod tests {
 
         let xray = CompiledEffect {
             input: EffectInput::Backdrop,
+            capture_padding: 0,
             invalidate: EffectInvalidationPolicy::Always,
             pipeline: vec![EffectStage::Unit(Box::new(CompiledEffect {
                 input: EffectInput::XrayBackdrop,
+                capture_padding: 0,
                 invalidate: EffectInvalidationPolicy::Always,
                 pipeline: Vec::new(),
                 alpha: EffectAlphaMode::Opaque,
@@ -4955,6 +4986,7 @@ mod tests {
 
         let window_source = CompiledEffect {
             input: EffectInput::Backdrop,
+            capture_padding: 0,
             invalidate: EffectInvalidationPolicy::Always,
             pipeline: vec![EffectStage::Blend {
                 input: EffectInput::WindowSource(WindowSourceInclude::Full),
@@ -4967,6 +4999,7 @@ mod tests {
 
         let layer_mask = CompiledEffect {
             input: EffectInput::Backdrop,
+            capture_padding: 0,
             invalidate: EffectInvalidationPolicy::Always,
             pipeline: vec![EffectStage::Shader(ShaderStage {
                 shader: ShaderModule {
@@ -4986,6 +5019,7 @@ mod tests {
 
         let popup_mask = CompiledEffect {
             input: EffectInput::Backdrop,
+            capture_padding: 0,
             invalidate: EffectInvalidationPolicy::Always,
             pipeline: vec![EffectStage::Shader(ShaderStage {
                 shader: ShaderModule {

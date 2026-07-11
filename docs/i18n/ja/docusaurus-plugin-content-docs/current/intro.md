@@ -70,7 +70,8 @@ const CloseButton = ({ window }: { window: WaylandWindow }) => {
 ```tsx
 const LAYER_BLUR_MASK = compileLayerEffect({
   input: backdropSource(),
-  invalidate: { kind: "on-source-damage-box", antiArtifactMargin: 8 },
+  capturePadding: 24,
+  invalidate: { kind: "on-source-damage-box", damagePadding: 8 },
   alpha: "preserve",
   pipeline: [
     dualKawaseBlur({ radius: 4, passes: 2 }),

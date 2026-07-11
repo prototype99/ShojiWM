@@ -460,6 +460,8 @@ pub struct PopupEffectEvaluationResult {
 pub struct RuntimePopupEffectAssignment {
     pub popup_id: String,
     pub effects: Option<WindowEffectConfig>,
+    /// `COMPOSITOR.rendering.surfacePolicy` result for this popup's surface.
+    pub surface_policy: Option<super::SurfacePolicy>,
 }
 
 fn validate_popup_effect_config(
@@ -1225,10 +1227,27 @@ struct RuntimeLayerEffectAssignmentResponse {
 }
 
 #[derive(serde::Deserialize)]
+struct WireSurfacePolicy {
+    #[serde(rename = "opaqueRegion")]
+    opaque_region: Option<String>,
+}
+
+fn surface_policy_from_wire(wire: WireSurfacePolicy) -> crate::ssd::SurfacePolicy {
+    crate::ssd::SurfacePolicy {
+        opaque_region: match wire.opaque_region.as_deref() {
+            Some("ignore") => crate::ssd::OpaqueRegionPolicy::Ignore,
+            _ => crate::ssd::OpaqueRegionPolicy::Trust,
+        },
+    }
+}
+
+#[derive(serde::Deserialize)]
 struct RuntimePopupEffectAssignmentResponse {
     #[serde(rename = "popupId")]
     popup_id: String,
     effects: Option<WireWindowEffectConfig>,
+    #[serde(rename = "surfacePolicy")]
+    surface_policy: Option<WireSurfacePolicy>,
 }
 
 #[derive(serde::Deserialize)]
@@ -4511,6 +4530,7 @@ impl DecorationEvaluator for NodeDecorationEvaluator {
                             .transpose()?
                             .map(validate_popup_effect_config)
                             .transpose()?,
+                        surface_policy: assignment.surface_policy.map(surface_policy_from_wire),
                     })
                 })
                 .collect::<Result<Vec<_>, DecorationBridgeError>>()
@@ -4596,6 +4616,7 @@ mod tests {
     fn popup_backdrop_mask_can_sample_popup_source() {
         let effect = CompiledEffect {
             input: EffectInput::Backdrop,
+            capture_padding: 0,
             invalidate: EffectInvalidationPolicy::Always,
             pipeline: vec![
                 EffectStage::DualKawaseBlur(BackdropBlur {
