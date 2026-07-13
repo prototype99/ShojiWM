@@ -3,7 +3,10 @@
 //! See: https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.impl.portal.ScreenCast.html
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{
+    Arc,
+    Mutex,
+};
 
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
@@ -48,7 +51,10 @@ enum AnyStreamHandle {
     Toplevel(ToplevelStreamHandle),
 }
 
-pub struct ScreenCast {
+/// Shared portal state. Held by the ScreenCast interface and by every
+/// per-session [`SessionImpl`] object, so a session Close can drop exactly
+/// its own stream and bookkeeping.
+struct Inner {
     picker: PickerHandle,
     sessions: Mutex<HashMap<String, Selection>>,
     streams: Mutex<HashMap<String, AnyStreamHandle>>,
@@ -61,6 +67,87 @@ pub struct ScreenCast {
     /// (and OBS on relaunch) skip the picker after the first approval.
     persist_modes: Mutex<HashMap<String, u32>>,
     thumbnail_tx: tokio::sync::mpsc::UnboundedSender<ThumbnailUpdate>,
+}
+
+impl Inner {
+    /// Tear down everything a session owns. Dropping the stream handle stops
+    /// the capture thread and removes the PipeWire node.
+    fn cleanup_session(
+        &self,
+        session_key: &str,
+    ) {
+        let stream = self.streams
+            .lock()
+            .unwrap()
+            .remove(
+                session_key,
+            );
+        let had_stream = stream
+            .is_some();
+        drop(
+            stream,
+        );
+        self.sessions
+            .lock()
+            .unwrap()
+            .remove(
+                session_key,
+            );
+        self.cursor_visibility
+            .lock()
+            .unwrap()
+            .remove(
+                session_key,
+            );
+        self.persist_modes
+            .lock()
+            .unwrap()
+            .remove(
+                session_key,
+            );
+        tracing::info!(session_key, had_stream, "session closed and cleaned up");
+    }
+}
+
+pub struct ScreenCast {
+    inner: Arc<Inner>,
+}
+
+/// Per-session `org.freedesktop.impl.portal.Session` object, exported at the
+/// session handle path by CreateSession. Without it the portal frontend's
+/// Close calls fail with UnknownObject and our streams outlive their
+/// sessions — Chromium's Go Live opens and closes several sessions
+/// back-to-back, so the stale driver streams pile up on the output.
+struct SessionImpl {
+    session_key: String,
+    inner: Arc<Inner>,
+}
+
+#[zbus::interface(name = "org.freedesktop.impl.portal.Session")]
+impl SessionImpl {
+    #[zbus(property, name = "version")]
+    fn version(
+        &self
+    ) -> u32 {
+        1
+    }
+
+    async fn close(
+        &self,
+        #[zbus(object_server)] server: &zbus::ObjectServer,
+    ) -> zbus::fdo::Result<()> {
+        self.inner
+            .cleanup_session(
+                &self.session_key,
+            );
+        if let Ok(path) = ObjectPath::try_from(
+            self.session_key
+                .clone(),
+        ) {
+            let _ = server.remove::<Self, _>(&path).await;
+        }
+        Ok(())
+    }
 }
 
 /// Vendor tag inside the `(suv)` restore_data blob. The frontend gives the
