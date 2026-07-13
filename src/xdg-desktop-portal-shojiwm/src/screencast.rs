@@ -63,6 +63,169 @@ pub struct ScreenCast {
     thumbnail_tx: tokio::sync::mpsc::UnboundedSender<ThumbnailUpdate>,
 }
 
+/// Vendor tag inside the `(suv)` restore_data blob. The frontend gives the
+/// blob back verbatim on later sessions; the tag + version gate decoding.
+const RESTORE_VENDOR: &str = "shojiwm";
+const RESTORE_VERSION: u32 = 1;
+
+/// Encode a selection as the `v` payload of restore_data. Flat `(ssss)`:
+/// ("output", connector_name, "", "") or
+/// ("toplevel", identifier, app_id, title). Toplevel identifiers are not
+/// stable across compositor restarts, so app_id+title are carried as a
+/// fallback match key.
+fn encode_restore_data(selection: &Selection) -> Value<'static> {
+    let data = match selection {
+        Selection::Output(out) => Value::from((
+            "output"
+                .to_string(),
+            out.name
+                .clone(),
+            String::new(),
+            String::new(),
+        )),
+        Selection::Toplevel(top) => Value::from((
+            "toplevel"
+                .to_string(),
+            top.identifier
+                .clone(),
+            top.app_id
+                .clone(),
+            top.title
+                .clone(),
+        )),
+    };
+    Value::from((
+        RESTORE_VENDOR
+            .to_string(),
+        RESTORE_VERSION,
+        Value::new(data),
+    ))
+}
+
+/// Decoded restore request from a `(suv)` restore_data option.
+struct RestoreRequest {
+    kind: String,
+    key: String,
+    app_id: String,
+    title: String,
+}
+
+fn decode_restore_data(value: &OwnedValue) -> Option<RestoreRequest> {
+    let structure = match &**value {
+        Value::Structure(s) => s,
+        _ => return None,
+    };
+    let fields = structure
+        .fields();
+    let vendor = match fields
+        .first()? {
+        Value::Str(s) => s
+            .as_str(),
+        _ => return None,
+    };
+    let version = match fields.get(1)? {
+        Value::U32(v) => *v,
+        _ => return None,
+    };
+    if vendor != RESTORE_VENDOR || version != RESTORE_VERSION {
+        return None;
+    }
+    let mut inner = fields.get(2)?;
+    while let Value::Value(boxed) = inner {
+        inner = boxed;
+    }
+    let data = match inner {
+        Value::Structure(s) => s,
+        _ => return None,
+    };
+    let field_str = |i: usize| -> Option<String> {
+        match data.fields().get(i)? {
+            Value::Str(s) => Some(
+                s
+                    .to_string()
+            ),
+            _ => None,
+        }
+    };
+    Some(RestoreRequest {
+        kind: field_str(0)?,
+        key: field_str(1)?,
+        app_id: field_str(2)?,
+        title: field_str(3)?,
+    })
+}
+
+/// Match a restore request against the currently existing sources. Only a
+/// live match may skip the picker — a vanished output or closed window
+/// falls through to the normal dialog.
+fn match_restore(request: &RestoreRequest, sources: &[SourceInfo]) -> Option<Selection> {
+    match request.kind.as_str() {
+        "output" => sources.iter().find_map(|s| match &s.kind {
+            SourceKind::Output(out) if out.name == request.key => {
+                Some(
+                    Selection::Output(
+                        out
+                            .clone()
+                    )
+                )
+            }
+            _ => None,
+        }),
+        "toplevel" => {
+            let toplevels: Vec<&ToplevelInfo> = sources
+                .iter()
+                .filter_map(|s| match &s.kind {
+                    SourceKind::Toplevel(top) => Some(top),
+                    _ => None,
+                })
+                .collect();
+            // Identifier is exact within a compositor run; app_id+title is
+            // the cross-restart fallback; a unique app_id match handles
+            // title drift (documents, web pages).
+            if let Some(top) = toplevels.iter().find(|t| t.identifier == request.key) {
+                return Some(
+                    Selection::Toplevel(
+                        (
+                            *top
+                        ).clone()
+                    )
+                );
+            }
+            if !request.app_id.is_empty()
+                && let Some(top) = toplevels
+                    .iter()
+                    .find(|t| t.app_id == request.app_id && t.title == request.title)
+            {
+                return Some(
+                    Selection::Toplevel(
+                        (
+                            *top
+                        ).clone()
+                    )
+                );
+            }
+            if !request.app_id.is_empty() {
+                let mut by_app = toplevels
+                    .iter()
+                    .filter(
+                        |t| t.app_id == request.app_id,
+                    );
+                if let (Some(top), None) = (by_app.next(), by_app.next()) {
+                    return Some(
+                        Selection::Toplevel(
+                            (
+                                *top
+                            ).clone(),
+                        ),
+                    );
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 impl ScreenCast {
     pub fn new(
         picker: PickerHandle,
