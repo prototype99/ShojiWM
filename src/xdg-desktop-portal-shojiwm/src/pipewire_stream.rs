@@ -189,6 +189,15 @@ struct AppState {
     dmabuf_modifiers: Vec<DrmModifier>,
     negotiated_dmabuf_modifier: Option<DrmModifier>,
     dmabuf_failed: bool,
+    /// Whether the CURRENTLY negotiated format carries a DMA-BUF modifier.
+    /// Buffer allocation must follow this: a modifier-less format means the
+    /// consumer expects mappable memory, and serving DMA-BUF anyway puts
+    /// OBS into a renegotiation livelock. Unlike `dmabuf_failed` this is NOT
+    /// a latch — Chromium swaps consumers mid-session (preview → WebRTC
+    /// capturer) and the next consumer may negotiate DMA-BUF again, so the
+    /// advertised formats always stay broad and this just tracks the latest
+    /// negotiation result.
+    format_has_modifier: bool,
 
     // PipeWire stream (cloneable Rc handle)
     stream: Option<pw::stream::StreamRc>,
@@ -299,6 +308,7 @@ fn run(
         dmabuf_modifiers: Vec::new(),
         negotiated_dmabuf_modifier: None,
         dmabuf_failed: false,
+        format_has_modifier: false,
         stream: None,
         pw_buffer_slots: HashMap::new(),
         pw_buffer_stride: HashMap::new(),
@@ -748,29 +758,27 @@ impl AppState {
             // OBS fails the import again and renegotiates in a ~20 Hz loop —
             // each cycle reallocating the whole 8×8 MB buffer pool, which
             // pegs several cores and leaks GPU memory until the machine dies.
-            // Honour the downgrade: allocate SHM from here on.
-            // 
-            // This also covers consumers that negotiate modifier-less from the start —
-            // a modifier-less format must never be served DMA-BUF buffers.
-            self.negotiated_dmabuf_modifier = None;
-            if !self
-                .dmabuf_failed {
+            // Allocation follows the format:
+            // SHM while this stays negotiated.
+            //
+            // Deliberately NOT a latch, and deliberately no update_params
+            // narrowing the advert to SHM-only: Chromium swaps consumers
+            // mid-session (preview → WebRTC capturer on Go Live), and the
+            // next consumer may offer DMA-BUF formats again. A narrowed
+            // advert makes that negotiation intersect to nothing — the link
+            // then never completes, the stream sits Paused forever, and
+            // vesktop's Go Live dies with endless portal retries.
+            if self.format_has_modifier {
                 tracing::info!(
-                    "screencast: consumer renegotiated without a DMA-BUF modifier; falling back to SHM"
+                    "screencast: consumer \
+                    negotiated a modifier-less format; allocating SHM buffers"
                 );
-                self.dmabuf_failed = true;
-                if let Err(e) = self
-                    .update_pipewire_params(
-                        stream,
-                        &[],
-                    ) {
-                    tracing::warn!(
-                        "screencast: failed to update PipeWire params for SHM fallback: {e}"
-                    );
-                }
             }
+            self.format_has_modifier = false;
+            self.negotiated_dmabuf_modifier = None;
             return;
         };
+        self.format_has_modifier = true;
 
         if modifier_param.dont_fixate {
             let Some(modifier) = self.choose_working_dmabuf_modifier(&modifier_param.modifiers)
@@ -951,7 +959,12 @@ impl AppState {
         let allows_dmabuf = data_types & dmabuf_flag != 0 || data_types == spa_sys::SPA_DATA_DmaBuf;
         let allows_memfd = data_types & memfd_flag != 0 || data_types == spa_sys::SPA_DATA_MemFd;
 
-        if allows_dmabuf && !self.dmabuf_failed {
+        // DMA-BUF is only valid while the negotiated format carries a
+        // modifier; under a modifier-less format the consumer expects
+        // mappable memory even if its Buffers param still allows DmaBuf.
+        if allows_dmabuf 
+            && self.format_has_modifier
+            && !self.dmabuf_failed {
             match self.create_dmabuf_slot() {
                 Ok(Some(slot)) => return Ok(slot),
                 Ok(None) if !allows_memfd => {
