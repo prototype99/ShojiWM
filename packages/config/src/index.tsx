@@ -54,6 +54,11 @@ COMPOSITOR.env.apply({
 });
 COMPOSITOR.env.publish();
 
+COMPOSITOR.cursor.configure({
+  theme: "Bibata-Modern-Ice",
+  size: 24,
+});
+
 const HYBRID_WINDOW_MANAGER = new HybridWindowManager(naturalRootRect);
 const HOT_RELOAD_WINDOW_MANAGER_STATE = "config.hybrid-window-manager";
 const FULLSCREEN_Z_INDEX = 2_000_000_000;

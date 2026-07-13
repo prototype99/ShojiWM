@@ -6,32 +6,61 @@ use tracing::warn;
 use xcursor::{CursorTheme, parser::Image};
 
 pub struct Cursor {
+    name: String,
     theme: CursorTheme,
     cache: HashMap<CursorIcon, Vec<Image>>,
     size: u32,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeCursorConfigUpdate {
+    pub theme: String,
+    pub size: u32,
+    #[serde(default)]
+    pub reload: bool,
 }
 
 impl Cursor {
     pub fn load() -> Self {
         let name = std::env::var("XCURSOR_THEME")
             .ok()
+            .filter(|name| !name.is_empty() && !name.contains('\0'))
             .unwrap_or_else(|| "default".into());
         let size = std::env::var("XCURSOR_SIZE")
             .ok()
             .and_then(|value| value.parse().ok())
+            .filter(|size| (1..=512).contains(size))
             .unwrap_or(24);
 
-        let theme = CursorTheme::load(&name);
-        let mut cache = HashMap::new();
-        cache.insert(
-            CursorIcon::Default,
-            load_icon(&theme, CursorIcon::Default).unwrap_or_else(|| {
-                warn!("failed to load default xcursor theme image, using fallback cursor");
-                vec![fallback_cursor_image()]
-            }),
-        );
+        Self::from_config(name, size)
+    }
 
-        Self { theme, cache, size }
+    fn from_config(name: String, size: u32) -> Self {
+        let theme = CursorTheme::load(&name);
+        let cache = default_icon_cache(&theme, &name);
+        Self {
+            name,
+            theme,
+            cache,
+            size,
+        }
+    }
+
+    pub fn apply_runtime_config(&mut self, update: RuntimeCursorConfigUpdate) -> bool {
+        if update.theme.is_empty() || update.size == 0 || update.size > 512 {
+            warn!(?update, "ignoring invalid runtime cursor configuration");
+            return false;
+        }
+        if !update.reload && update.theme == self.name && update.size == self.size {
+            return false;
+        }
+
+        self.name = update.theme;
+        self.size = update.size;
+        self.theme = CursorTheme::load(&self.name);
+        self.cache = default_icon_cache(&self.theme, &self.name);
+        true
     }
 
     pub fn size(&self) -> u32 {
@@ -50,6 +79,21 @@ impl Cursor {
         });
         frame(time.as_millis() as u32, size, icons)
     }
+}
+
+fn default_icon_cache(theme: &CursorTheme, name: &str) -> HashMap<CursorIcon, Vec<Image>> {
+    let mut cache = HashMap::new();
+    cache.insert(
+        CursorIcon::Default,
+        load_icon(theme, CursorIcon::Default).unwrap_or_else(|| {
+            warn!(
+                theme = name,
+                "failed to load default xcursor theme image, using fallback cursor"
+            );
+            vec![fallback_cursor_image()]
+        }),
+    );
+    cache
 }
 
 fn fallback_cursor_image() -> Image {
@@ -128,4 +172,48 @@ fn load_icon(theme: &CursorTheme, icon: CursorIcon) -> Option<Vec<Image>> {
         })
         .and_then(|path| std::fs::read(path).ok())
         .and_then(|bytes| xcursor::parser::parse_xcursor(&bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_config_reloads_only_when_needed() {
+        let mut cursor = Cursor::from_config("__shojiwm_test_missing_theme__".into(), 24);
+
+        assert!(!cursor.apply_runtime_config(RuntimeCursorConfigUpdate {
+            theme: "__shojiwm_test_missing_theme__".into(),
+            size: 24,
+            reload: false,
+        }));
+        assert!(cursor.apply_runtime_config(RuntimeCursorConfigUpdate {
+            theme: "__shojiwm_test_missing_theme__".into(),
+            size: 24,
+            reload: true,
+        }));
+        assert!(cursor.apply_runtime_config(RuntimeCursorConfigUpdate {
+            theme: "__shojiwm_test_missing_theme__".into(),
+            size: 48,
+            reload: false,
+        }));
+        assert_eq!(cursor.size(), 48);
+    }
+
+    #[test]
+    fn invalid_runtime_config_is_rejected() {
+        let mut cursor = Cursor::from_config("__shojiwm_test_missing_theme__".into(), 24);
+
+        assert!(!cursor.apply_runtime_config(RuntimeCursorConfigUpdate {
+            theme: String::new(),
+            size: 24,
+            reload: true,
+        }));
+        assert!(!cursor.apply_runtime_config(RuntimeCursorConfigUpdate {
+            theme: "default".into(),
+            size: 513,
+            reload: true,
+        }));
+        assert_eq!(cursor.size(), 24);
+    }
 }

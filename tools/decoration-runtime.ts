@@ -58,6 +58,7 @@ import {
   invokeKeyBinding,
   managedWindowOnlyDirtyIds,
   takePendingDebugConfig,
+  takePendingCursorConfig,
   takePendingDisplayConfig,
   takePendingKeyBindingConfig,
   takePendingInputConfig,
@@ -3503,8 +3504,13 @@ function writeResponse(
     | RuntimeFailure,
 ): Promise<void> {
   const envUpdates = drainPendingEnvUpdates();
-  const responseWithEnv = envUpdates ? { ...response, envUpdates } : response;
-  const payload = Buffer.from(JSON.stringify(responseWithEnv), "utf8");
+  const cursorConfig = takePendingCursorConfig();
+  const responseWithRuntimeUpdates = {
+    ...response,
+    ...(envUpdates ? { envUpdates } : {}),
+    ...(cursorConfig ? { cursorConfig } : {}),
+  };
+  const payload = Buffer.from(JSON.stringify(responseWithRuntimeUpdates), "utf8");
   if (payload.length > 0xffff_ffff) {
     throw new Error("runtime response too large");
   }

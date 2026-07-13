@@ -1051,6 +1051,9 @@ impl ShojiWM {
                             &runtime_scheduler_kick_loop_handle,
                         );
                     }
+                    DecorationRuntimeAsyncInvocation::CursorConfig(update) => {
+                        state.apply_runtime_cursor_config_update(update);
+                    }
                 },
                 ChannelEvent::Closed => {}
             })
@@ -2555,6 +2558,20 @@ impl ShojiWM {
             self.fps_counter.set_enabled(update.fps_counter);
             crate::profiler::set_enabled(update.profile);
         }
+    }
+
+    pub fn apply_runtime_cursor_config_update(
+        &mut self,
+        update: crate::cursor::RuntimeCursorConfigUpdate,
+    ) {
+        if !self.cursor_theme.apply_runtime_config(update) {
+            return;
+        }
+        self.pointer_images.clear();
+        self.current_pointer_image = None;
+        self.pointer_element.clear_buffer();
+        self.request_tty_maintenance("runtime-cursor-config");
+        self.schedule_redraw();
     }
 
     pub fn mark_runtime_dirty_windows(

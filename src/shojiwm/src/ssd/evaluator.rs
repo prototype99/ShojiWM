@@ -412,6 +412,7 @@ pub type DecorationGestureSwipeAsyncInvocation = DecorationPointerMoveAsyncInvoc
 pub enum DecorationRuntimeAsyncInvocation {
     PointerMove(DecorationPointerMoveAsyncInvocation),
     GestureSwipe(DecorationGestureSwipeAsyncInvocation),
+    CursorConfig(crate::cursor::RuntimeCursorConfigUpdate),
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -702,6 +703,7 @@ struct NodeDecorationRuntime {
     connection: RuntimeConnection,
     next_request_id: u64,
     stderr_log: Arc<Mutex<String>>,
+    async_event_sender: Arc<Mutex<Option<CalloopSender<DecorationRuntimeAsyncInvocation>>>>,
 }
 
 enum RuntimeConnection {
@@ -1907,6 +1909,7 @@ impl NodeDecorationEvaluator {
             },
             next_request_id: 1,
             stderr_log,
+            async_event_sender: Arc::clone(&self.async_event_sender),
         })
     }
 
@@ -1985,6 +1988,7 @@ impl NodeDecorationEvaluator {
             },
             next_request_id: 1,
             stderr_log,
+            async_event_sender: Arc::clone(&self.async_event_sender),
         })
     }
 
@@ -2431,6 +2435,30 @@ impl NodeDecorationRuntime {
                     ))
                 })?;
             apply_runtime_env_updates(env_updates, "typescript-runtime");
+        }
+
+        if let Some(cursor_config) = value.get("cursorConfig") {
+            timescope::scope!("runtime cursor config");
+            let cursor_config: crate::cursor::RuntimeCursorConfigUpdate =
+                serde_json::from_value(cursor_config.clone()).map_err(|error| {
+                    DecorationEvaluationError::InvalidResponse(format!(
+                        "invalid cursorConfig: {error}; payload={}",
+                        String::from_utf8_lossy(&payload)
+                    ))
+                })?;
+            if let Ok(sender) = self.async_event_sender.lock()
+                && let Some(sender) = sender.as_ref()
+            {
+                sender
+                    .send(DecorationRuntimeAsyncInvocation::CursorConfig(
+                        cursor_config,
+                    ))
+                    .map_err(|error| {
+                        DecorationEvaluationError::RuntimeProtocol(format!(
+                            "failed to dispatch runtime cursor config: {error}"
+                        ))
+                    })?;
+            }
         }
 
         {

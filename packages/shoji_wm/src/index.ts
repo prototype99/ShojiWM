@@ -176,6 +176,7 @@ import { OUTPUT_CONTROLLER, installOutputChangeEmitter } from "./output";
 import { WORKSPACE_CONTROLLER } from "./workspace";
 import { DEBUG_CONTROLLER, takePendingDebugConfig } from "./debug";
 import { ENV_CONTROLLER, drainPendingEnvUpdates } from "./env";
+import { CURSOR_CONTROLLER, takePendingCursorConfig } from "./cursor";
 import { LAYER_CONTROLLER, updateLayerSnapshots } from "./layer";
 import {
   PROCESS_CONTROLLER,
@@ -330,6 +331,11 @@ export {
 export { LAYER_CONTROLLER, updateLayerSnapshots } from "./layer";
 export { DEBUG_CONTROLLER, takePendingDebugConfig } from "./debug";
 export { ENV_CONTROLLER, drainPendingEnvUpdates } from "./env";
+export {
+  CURSOR_CONTROLLER,
+  currentCursorConfig,
+  takePendingCursorConfig,
+} from "./cursor";
 export {
   KEY_BINDING_CONTROLLER,
   beginKeyBindingRegistration,
@@ -592,6 +598,9 @@ export type {
   KeyboardInputConfig,
   PointerInputConfig,
   TouchpadInputConfig,
+  CursorConfig,
+  CursorController,
+  RuntimeCursorConfigUpdate,
   PreloadController,
   RuntimeController,
   DebugController,
@@ -840,6 +849,7 @@ function createCompositorDefinition(): CompositorDefinition {
     key: KEY_BINDING_CONTROLLER,
     pointer: POINTER_CONTROLLER,
     input: INPUT_CONTROLLER,
+    cursor: CURSOR_CONTROLLER,
     runtime: RUNTIME_CONTROLLER,
     window: WINDOW_CONTROLLER,
     layer: LAYER_CONTROLLER,

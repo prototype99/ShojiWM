@@ -1435,6 +1435,32 @@ export interface InputController {
   reconfigure(): void;
 }
 
+/** Desktop cursor theme and logical size. / デスクトップカーソルのテーマと論理サイズ。 */
+export interface CursorConfig {
+  /** XCursor theme name. / XCursor テーマ名。 */
+  theme: string;
+  /** Cursor size in logical pixels. / 論理ピクセル単位のカーソルサイズ。 */
+  size: number;
+}
+
+/** @internal Wire payload sent to the compositor runtime. */
+export interface RuntimeCursorConfigUpdate extends CursorConfig {
+  reload: boolean;
+}
+
+/**
+ * Configures compositor-owned named cursors and exports matching XCursor
+ * environment variables for processes started afterwards.
+ * コンポジター所有の named cursor を設定し、後から起動するプロセス向けに
+ * 対応する XCursor 環境変数も公開します。
+ */
+export interface CursorController {
+  /** Apply a theme and logical size immediately. / テーマと論理サイズを即時適用します。 */
+  configure(config: CursorConfig): void;
+  /** Reload the current theme and discard decoded cursor caches. / 現在のテーマをキャッシュ破棄して再読込します。 */
+  reload(): void;
+}
+
 export interface BorderValue {
   px: MaybeSignal<number>;
   color: MaybeSignal<string>;
@@ -1992,6 +2018,21 @@ export interface CompositorDefinition {
    * ```
    */
   input: InputController;
+  /**
+   * Desktop cursor appearance. The compositor applies this to named cursors
+   * and synchronizes `XCURSOR_THEME` / `XCURSOR_SIZE` for future processes.
+   * デスクトップカーソルの外観。named cursor に適用し、今後起動する
+   * プロセス向けの `XCURSOR_THEME` / `XCURSOR_SIZE` も同期します。
+   *
+   * @example
+   * ```ts
+   * COMPOSITOR.cursor.configure({
+   *   theme: "Bibata-Modern-Classic",
+   *   size: 24,
+   * });
+   * ```
+   */
+  cursor: CursorController;
   /**
    * Environment variable controller for child processes spawned by the compositor.
    * コンポジターが起動する子プロセスが継承する環境変数を管理します。

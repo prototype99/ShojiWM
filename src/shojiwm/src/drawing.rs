@@ -34,6 +34,10 @@ impl PointerElement {
     pub fn set_buffer(&mut self, buffer: MemoryRenderBuffer) {
         self.buffer = Some(buffer);
     }
+
+    pub fn clear_buffer(&mut self) {
+        self.buffer = None;
+    }
 }
 
 render_elements! {
