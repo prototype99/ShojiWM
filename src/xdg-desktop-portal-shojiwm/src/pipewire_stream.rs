@@ -1172,6 +1172,10 @@ impl AppState {
             slot.wl_buffer.destroy();
         }
         self.pw_buffer_stride.remove(&key);
+        // A throttle-held buffer from the outgoing pool must not be reused.
+        if self.spare_buffer == Some(key) {
+            self.spare_buffer = None;
+        }
         // If an in-flight wlr-screencopy frame was targeting this buffer,
         // abandon it. A late Ready event would otherwise call queue_raw_buffer
         // on the now-freed pointer (use-after-free → SEGV — observed when OBS
@@ -1373,13 +1377,28 @@ impl AppState {
         tracing::warn!("screencast frame failed");
         if let Some(pending) = self.pending_frame.take() {
             pending.frame.destroy();
-            // Return the dequeued buffer (if any) without queueing — actually
-            // we still need to queue it back; PW expects buffers to come back.
+            // PW expects the dequeued buffer back, but its content is stale —
+            // mark the chunk empty and corrupted so consumers skip it instead
+            // of re-showing whatever the buffer held last.
             if pending.pw_buffer != 0
                 && let Some(stream) = self.stream.clone()
             {
                 let pw_buf = pending.pw_buffer as *mut pw::sys::pw_buffer;
-                unsafe { stream.queue_raw_buffer(pw_buf) };
+                unsafe {
+                    if !pw_buf.is_null()
+                        && !(*pw_buf).buffer.is_null()
+                        && (*(*pw_buf).buffer).n_datas > 0
+                    {
+                        let datas = std::slice::from_raw_parts_mut(
+                            (*(*pw_buf).buffer).datas,
+                            (*(*pw_buf).buffer).n_datas as usize,
+                        );
+                        let chunk = &mut *datas[0].chunk;
+                        chunk.size = 0;
+                        chunk.flags = spa_sys::SPA_CHUNK_FLAG_CORRUPTED as i32;
+                    }
+                    stream.queue_raw_buffer(pw_buf);
+                }
             }
         }
         // Backoff briefly and retry.
