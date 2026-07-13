@@ -741,6 +741,34 @@ impl AppState {
             return;
         };
         let Some(modifier_param) = parse_pipewire_modifier_param(param) else {
+            // A format WITHOUT a modifier property means the consumer wants
+            // mappable memory, not DMA-BUF. OBS does this after a failed
+            // GL import: it drops the modifier and renegotiates. If we keep
+            // serving DMA-BUF anyway (stale `negotiated_dmabuf_modifier`),
+            // OBS fails the import again and renegotiates in a ~20 Hz loop —
+            // each cycle reallocating the whole 8×8 MB buffer pool, which
+            // pegs several cores and leaks GPU memory until the machine dies.
+            // Honour the downgrade: allocate SHM from here on.
+            // 
+            // This also covers consumers that negotiate modifier-less from the start —
+            // a modifier-less format must never be served DMA-BUF buffers.
+            self.negotiated_dmabuf_modifier = None;
+            if !self
+                .dmabuf_failed {
+                tracing::info!(
+                    "screencast: consumer renegotiated without a DMA-BUF modifier; falling back to SHM"
+                );
+                self.dmabuf_failed = true;
+                if let Err(e) = self
+                    .update_pipewire_params(
+                        stream,
+                        &[],
+                    ) {
+                    tracing::warn!(
+                        "screencast: failed to update PipeWire params for SHM fallback: {e}"
+                    );
+                }
+            }
             return;
         };
 
