@@ -303,6 +303,30 @@ impl ScreenCast {
             .lock()
             .unwrap()
             .insert(session_handle.to_string(), cursor_visible);
+        let persist_mode = options
+            .get(
+                "persist_mode",
+            )
+            .and_then(
+                |v| u32::try_from(v)
+                    .ok(),
+            )
+            .unwrap_or(0);
+        self.persist_modes
+            .lock()
+            .unwrap()
+            .insert(
+                session_handle
+                    .to_string(),
+                persist_mode,
+            );
+        let restore_request = options
+            .get(
+                "restore_data",
+            )
+            .and_then(
+                decode_restore_data,
+            );
         tracing::info!(
             %handle, %session_handle, %app_id, requested_types = requested, cursor_mode, cursor_visible,
             "SelectSources: enumerating sources and prompting picker"
@@ -328,6 +352,38 @@ impl ScreenCast {
             })
             .collect();
         tracing::info!(count = filtered.len(), "enumerated sources");
+
+        // A valid restore_data blob that still matches a live source skips
+        // the picker entirely — this is what keeps Chromium's Go Live (which
+        // opens several sessions back-to-back) down to a single dialog.
+        if let Some(request) = restore_request {
+            if let Some(selection) = match_restore(&request, &filtered) {
+                tracing::info!(
+                    %session_handle, 
+                    ?selection,
+                    "restore_data matched a live source; skipping picker",
+                );
+                drop(_stream_guard);
+                self.sessions
+                    .lock()
+                    .unwrap()
+                    .insert(
+                        session_handle
+                            .to_string(), 
+                        selection,
+                    );
+                return Ok(
+                    (
+                        0,
+                        HashMap::new(),
+                    )
+                );
+            }
+            tracing::info!(
+                %session_handle,
+                "restore_data no longer matches any source; prompting picker",
+            );
+        }
 
         let pick = self.picker.pick(filtered).await;
         drop(_stream_guard);
