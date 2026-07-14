@@ -1042,6 +1042,9 @@ impl AppState {
         // hold the buffer in `spare_buffer` instead of queueing — the next
         // kick recaptures into it, so the consumer sees at most the
         // negotiated framerate.
+        // Compare against 3/4 of the interval, not the full interval: when
+        // the negotiated rate equals the capture rate, scheduling jitter
+        // would otherwise flag ~every frame as early and halve the throughput.
         let throttled = match (
             self.frame_interval,
             self.last_queue_at,
@@ -1054,7 +1057,8 @@ impl AppState {
                     last_queue_at,
                 ),
             ) => last_queue_at
-                .elapsed() < interval,
+                .elapsed() < interval
+                * 3 / 4,
             _ => false,
         };
         if let Some(stream) = self.stream.clone()
