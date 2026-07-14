@@ -1058,11 +1058,30 @@ impl AppState {
         tracing::warn!("toplevel screencast frame failed");
         if let Some(pending) = self.pending_frame.take() {
             pending.frame.destroy();
+            // PW expects the dequeued buffer back, but its content is stale —
+            // mark the chunk empty and corrupted so consumers skip it instead
+            // of re-showing whatever the buffer held last.
             if pending.pw_buffer != 0
                 && let Some(stream) = self.stream.clone()
             {
                 let pw_buf = pending.pw_buffer as *mut pw::sys::pw_buffer;
-                unsafe { stream.queue_raw_buffer(pw_buf) };
+                unsafe {
+                    if !pw_buf.is_null()
+                        && !(*pw_buf).buffer.is_null()
+                        && (*(*pw_buf).buffer).n_datas > 0
+                    {
+                        let datas = std::slice::from_raw_parts_mut(
+                            (*(*pw_buf).buffer).datas,
+                            (*(*pw_buf).buffer).n_datas as usize,
+                        );
+                        let chunk = &mut *datas[0].chunk;
+                        chunk.size = 0;
+                        chunk.flags = spa_sys::SPA_CHUNK_FLAG_CORRUPTED as i32;
+                    }
+                    stream.queue_raw_buffer(
+                        pw_buf,
+                    );
+                }
             }
         }
         thread::sleep(std::time::Duration::from_millis(50));
