@@ -93,6 +93,48 @@ impl WlrLayerShellHandler for ShojiWM {
     }
 }
 
+impl ShojiWM {
+    pub(crate) fn close_layer_surfaces_for_output(&mut self, output: &Output) {
+        let mapped_layers = {
+            let map = layer_map_for_output(output);
+            map.layers().cloned().collect::<Vec<_>>()
+        };
+
+        let pending_layers = std::mem::take(&mut self.pending_layer_surfaces);
+        let mut retained_pending_layers = Vec::with_capacity(pending_layers.len());
+        for pending in pending_layers {
+            if &pending.output == output {
+                pending.layer.layer_surface().send_close();
+            } else {
+                retained_pending_layers.push(pending);
+            }
+        }
+        self.pending_layer_surfaces = retained_pending_layers;
+
+        let mut focus_changed = false;
+        for layer in &mapped_layers {
+            self.mapped_on_demand_layer_surfaces
+                .remove(&layer.wl_surface().id().protocol_id());
+            if self.layer_shell_on_demand_focus.as_ref() == Some(layer) {
+                self.layer_shell_on_demand_focus = None;
+                focus_changed = true;
+            }
+            layer.layer_surface().send_close();
+        }
+
+        {
+            let mut map = layer_map_for_output(output);
+            for layer in &mapped_layers {
+                map.unmap_layer(layer);
+            }
+        }
+
+        if focus_changed {
+            self.update_keyboard_focus(SERIAL_COUNTER.next_serial());
+        }
+    }
+}
+
 pub fn handle_commit(state: &mut ShojiWM, surface: &WlSurface) {
     let mut root = surface.clone();
     while let Some(parent) = get_parent(&root) {

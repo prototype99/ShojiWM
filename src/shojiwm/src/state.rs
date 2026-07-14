@@ -1353,11 +1353,39 @@ impl ShojiWM {
         global
     }
 
-    pub(crate) fn remove_output_global(&mut self, output_name: &str) {
-        let Some(global) = self.runtime_output_globals.remove(output_name) else {
+    pub(crate) fn remove_output_global(&mut self, output: &Output) {
+        let output_name = output.name();
+        let Some(global) = self.runtime_output_globals.remove(&output_name) else {
             return;
         };
-        self.display_handle.remove_global::<Self>(global);
+
+        // Layer-shell clients bind their windows to a specific output. Close and unmap those
+        // surfaces before withdrawing wl_output so clients can tear down their windows while the
+        // output resource is still valid. Hyprland and niri use the same ordering on hot-unplug.
+        self.close_layer_surfaces_for_output(output);
+
+        // `wl_surface.leave` must precede removal of the `wl_output` global. Clients such as
+        // GTK/GDK use that ordering to detach their remaining surfaces from the disappearing
+        // monitor before invalidating the monitor object itself.
+        output.leave_all();
+
+        // Announce global removal immediately, but retain existing wl_output resources briefly.
+        // This gives toolkit event loops time to process layer-surface.closed and surface.leave
+        // before their monitor object becomes inert.
+        self.display_handle.disable_global::<Self>(global.clone());
+        let deferred_global = global.clone();
+        if let Err(error) = self.loop_handle.insert_source(
+            Timer::from_duration(Duration::from_secs(10)),
+            move |_, _, state| {
+                state
+                    .display_handle
+                    .remove_global::<Self>(deferred_global.clone());
+                TimeoutAction::Drop
+            },
+        ) {
+            warn!(?error, output = %output_name, "failed to defer output global removal");
+            self.display_handle.remove_global::<Self>(global);
+        }
     }
 
     pub fn seed_xwayland_refresh_override_from_output(
@@ -2297,7 +2325,7 @@ impl ShojiWM {
         for output in disabled_outputs {
             let name = output.name();
             self.space.unmap_output(&output);
-            self.remove_output_global(&name);
+            self.remove_output_global(&output);
             self.screencopy_state.remove_output(&output);
             crate::backend::image_copy_capture_render::fail_pending_output_capture(
                 &mut self.image_copy_capture_pending,
