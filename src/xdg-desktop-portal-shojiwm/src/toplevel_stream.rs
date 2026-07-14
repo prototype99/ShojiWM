@@ -525,8 +525,17 @@ fn run(
                             // reallocated buffers land (pending_frame is None).
                         }
                     }
-                    (e1, e2) => {
-                        tracing::warn!(?e1, ?e2, "build params failed during renegotiate");
+                    (
+                        e1,
+                        e2,
+                        e3,
+                    ) => {
+                        tracing::warn!(
+                            ?e1,
+                            ?e2,
+                            ?e3,
+                            "build params failed during renegotiate",
+                        );
                     }
                 }
             }
