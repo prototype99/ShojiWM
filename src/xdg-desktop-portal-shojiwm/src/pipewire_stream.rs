@@ -1830,7 +1830,7 @@ fn build_buffers_param(
 /// (KWin, Mutter, xdph) provides this; consumers use the pts/seq for frame
 /// pacing, and its absence puts us off the code paths consumers are actually
 /// tested against.
-fn build_header_meta_param() -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn build_header_meta_param() -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let obj = Value::Object(Object {
         type_: spa_sys::SPA_TYPE_OBJECT_ParamMeta,
         id: spa_sys::SPA_PARAM_Meta,
@@ -1860,7 +1860,7 @@ fn build_header_meta_param() -> Result<Vec<u8>, Box<dyn std::error::Error + Send
 /// monotonic timestamp and sequence number. `flags` must be explicitly
 /// zeroed — a stray `SPA_META_HEADER_FLAG_CORRUPTED` makes consumers drop
 /// the frame silently.
-unsafe fn fill_header_meta(
+pub(crate) unsafe fn fill_header_meta(
     pw_buf: *mut pw::sys::pw_buffer,
     seq: u64,
 ) {
@@ -1896,7 +1896,7 @@ unsafe fn fill_header_meta(
 }
 
 /// Extract the fixated `maxFramerate` from a negotiated Format param.
-fn parse_pipewire_max_framerate(
+pub(crate) fn parse_pipewire_max_framerate(
     param: &Pod,
 ) -> Option<Fraction> {
     let obj = param
