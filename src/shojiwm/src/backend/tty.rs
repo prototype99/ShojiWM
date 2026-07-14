@@ -11461,7 +11461,10 @@ fn connector_disconnected(
     state.remove_output_global(&output);
     state.screencopy_state.remove_output(&output);
     state.output_capture_mirrors.remove(&output_name);
-    state.runtime_output_configs.remove(&output_name);
+    // Output configuration belongs to the connector name, not to this short-lived Output
+    // instance. Keep it across hot-unplug so a reconnected connector receives its mode, scale,
+    // and position immediately. The TS runtime suppresses unchanged configuration payloads, so
+    // deleting the Rust-side entry here would otherwise leave the new Output at scale 1.
     state.runtime_animation_outputs.remove(&output_name);
     state.damage_blink_visible.remove(&output_name);
     state.damage_blink_pending.remove(&output_name);
